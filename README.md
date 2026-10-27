@@ -6,7 +6,7 @@ Two terminal clients exchange chat or tic-tac-toe moves through a selected hardw
 
 Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
 
-> **Hardware link: unmeasured.** The protocol, game rules, terminal clients, and a labeled simulation transport are implemented and tested. The cache and CPU channels compile but have not been measured inside isolated containers on this host. Docker/OrbStack was not running when this tree was written. Do not treat a passing `cargo test` as a working covert channel.
+> **Hardware link: not locked.** Headless simulation chat and game pass. Docker isolation (`--network none`) and OrbStack debian VMs run. Shared-CPU benches show timing contrast. Handshake does not decode frames. See [docs/measurements.md](docs/measurements.md).
 
 ## What works now
 
@@ -27,7 +27,7 @@ cpu-cache-chat inspect-isolation
 
 Two-process software pair: `scripts/host-sim-pair.sh`.
 
-Two-container launch (requires a working Docker daemon): `scripts/run-pair.sh`. That script uses `--network none` and does not relay messages. It does not prove the physical channel.
+Headless sim: `MODE=chat ./scripts/e2e-headless-sim.sh`. Two-container launch: `scripts/run-pair.sh` or `scripts/e2e-docker.sh`. Isolation uses `--network none` and does not relay messages. Physical handshake is not working yet. Computer-use retest: [docs/codex-computer-use-test.md](docs/codex-computer-use-test.md).
 
 ## Isolation
 

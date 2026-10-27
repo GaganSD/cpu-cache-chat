@@ -92,8 +92,11 @@ impl<W: Wire> Link<W> {
         self.state = LinkState::Connecting;
         let mut events = vec![LinkEvent::State(self.state)];
         if self.cfg.role.is_initiator() {
-            let slice = (self.cfg.sync_timeout / self.cfg.max_retries.max(1))
-                .max(Duration::from_millis(50));
+            let slice = if self.cfg.channel.is_physical() {
+                Duration::from_secs(4)
+            } else {
+                (self.cfg.sync_timeout / self.cfg.max_retries.max(1)).max(Duration::from_millis(50))
+            };
             let mut last = Error::Timeout;
             let mut ok = false;
             for _ in 0..=self.cfg.max_retries {
@@ -342,7 +345,12 @@ impl<W: Wire> Link<W> {
             if remain.is_zero() {
                 return Err(Error::Timeout);
             }
-            let bytes = self.wire.recv_blob(remain)?;
+            let bytes = match self.wire.recv_blob(remain) {
+                Ok(bytes) => bytes,
+                Err(Error::Timeout) => return Err(Error::Timeout),
+                Err(Error::Interrupted) => return Err(Error::Interrupted),
+                Err(_) => continue,
+            };
             match decode_frame(&bytes) {
                 Ok(frame)
                     if frame.ftype == want

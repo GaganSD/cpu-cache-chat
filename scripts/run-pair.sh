@@ -14,8 +14,10 @@ if [[ -n "${CPUSET:-}" ]]; then common+=(--cpuset-cpus "$CPUSET"); fi
 for name in ccc-a ccc-b; do
   if docker inspect "$name" >/dev/null 2>&1; then echo "$name already exists; remove it explicitly before starting" >&2; exit 1; fi
 done
-docker run -d -it --name ccc-a --hostname ccc-a "${common[@]}" "$IMAGE" "$MODE" --role a --channel "$CHANNEL"
-if ! docker run -d -it --name ccc-b --hostname ccc-b "${common[@]}" "$IMAGE" "$MODE" --role b --channel "$CHANNEL"; then
+extra=()
+if [[ "${HEADLESS:-}" == 1 ]]; then extra+=(--plain); fi
+docker run -d -it --name ccc-a --hostname ccc-a "${common[@]}" "$IMAGE" "$MODE" --role a --channel "$CHANNEL" "${extra[@]}"
+if ! docker run -d -it --name ccc-b --hostname ccc-b "${common[@]}" "$IMAGE" "$MODE" --role b --channel "$CHANNEL" "${extra[@]}"; then
   docker rm -f ccc-a >/dev/null || true
   exit 1
 fi

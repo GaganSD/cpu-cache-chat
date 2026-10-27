@@ -8,6 +8,7 @@ use ccc_core::{Error, PREAMBLE};
 use crate::timing::measure;
 
 const CARRIER_ONES: u32 = 8;
+const LOCK_ONES: u32 = 32;
 const PREAMBLE_BITS: usize = 32;
 const TRAINING_BITS: usize = CARRIER_ONES as usize + PREAMBLE_BITS;
 
@@ -53,7 +54,7 @@ impl Phy {
                 },
                 cursor: 0,
             },
-            cpu_iters: 50_000,
+            cpu_iters: 8_000,
             decoder: None,
             next_slot: None,
             hunt_samples: std::collections::VecDeque::with_capacity(TRAINING_BITS),
@@ -76,16 +77,41 @@ impl Phy {
         self.stop.load(Ordering::SeqCst)
     }
 
+    /// Role A: 32 busy slots then 32 idle. Role B: sample 64 slot costs.
+    pub fn bench_pattern(&mut self, send: bool) -> Result<Vec<Duration>, Error> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        self.next_slot = None;
+        if send {
+            thread::sleep(Duration::from_millis(400));
+            self.idle_slots(8, deadline)?;
+            for _ in 0..64 {
+                self.slot_activity(deadline)?;
+            }
+            self.idle_slots(64, deadline)?;
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            out.push(self.sample_cost(deadline)?);
+        }
+        Ok(out)
+    }
+
     pub fn send_blob(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), Error> {
         let deadline = Instant::now() + timeout;
         self.check(deadline)?;
         let len = u16::try_from(bytes.len()).map_err(|_| Error::TooLarge(bytes.len()))?;
         self.next_slot = None;
+        if std::env::var_os("CCC_DEBUG").is_some() {
+            eprintln!("phy send {} bytes", bytes.len());
+        }
         // Inter-frame gap.
         self.idle_slots(4, deadline)?;
-        for _ in 0..CARRIER_ONES {
+        for _ in 0..LOCK_ONES {
             self.slot_activity(deadline)?;
         }
+        self.idle_slots(8, deadline)?;
         self.send_u32(PREAMBLE, deadline)?;
         self.send_u16(len, deadline)?;
         for &b in bytes {
@@ -120,7 +146,7 @@ impl Phy {
     fn read_trained_frame(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
         let len = self.recv_u16(deadline)? as usize;
         if len > ccc_core::MAX_PAYLOAD + 64 {
-            return Err(Error::TooLarge(len));
+            return Err(Error::Corrupt("bad length"));
         }
         let mut bytes = vec![0u8; len];
         for slot in &mut bytes {
@@ -137,20 +163,67 @@ impl Phy {
     // Each candidate trains two clusters from its own samples, so no absolute
     // timing threshold or assumed direction of contention is required.
     fn hunt_preamble(&mut self, deadline: Instant) -> Result<(), Error> {
-        loop {
-            let cost = self.sample_cost(deadline)?;
-            if self.hunt_samples.len() == TRAINING_BITS {
-                self.hunt_samples.pop_front();
-            }
-            self.hunt_samples.push_back(cost);
-            if self.hunt_samples.len() == TRAINING_BITS {
-                let candidate: Vec<_> = self.hunt_samples.iter().copied().collect();
-                if let Some(decoder) = train_preamble(&candidate) {
-                    self.decoder = Some(decoder);
-                    return Ok(());
-                }
-            }
+        // Fast baseline, then lock to a busy carrier and sample mid-slot.
+        let mut base = Duration::from_secs(1);
+        for _ in 0..12 {
+            self.check(deadline)?;
+            base = base.min(self.observe());
         }
+        let thresh = base
+            .saturating_mul(2)
+            .saturating_add(Duration::from_micros(5));
+        let decoder = Decoder {
+            threshold: thresh,
+            active_high: true,
+        };
+        let mut highs = 0u32;
+        while highs < 20 {
+            self.check(deadline)?;
+            if self.observe() > thresh {
+                highs += 1;
+            } else {
+                highs = 0;
+            }
+            thread::sleep(self.slot / 8);
+        }
+        let began = Instant::now();
+        let mut lows = 0u32;
+        while lows < 6 {
+            self.check(deadline)?;
+            if began.elapsed() > self.slot.saturating_mul(48) {
+                break;
+            }
+            if self.observe() <= thresh {
+                lows += 1;
+            } else {
+                lows = 0;
+            }
+            thread::sleep(self.slot / 8);
+        }
+        self.next_slot = Some(Instant::now() + self.slot / 2);
+        self.decoder = Some(decoder);
+        let mut window = 0u32;
+        for _ in 0..PREAMBLE_BITS {
+            let (bit, _) = self.sample_slot(deadline)?;
+            window = (window << 1) | u32::from(bit);
+        }
+        let ham = |a: u32, b: u32| (a ^ b).count_ones();
+        if std::env::var_os("CCC_DEBUG").is_some() {
+            eprintln!(
+                "phy hunt window={window:#010x} ham_pre={} ham_inv={}",
+                ham(window, PREAMBLE),
+                ham(window, !PREAMBLE)
+            );
+        }
+        if ham(window, PREAMBLE) <= 8 || ham(window, !PREAMBLE) <= 8 {
+            self.decoder = Some(Decoder {
+                threshold: thresh,
+                active_high: window.count_ones() >= 16,
+            });
+            return Ok(());
+        }
+        // Try again until deadline.
+        self.hunt_preamble(deadline)
     }
 
     fn send_u32(&mut self, v: u32, deadline: Instant) -> Result<(), Error> {
@@ -219,10 +292,10 @@ impl Phy {
         let end = self.slot_end(deadline)?;
         let cost = self.observe();
         if Instant::now() > end {
+            // Overrun is a high-cost sample, not a dead link.
+            self.next_slot = Some(Instant::now() + self.slot);
             self.check(deadline)?;
-            return Err(Error::Channel(
-                "probe exceeded slot; increase slot duration".into(),
-            ));
+            return Ok(cost);
         }
         self.finish_slot(end, deadline)?;
         Ok(cost)
@@ -253,9 +326,10 @@ impl Phy {
             return Err(Error::InvalidInput("slot must be nonzero".into()));
         }
         let start = self.next_slot.unwrap_or_else(Instant::now);
-        let end = start + self.slot;
-        if Instant::now() >= end {
-            return Err(Error::Channel("missed slot; increase slot duration".into()));
+        let mut end = start + self.slot;
+        // Skip missed slots instead of aborting the frame.
+        while Instant::now() >= end {
+            end += self.slot;
         }
         self.next_slot = Some(end);
         Ok(end)
@@ -391,24 +465,29 @@ pub fn train_preamble(samples: &[Duration]) -> Option<Decoder> {
         return None;
     }
     let threshold = sorted[split - 1] + largest_gap / 2;
-    let active_high = samples[0] > threshold;
-    let decoder = Decoder {
-        threshold,
-        active_high,
-    };
-    if samples[..CARRIER_ONES as usize]
-        .iter()
-        .any(|&s| !decoder.decode(s))
-    {
-        return None;
-    }
-    for (i, &sample) in samples[CARRIER_ONES as usize..].iter().enumerate() {
-        let expected = (PREAMBLE >> (31 - i)) & 1 != 0;
-        if decoder.decode(sample) != expected {
-            return None;
+    let mut best: Option<(u32, Decoder)> = None;
+    for active_high in [true, false] {
+        let decoder = Decoder {
+            threshold,
+            active_high,
+        };
+        let mut errors = 0u32;
+        for &sample in &samples[..CARRIER_ONES as usize] {
+            if !decoder.decode(sample) {
+                errors += 1;
+            }
+        }
+        for (i, &sample) in samples[CARRIER_ONES as usize..].iter().enumerate() {
+            let expected = (PREAMBLE >> (31 - i)) & 1 != 0;
+            if decoder.decode(sample) != expected {
+                errors += 1;
+            }
+        }
+        if errors <= 6 && best.is_none_or(|(e, _)| errors < e) {
+            best = Some((errors, decoder));
         }
     }
-    Some(decoder)
+    best.map(|(_, decoder)| decoder)
 }
 
 /// Bits in wire order, most significant first.

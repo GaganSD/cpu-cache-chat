@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ccc_app::escape_controls;
-use ccc_channel::{run_probe_receiver, run_probe_sender};
+use ccc_channel::{open_phy, run_probe_receiver, run_probe_sender};
 use ccc_core::{
     AppKind, ChannelMode, Error, Role, RuntimeConfig, DEFAULT_PROBE_BITS, DEFAULT_PROBE_TRIALS,
 };
@@ -28,6 +28,7 @@ enum Cmd {
     Chat(ClientArgs),
     Game(GameArgs),
     Probe(ProbeArgs),
+    Bench(ProbeArgs),
     InspectIsolation,
 }
 
@@ -45,7 +46,7 @@ struct ClientArgs {
     /// Line-oriented input/output. EOF leaves the session running; enter /q to quit.
     #[arg(long)]
     plain: bool,
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "5")]
     slot_ms: u64,
 }
 
@@ -69,7 +70,7 @@ struct ProbeArgs {
     trials: u32,
     #[arg(long, default_value_t = DEFAULT_PROBE_BITS)]
     bits: u32,
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "5")]
     slot_ms: u64,
 }
 
@@ -120,6 +121,7 @@ fn run() -> Result<(), Error> {
         Cmd::Chat(args) => client(AppKind::Chat, args, false, None),
         Cmd::Game(args) => client(AppKind::Game, args.client, args.agent, args.agent_cmd),
         Cmd::Probe(args) => probe(args),
+        Cmd::Bench(args) => bench(args),
         Cmd::InspectIsolation => inspect_isolation(),
     }
 }
@@ -266,6 +268,39 @@ fn probe(args: ProbeArgs) -> Result<(), Error> {
         run_probe_receiver(mode, role, args.trials, args.bits, slot, stop, None)?
     };
     println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    Ok(())
+}
+
+fn bench(args: ProbeArgs) -> Result<(), Error> {
+    let mode = args.channel.mode(false);
+    let slot = Duration::from_millis(args.slot_ms);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut phy = open_phy(mode, slot, stop)?;
+    let send = Role::from(args.role).is_initiator();
+    println!(
+        "bench mode={} role={} slot_ms={} send={send}",
+        mode,
+        Role::from(args.role),
+        args.slot_ms
+    );
+    let samples = phy.bench_pattern(send)?;
+    if samples.is_empty() {
+        println!("{{\"role\":\"A\",\"sent\":true}}");
+        return Ok(());
+    }
+    let ns: Vec<u128> = samples.iter().map(|d| d.as_nanos()).collect();
+    let mean = ns.iter().sum::<u128>() / ns.len().max(1) as u128;
+    let min = *ns.iter().min().unwrap_or(&0);
+    let max = *ns.iter().max().unwrap_or(&0);
+    println!(
+        "n={} mean_ns={mean} min_ns={min} max_ns={max} ratio={:.2} samples={ns:?}",
+        ns.len(),
+        if min == 0 {
+            0.0
+        } else {
+            max as f64 / min as f64
+        }
+    );
     Ok(())
 }
 

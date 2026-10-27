@@ -43,8 +43,13 @@ fn trained_threshold_handles_both_polarities_and_rejects_noise() {
         assert!(!decoder.decode(Duration::from_nanos(if inverted { 201 } else { 101 })));
     }
     assert!(train_preamble(&vec![Duration::from_nanos(100); 40]).is_none());
+    let mut one = training(false);
+    one[12] = Duration::from_nanos(100);
+    assert!(train_preamble(&one).is_some());
     let mut bad = training(false);
-    bad[12] = Duration::from_nanos(100);
+    for slot in bad.iter_mut().skip(8).take(16) {
+        *slot = Duration::from_nanos(100);
+    }
     assert!(train_preamble(&bad).is_none());
 }
 
