@@ -2,7 +2,8 @@
 
 mod cache;
 mod cpu;
-mod phy;
+#[doc(hidden)]
+pub mod phy;
 mod probe;
 mod sim;
 mod timing;
@@ -10,7 +11,7 @@ mod timing;
 pub use cache::CacheChannel;
 pub use cpu::CpuChannel;
 pub use phy::{Phy, PhyKind};
-pub use probe::{run_probe_receiver, run_probe_sender};
+pub use probe::{run_probe_receiver, run_probe_sender, run_silent_control};
 pub use sim::{SimPair, SimSocket, SimWire};
 pub use timing::{ticks, Timer};
 

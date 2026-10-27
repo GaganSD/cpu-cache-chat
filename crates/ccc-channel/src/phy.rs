@@ -8,7 +8,8 @@ use ccc_core::{Error, PREAMBLE};
 use crate::timing::measure;
 
 const CARRIER_ONES: u32 = 8;
-const PREAMBLE_BITS: u32 = 32;
+const PREAMBLE_BITS: usize = 32;
+const TRAINING_BITS: usize = CARRIER_ONES as usize + PREAMBLE_BITS;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PhyKind {
@@ -22,20 +23,23 @@ pub struct Phy {
     stop: Arc<AtomicBool>,
     cache: CacheWork,
     cpu_iters: u32,
+    decoder: Option<Decoder>,
+    next_slot: Option<Instant>,
 }
 
 struct CacheWork {
     data: Vec<u64>,
     stride: usize,
+    cursor: usize,
 }
 
 impl Phy {
     pub fn new(kind: PhyKind, slot: Duration, stop: Arc<AtomicBool>) -> Self {
         let bytes = match kind {
             PhyKind::Cache => 8 * 1024 * 1024,
-            PhyKind::Cpu => 4096,
+            PhyKind::Cpu => 0,
         };
-        let n = (bytes / 8).max(64);
+        let n = bytes / 8;
         Self {
             kind,
             slot,
@@ -46,8 +50,11 @@ impl Phy {
                     PhyKind::Cache => 8,
                     PhyKind::Cpu => 1,
                 },
+                cursor: 0,
             },
             cpu_iters: 50_000,
+            decoder: None,
+            next_slot: None,
         }
     }
 
@@ -70,13 +77,14 @@ impl Phy {
     pub fn send_blob(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), Error> {
         let deadline = Instant::now() + timeout;
         self.check(deadline)?;
+        let len = u16::try_from(bytes.len()).map_err(|_| Error::TooLarge(bytes.len()))?;
+        self.next_slot = None;
         // Inter-frame gap.
         self.idle_slots(4, deadline)?;
         for _ in 0..CARRIER_ONES {
             self.slot_activity(deadline)?;
         }
         self.send_u32(PREAMBLE, deadline)?;
-        let len = u16::try_from(bytes.len()).map_err(|_| Error::TooLarge(bytes.len()))?;
         self.send_u16(len, deadline)?;
         for &b in bytes {
             self.send_u8(b, deadline)?;
@@ -88,6 +96,8 @@ impl Phy {
 
     pub fn recv_blob(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
         let deadline = Instant::now() + timeout;
+        self.decoder = None;
+        self.next_slot = None;
         self.hunt_preamble(deadline)?;
         let len = self.recv_u16(deadline)? as usize;
         if len > ccc_core::MAX_PAYLOAD + 64 {
@@ -104,78 +114,44 @@ impl Phy {
         Ok(bytes)
     }
 
-    pub fn sample_bit(&mut self) -> (bool, Duration) {
-        let cost = self.observe();
-        // High cost means the sender is active (contention / occupancy).
-        (cost > self.threshold(), cost)
-    }
-
-    pub fn local_ones_zeros(&mut self, n: u32) -> (f64, f64, f64) {
-        let mut ones = Vec::new();
-        let mut zeros = Vec::new();
-        let mut silent = Vec::new();
-        for _ in 0..n {
-            ones.push(self.activity_cost().as_secs_f64() * 1e9);
-            zeros.push(self.idle_cost().as_secs_f64() * 1e9);
-            silent.push(self.observe().as_secs_f64() * 1e9);
-        }
-        (mean(&ones), mean(&zeros), mean(&silent))
-    }
-
-    fn threshold(&self) -> Duration {
-        // Conservative default: anything clearly slower than a quiet observe.
-        self.slot / 8
-    }
-
+    // Sliding windows require a carrier followed by a complete alternating preamble.
+    // Each candidate trains two clusters from its own samples, so no absolute
+    // timing threshold or assumed direction of contention is required.
     fn hunt_preamble(&mut self, deadline: Instant) -> Result<(), Error> {
-        // Wait for carrier (several consecutive ones), then collect 32 bits
-        // and accept PREAMBLE or its inverse.
-        let mut ones = 0u32;
-        while ones < CARRIER_ONES {
-            self.check(deadline)?;
-            let (bit, _) = self.sample_slot(deadline)?;
-            if bit {
-                ones += 1;
-            } else {
-                ones = 0;
+        let mut samples = std::collections::VecDeque::with_capacity(TRAINING_BITS);
+        loop {
+            let cost = self.sample_cost(deadline)?;
+            if samples.len() == TRAINING_BITS {
+                samples.pop_front();
+            }
+            samples.push_back(cost);
+            if samples.len() == TRAINING_BITS {
+                let candidate: Vec<_> = samples.iter().copied().collect();
+                if let Some(decoder) = train_preamble(&candidate) {
+                    self.decoder = Some(decoder);
+                    return Ok(());
+                }
             }
         }
-        let mut window = 0u32;
-        for _ in 0..PREAMBLE_BITS {
-            let (bit, _) = self.sample_slot(deadline)?;
-            window = (window << 1) | u32::from(bit);
-        }
-        if window == PREAMBLE || window == !PREAMBLE {
-            return Ok(());
-        }
-        // One more sliding hunt over a limited window.
-        for _ in 0..PREAMBLE_BITS * 2 {
-            let (bit, _) = self.sample_slot(deadline)?;
-            window = (window << 1) | u32::from(bit);
-            if window == PREAMBLE || window == !PREAMBLE {
-                return Ok(());
-            }
-        }
-        Err(Error::Corrupt("preamble"))
     }
 
     fn send_u32(&mut self, v: u32, deadline: Instant) -> Result<(), Error> {
-        for i in (0..32).rev() {
-            self.send_bit(((v >> i) & 1) == 1, deadline)?;
+        for bit in bits_msb(v, 32) {
+            self.send_bit(bit, deadline)?;
         }
         Ok(())
     }
 
     fn send_u16(&mut self, v: u16, deadline: Instant) -> Result<(), Error> {
-        for i in (0..16).rev() {
-            self.send_bit(((v >> i) & 1) == 1, deadline)?;
+        for bit in bits_msb(u32::from(v), 16) {
+            self.send_bit(bit, deadline)?;
         }
         Ok(())
     }
 
     fn send_u8(&mut self, v: u8, deadline: Instant) -> Result<(), Error> {
-        for i in (0..8).rev() {
-            self.send_bit(((v >> i) & 1) == 1, deadline)?;
+        for bit in bits_msb(u32::from(v), 8) {
+            self.send_bit(bit, deadline)?;
         }
         Ok(())
     }
@@ -215,46 +191,85 @@ impl Phy {
     }
 
     fn sample_slot(&mut self, deadline: Instant) -> Result<(bool, Duration), Error> {
+        let cost = self.sample_cost(deadline)?;
+        let decoder = self.decoder.ok_or(Error::Corrupt("untrained receiver"))?;
+        Ok((decoder.decode(cost), cost))
+    }
+
+    fn sample_cost(&mut self, deadline: Instant) -> Result<Duration, Error> {
         self.check(deadline)?;
-        let start = Instant::now();
+        let end = self.slot_end(deadline)?;
         let cost = self.observe();
-        let bit = cost > self.threshold();
-        self.finish_slot(start);
-        Ok((bit, cost))
+        if Instant::now() > end {
+            self.check(deadline)?;
+            return Err(Error::Channel(
+                "probe exceeded slot; increase slot duration".into(),
+            ));
+        }
+        self.finish_slot(end, deadline)?;
+        Ok(cost)
     }
 
     fn slot_activity(&mut self, deadline: Instant) -> Result<(), Error> {
         self.check(deadline)?;
-        let start = Instant::now();
-        while start.elapsed() < self.slot {
+        let end = self.slot_end(deadline)?;
+        while Instant::now() < end {
             self.check(deadline)?;
             self.activity();
         }
-        Ok(())
+        self.check(deadline)
     }
 
     fn idle_slots(&mut self, n: u32, deadline: Instant) -> Result<(), Error> {
         for _ in 0..n {
             self.check(deadline)?;
-            thread::sleep(self.slot);
+            let end = self.slot_end(deadline)?;
+            self.finish_slot(end, deadline)?;
         }
         Ok(())
     }
 
-    fn finish_slot(&self, start: Instant) {
-        let used = start.elapsed();
-        if used < self.slot {
-            thread::sleep(self.slot - used);
+    fn slot_end(&mut self, deadline: Instant) -> Result<Instant, Error> {
+        self.check(deadline)?;
+        if self.slot.is_zero() {
+            return Err(Error::InvalidInput("slot must be nonzero".into()));
+        }
+        let start = self.next_slot.unwrap_or_else(Instant::now);
+        let end = start + self.slot;
+        if Instant::now() >= end {
+            return Err(Error::Channel("missed slot; increase slot duration".into()));
+        }
+        self.next_slot = Some(end);
+        Ok(end)
+    }
+
+    fn finish_slot(&self, end: Instant, deadline: Instant) -> Result<(), Error> {
+        loop {
+            self.check(deadline)?;
+            let now = Instant::now();
+            if now >= end {
+                return Ok(());
+            }
+            let remaining = end
+                .saturating_duration_since(now)
+                .min(deadline.saturating_duration_since(now));
+            if remaining > Duration::from_micros(100) {
+                thread::sleep(
+                    (remaining - Duration::from_micros(50)).min(Duration::from_millis(1)),
+                );
+            } else {
+                std::hint::spin_loop();
+            }
         }
     }
 
     fn activity(&mut self) {
         match self.kind {
             PhyKind::Cache => {
-                walk(&mut self.cache);
+                walk_chunk(&mut self.cache);
             }
             PhyKind::Cpu => {
-                burn(self.cpu_iters);
+                burn(1_000);
             }
         }
     }
@@ -268,18 +283,6 @@ impl Phy {
                 burn(self.cpu_iters);
             }),
         }
-    }
-
-    fn activity_cost(&mut self) -> Duration {
-        let start = Instant::now();
-        self.activity();
-        start.elapsed()
-    }
-
-    fn idle_cost(&mut self) -> Duration {
-        let start = Instant::now();
-        thread::sleep(Duration::from_micros(20));
-        start.elapsed()
     }
 
     fn check(&self, deadline: Instant) -> Result<(), Error> {
@@ -303,6 +306,16 @@ fn walk(work: &mut CacheWork) {
     core::hint::black_box(sum);
 }
 
+// Keep each activity batch short while cycling across the complete occupancy array.
+fn walk_chunk(work: &mut CacheWork) {
+    let mut sum = 0u64;
+    for _ in 0..256 {
+        sum = sum.wrapping_add(unsafe { core::ptr::read_volatile(&work.data[work.cursor]) });
+        work.cursor = (work.cursor + work.stride) % work.data.len();
+    }
+    core::hint::black_box(sum);
+}
+
 fn burn(iters: u32) {
     let mut x = 0x1234_5678_9ABCu64;
     for _ in 0..iters {
@@ -312,7 +325,7 @@ fn burn(iters: u32) {
     core::hint::black_box(x);
 }
 
-fn crc32_of(bytes: &[u8]) -> u32 {
+pub fn crc32_of(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in bytes {
         crc ^= u32::from(b);
@@ -324,10 +337,63 @@ fn crc32_of(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn mean(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        0.0
-    } else {
-        xs.iter().sum::<f64>() / xs.len() as f64
+/// A threshold and the direction in which an active slot lies.
+#[derive(Clone, Copy, Debug)]
+pub struct Decoder {
+    threshold: Duration,
+    active_high: bool,
+}
+
+impl Decoder {
+    pub fn decode(self, sample: Duration) -> bool {
+        (sample > self.threshold) == self.active_high
     }
+}
+
+/// Train from eight carrier slots followed by the 32-bit alternating preamble.
+/// Reject overlapping clusters and candidates that do not match the complete pattern.
+pub fn train_preamble(samples: &[Duration]) -> Option<Decoder> {
+    if samples.len() != TRAINING_BITS {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let mut best = None;
+    let mut largest_gap = Duration::ZERO;
+    for i in 1..sorted.len() {
+        let gap = sorted[i] - sorted[i - 1];
+        if gap > largest_gap {
+            largest_gap = gap;
+            best = Some(i);
+        }
+    }
+    let split = best?;
+    // Reject tiny gaps that would turn ordinary timer jitter into a carrier.
+    if largest_gap < sorted[split - 1] / 10 || largest_gap < Duration::from_nanos(1) {
+        return None;
+    }
+    let threshold = sorted[split - 1] + largest_gap / 2;
+    let active_high = samples[0] > threshold;
+    let decoder = Decoder {
+        threshold,
+        active_high,
+    };
+    if samples[..CARRIER_ONES as usize]
+        .iter()
+        .any(|&s| !decoder.decode(s))
+    {
+        return None;
+    }
+    for (i, &sample) in samples[CARRIER_ONES as usize..].iter().enumerate() {
+        let expected = (PREAMBLE >> (31 - i)) & 1 != 0;
+        if decoder.decode(sample) != expected {
+            return None;
+        }
+    }
+    Some(decoder)
+}
+
+/// Bits in wire order, most significant first.
+pub fn bits_msb(value: u32, width: u32) -> impl Iterator<Item = bool> {
+    (0..width.min(32)).rev().map(move |i| (value >> i) & 1 != 0)
 }
