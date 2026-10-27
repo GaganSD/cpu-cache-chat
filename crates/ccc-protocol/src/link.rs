@@ -34,6 +34,8 @@ pub struct Link<W: Wire> {
     inflight: Option<Inflight>,
     queue: VecDeque<(u16, AppMessage)>,
     peer_seen: bool,
+    have_token: bool,
+    token_since: Instant,
 }
 
 struct Inflight {
@@ -45,6 +47,7 @@ struct Inflight {
 
 impl<W: Wire> Link<W> {
     pub fn new(cfg: RuntimeConfig, wire: W, session: u32) -> Self {
+        let have_token = cfg.role.is_initiator();
         Self {
             cfg,
             wire,
@@ -55,6 +58,8 @@ impl<W: Wire> Link<W> {
             inflight: None,
             queue: VecDeque::new(),
             peer_seen: false,
+            have_token,
+            token_since: Instant::now(),
         }
     }
 
@@ -87,16 +92,36 @@ impl<W: Wire> Link<W> {
         self.state = LinkState::Connecting;
         let mut events = vec![LinkEvent::State(self.state)];
         if self.cfg.role.is_initiator() {
-            self.send_control(FrameType::Sync, 0)?;
-            let frame = self.recv_typed(FrameType::SyncAck, self.cfg.sync_timeout)?;
-            self.accept_session(frame.session);
-            self.peer_seen = true;
+            let slice = (self.cfg.sync_timeout / self.cfg.max_retries.max(1))
+                .max(Duration::from_millis(50));
+            let mut last = Error::Timeout;
+            let mut ok = false;
+            for _ in 0..=self.cfg.max_retries {
+                if let Err(e) = self.send_control(FrameType::Sync, 0) {
+                    last = e;
+                    continue;
+                }
+                match self.recv_typed(FrameType::SyncAck, slice) {
+                    Ok(frame) => {
+                        self.accept_session(frame.session);
+                        ok = true;
+                        break;
+                    }
+                    Err(e) => last = e,
+                }
+            }
+            if !ok {
+                self.state = LinkState::Failed;
+                return Err(last);
+            }
         } else {
             let frame = self.recv_typed(FrameType::Sync, self.cfg.sync_timeout)?;
             self.accept_session(frame.session);
             self.send_control(FrameType::SyncAck, 0)?;
-            self.peer_seen = true;
         }
+        self.peer_seen = true;
+        self.have_token = self.cfg.role.is_initiator();
+        self.token_since = Instant::now();
         self.state = LinkState::Connected;
         events.push(LinkEvent::State(self.state));
         events.push(LinkEvent::Info(format!(
@@ -111,7 +136,7 @@ impl<W: Wire> Link<W> {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        if self.inflight.is_none() && self.state == LinkState::Connected {
+        if self.inflight.is_none() && self.state == LinkState::Connected && self.have_token {
             if let Some((seq, msg)) = self.queue.pop_front() {
                 let payload = msg.encode()?;
                 let frame = Frame::new(FrameType::Data, self.session, seq, payload)?;
@@ -126,6 +151,10 @@ impl<W: Wire> Link<W> {
                     seq,
                     state: Delivery::AwaitingAck,
                 });
+            } else if self.token_since.elapsed() >= Duration::from_millis(80)
+                && self.send_control(FrameType::Heartbeat, 0).is_ok()
+            {
+                self.have_token = false;
             }
         }
 
@@ -172,8 +201,6 @@ impl<W: Wire> Link<W> {
                 events.push(LinkEvent::State(self.state));
             }
             Err(e) => {
-                self.state = LinkState::Degraded;
-                events.push(LinkEvent::State(self.state));
                 events.push(LinkEvent::Error(e.to_string()));
             }
         }
@@ -199,6 +226,7 @@ impl<W: Wire> Link<W> {
                     if frame.ack_seq == inf.seq {
                         let seq = inf.seq;
                         self.inflight = None;
+                        self.token_since = Instant::now();
                         if self.state == LinkState::Degraded {
                             self.state = LinkState::Connected;
                         }
@@ -267,17 +295,29 @@ impl<W: Wire> Link<W> {
                     }
                 }
             }
-            FrameType::Heartbeat => Ok(None),
+            FrameType::Heartbeat => {
+                self.grant_token();
+                Ok(None)
+            }
             FrameType::Close => {
                 self.state = LinkState::Closed;
                 Ok(Some(vec![LinkEvent::State(self.state)]))
             }
-            FrameType::Sync | FrameType::SyncAck | FrameType::Resync => {
-                Ok(Some(vec![LinkEvent::Info(
-                    "unexpected control after handshake".into(),
-                )]))
+            FrameType::Sync => {
+                if !self.cfg.role.is_initiator() {
+                    let _ = self.send_control(FrameType::SyncAck, 0);
+                }
+                Ok(None)
             }
+            FrameType::SyncAck | FrameType::Resync => Ok(Some(vec![LinkEvent::Info(
+                "unexpected control after handshake".into(),
+            )])),
         }
+    }
+
+    fn grant_token(&mut self) {
+        self.have_token = true;
+        self.token_since = Instant::now();
     }
 
     fn send_control(&mut self, ftype: FrameType, ack_seq: u16) -> Result<(), Error> {

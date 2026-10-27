@@ -17,8 +17,10 @@ for name in ccc-a ccc-b; do
   printf '%s mounts:\n%s\n' "$name" "$mounts"
   while IFS='|' read -r type source dest _; do
     [[ -n "$type" ]] || continue
-    if [[ "$source" == *docker.sock* || "$dest" == *docker.sock* ]]; then
-      echo "FAIL: $name has a docker.sock mount" >&2; fail=1
+    if [[ "$source" == *docker.sock* || "$dest" == *docker.sock* \
+       || "$source" == /var/run || "$source" == /run \
+       || "$source" == /var/run/* || "$source" == /run/* ]]; then
+      echo "FAIL: $name exposes a docker host socket path ($source -> $dest)" >&2; fail=1
     fi
   done <<< "$mounts"
   if [[ "$name" == ccc-a ]]; then mounts_a="$mounts"; else mounts_b="$mounts"; fi

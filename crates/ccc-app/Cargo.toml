@@ -11,3 +11,4 @@ ccc-core.workspace = true
 ccc-protocol.workspace = true
 ccc-game.workspace = true
 ccc-channel.workspace = true
+serde_json.workspace = true

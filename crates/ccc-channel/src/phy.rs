@@ -25,6 +25,7 @@ pub struct Phy {
     cpu_iters: u32,
     decoder: Option<Decoder>,
     next_slot: Option<Instant>,
+    hunt_samples: std::collections::VecDeque<Duration>,
 }
 
 struct CacheWork {
@@ -55,6 +56,7 @@ impl Phy {
             cpu_iters: 50_000,
             decoder: None,
             next_slot: None,
+            hunt_samples: std::collections::VecDeque::with_capacity(TRAINING_BITS),
         }
     }
 
@@ -96,9 +98,26 @@ impl Phy {
 
     pub fn recv_blob(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
         let deadline = Instant::now() + timeout;
-        self.decoder = None;
-        self.next_slot = None;
-        self.hunt_preamble(deadline)?;
+        if self.decoder.is_none() {
+            self.hunt_preamble(deadline)?;
+        }
+        let result = self.read_trained_frame(deadline);
+        match &result {
+            Ok(_) => {
+                self.decoder = None;
+                self.hunt_samples.clear();
+            }
+            Err(Error::Timeout) if self.decoder.is_none() => {}
+            Err(_) => {
+                self.decoder = None;
+                self.hunt_samples.clear();
+                self.next_slot = None;
+            }
+        }
+        result
+    }
+
+    fn read_trained_frame(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
         let len = self.recv_u16(deadline)? as usize;
         if len > ccc_core::MAX_PAYLOAD + 64 {
             return Err(Error::TooLarge(len));
@@ -118,15 +137,14 @@ impl Phy {
     // Each candidate trains two clusters from its own samples, so no absolute
     // timing threshold or assumed direction of contention is required.
     fn hunt_preamble(&mut self, deadline: Instant) -> Result<(), Error> {
-        let mut samples = std::collections::VecDeque::with_capacity(TRAINING_BITS);
         loop {
             let cost = self.sample_cost(deadline)?;
-            if samples.len() == TRAINING_BITS {
-                samples.pop_front();
+            if self.hunt_samples.len() == TRAINING_BITS {
+                self.hunt_samples.pop_front();
             }
-            samples.push_back(cost);
-            if samples.len() == TRAINING_BITS {
-                let candidate: Vec<_> = samples.iter().copied().collect();
+            self.hunt_samples.push_back(cost);
+            if self.hunt_samples.len() == TRAINING_BITS {
+                let candidate: Vec<_> = self.hunt_samples.iter().copied().collect();
                 if let Some(decoder) = train_preamble(&candidate) {
                     self.decoder = Some(decoder);
                     return Ok(());

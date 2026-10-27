@@ -9,9 +9,7 @@ try {
     if (raw.length > 4096) throw new Error("board input too large");
   }
   const state = parseBoard(raw);
-  if (process.env.CCC_ALLOW_FIRST_LEGAL === "1") {
-    console.log(JSON.stringify({ square: state.legal[0], source: "test-hook" }));
-  } else {
+  {
     // A hard deadline covers SDK startup, inference, and abort cleanup.
     const deadline = setTimeout(() => {
       console.error("agent: timed out");

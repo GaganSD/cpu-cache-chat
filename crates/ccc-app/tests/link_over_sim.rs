@@ -136,7 +136,7 @@ fn agent_command_accepts_arguments_and_json_output_and_move_is_validated() {
     cfg.sim_path = Some("/unused".into());
     cfg.agent = true;
     cfg.agent_cmd = Some(
-        "sh -c 'cat >/dev/null; printf \"{\\\"square\\\":1,\\\"source\\\":\\\"test\\\"}\"'".into(),
+        "sh -c 'cat >/dev/null; printf \"{\\\"square\\\":1,\\\"source\\\":\\\"pi\\\"}\"'".into(),
     );
     let mut a = Session::wrap(cfg.clone(), pair.a, 43);
     cfg.role = Role::B;
@@ -147,5 +147,5 @@ fn agent_command_accepts_arguments_and_json_output_and_move_is_validated() {
     assert_eq!(a.try_agent_move().unwrap(), Some(1));
     a.queue_move(1).unwrap();
     assert!(a.queue_move(2).is_err());
-    assert_eq!(a.board().ply(), 1);
+    assert_eq!(a.board().ply(), 0);
 }

@@ -32,13 +32,13 @@ test("illegal moves return feedback and do not choose a square", async () => {
 });
 
 test("test hook runs without importing Pi", () => {
-  const run = spawnSync(process.execPath, [new URL("../src/play.mjs", import.meta.url).pathname], {
-    input: JSON.stringify(board), encoding: "utf8", env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "1" },
+  const run = spawnSync(process.execPath, [new URL("./first-legal.mjs", import.meta.url).pathname], {
+    input: JSON.stringify(board), encoding: "utf8",
   });
   assert.equal(run.status, 0, run.stderr);
   assert.deepEqual(JSON.parse(run.stdout), { square: 2, source: "test-hook" });
-  const bad = spawnSync(process.execPath, [new URL("../src/play.mjs", import.meta.url).pathname], {
-    input: "broken", encoding: "utf8", env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "1" },
+  const bad = spawnSync(process.execPath, [new URL("./first-legal.mjs", import.meta.url).pathname], {
+    input: "broken", encoding: "utf8",
   });
   assert.notEqual(bad.status, 0);
   assert.equal(bad.stdout, "");

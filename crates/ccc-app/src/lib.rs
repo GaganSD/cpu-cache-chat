@@ -40,7 +40,8 @@ pub struct Session<W: Wire> {
     started: bool,
     status: String,
     next_chat_id: u16,
-    next_seq: u16,
+    pending_move: Option<(u16, u8, Mark, Board)>,
+    frozen: bool,
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -73,7 +74,8 @@ impl<W: Wire> Session<W> {
             started: false,
             status,
             next_chat_id: 1,
-            next_seq: 1,
+            pending_move: None,
+            frozen: false,
             stop: None,
         }
     }
@@ -91,11 +93,13 @@ impl<W: Wire> Session<W> {
         let text = sanitize_user_text(&text)?;
         let id = self.next_chat_id;
         self.next_chat_id = self.next_chat_id.saturating_add(1);
-        self.link.enqueue(AppMessage::Chat {
+        let seq = self.link.enqueue(AppMessage::Chat {
             id,
             text: text.clone(),
         })?;
-        let seq = self.reserve_seq();
+        if self.chat.len() > 100 {
+            self.chat.remove(0);
+        }
         self.chat.push(ChatLine {
             from: self.cfg.role,
             text,
@@ -115,28 +119,17 @@ impl<W: Wire> Session<W> {
         }
         let mut board = self.board.clone();
         let outcome = board.play(square, mark)?;
-        self.link.enqueue(AppMessage::Move { ply, square, mark })?;
-        let seq = self.reserve_seq();
-        self.board = board;
+        let seq = self.link.enqueue(AppMessage::Move { ply, square, mark })?;
+        self.pending_move = Some((seq, square, mark, board));
         self.status = format!("queued move {square} (seq {seq})");
         Ok(outcome)
     }
 
     pub fn request_start(&mut self) -> Result<(), Error> {
         self.link.enqueue(AppMessage::Ctrl(GameCtrl::Start))?;
-        self.reserve_seq();
         self.started = true;
         self.status = "game start sent".into();
         Ok(())
-    }
-
-    fn reserve_seq(&mut self) -> u16 {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        if self.next_seq == 0 {
-            self.next_seq = 1;
-        }
-        seq
     }
 
     pub fn tick(&mut self, wait: Duration) -> Result<Vec<String>, Error> {
@@ -175,6 +168,8 @@ impl<W: Wire> Session<W> {
 
     pub fn our_turn(&self) -> bool {
         self.cfg.kind == AppKind::Game
+            && !self.frozen
+            && self.pending_move.is_none()
             && self.board.outcome() == Outcome::InProgress
             && self.board.turn() == self.cfg.role.mark()
             && self.link.state() == LinkState::Connected
@@ -208,6 +203,7 @@ impl<W: Wire> Session<W> {
                 command
             }
         };
+        command.env_remove("CCC_ALLOW_FIRST_LEGAL");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -279,6 +275,24 @@ impl<W: Wire> Session<W> {
                     if let Some(line) = self.chat.iter_mut().find(|c| c.seq == seq) {
                         line.delivery = state;
                     }
+                    if let Some((pseq, square, _, board)) = &self.pending_move {
+                        if *pseq == seq {
+                            match state {
+                                Delivery::Delivered => {
+                                    self.board = board.clone();
+                                    self.status = format!("move {square} delivered");
+                                    self.pending_move = None;
+                                }
+                                Delivery::Unknown | Delivery::Failed => {
+                                    self.frozen = true;
+                                    self.status =
+                                        format!("move {square} {state}; board not committed");
+                                    self.pending_move = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     notes.push(format!("seq {seq}: {state}"));
                 }
                 LinkEvent::Recv(AppMessage::Chat { text, .. }) => {
@@ -293,6 +307,7 @@ impl<W: Wire> Session<W> {
                 }
                 LinkEvent::Recv(AppMessage::Move { ply, square, mark }) => {
                     if ply != self.board.ply() || mark != self.cfg.role.peer().mark() {
+                        self.frozen = true;
                         self.status = format!(
                             "rejected peer move: unexpected ply or mark ({ply}, {})",
                             mark.glyph()
@@ -310,6 +325,7 @@ impl<W: Wire> Session<W> {
                             }
                         }
                         Err(e) => {
+                            self.frozen = true;
                             self.status = format!("rejected peer move: {e}");
                         }
                     }
@@ -364,24 +380,22 @@ pub fn escape_controls(text: &str) -> String {
 
 fn parse_square(text: &str) -> Result<u8, Error> {
     let t = text.trim();
-    if let Ok(n) = t.parse::<u8>() {
-        if (1..=9).contains(&n) {
-            return Ok(n);
-        }
+    let v: serde_json::Value = serde_json::from_str(t)
+        .map_err(|_| Error::Agent(format!("could not parse move from {t:?}")))?;
+    let source = v.get("source").and_then(|s| s.as_str());
+    if source != Some("pi") {
+        return Err(Error::Agent(
+            "refusing non-pi move source; no scripted fallback".into(),
+        ));
     }
-    if let Some((_, rest)) = t.split_once("\"square\"") {
-        if let Some(rest) = rest.trim_start().strip_prefix(':') {
-            let digits: String = rest
-                .trim_start()
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
-            if let Ok(n) = digits.parse::<u8>() {
-                if (1..=9).contains(&n) {
-                    return Ok(n);
-                }
-            }
-        }
+    let n = v
+        .get("square")
+        .and_then(|s| s.as_u64())
+        .ok_or_else(|| Error::Agent("missing square".into()))?;
+    let n = u8::try_from(n).map_err(|_| Error::Agent("bad square".into()))?;
+    if (1..=9).contains(&n) {
+        Ok(n)
+    } else {
+        Err(Error::Agent("square must be 1-9".into()))
     }
-    Err(Error::Agent(format!("could not parse move from {t:?}")))
 }

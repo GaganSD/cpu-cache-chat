@@ -106,8 +106,9 @@ pub fn start(
                 };
                 if let Err(e) = result {
                     let _ = output.send(Update::Note(e.to_string()));
+                } else {
+                    let _ = output.send(Update::Accepted);
                 }
-                let _ = output.send(Update::Accepted);
                 let _ = output.send(Update::Snapshot(session.snapshot()));
             }
             if cfg.agent && !agent_paused && session.our_turn() {
@@ -126,7 +127,7 @@ pub fn start(
                 }
                 let _ = output.send(Update::Snapshot(session.snapshot()));
             }
-            match session.tick(Duration::from_millis(20)) {
+            match session.tick(cfg.recv_poll()) {
                 Ok(notes) => {
                     for note in notes {
                         let _ = output.send(Update::Note(note));

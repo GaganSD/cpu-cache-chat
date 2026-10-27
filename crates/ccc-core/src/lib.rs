@@ -12,7 +12,7 @@ pub const MAX_CHAT_BYTES: usize = 200;
 pub const MAX_RETRIES: u32 = 5;
 pub const PREAMBLE: u32 = 0xAAAA_AAAA;
 pub const DEFAULT_SLOT: Duration = Duration::from_millis(2);
-pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_CALIBRATE: Duration = Duration::from_secs(3);
 pub const DEFAULT_PROBE_TRIALS: u32 = 64;
@@ -273,6 +273,17 @@ impl RuntimeConfig {
             return Err(Error::InvalidInput("slot is too short".into()));
         }
         Ok(())
+    }
+
+    /// How long a receive poll should last. Physical hunts need many slots.
+    pub fn recv_poll(&self) -> Duration {
+        if self.channel.is_physical() {
+            self.slot
+                .saturating_mul(128)
+                .max(Duration::from_millis(400))
+        } else {
+            Duration::from_millis(20)
+        }
     }
 }
 
