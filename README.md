@@ -2,11 +2,11 @@
 
 **Two isolated agents. One shared CPU. Tic-tac-toe without a network between them.**
 
-Two terminal clients exchange chat or tic-tac-toe moves through a selected hardware timing channel. The intended demo is two Pi agents in separate Docker containers. Manual chat uses the same transport.
+Two terminal clients are intended to exchange chat or tic-tac-toe moves through a selected hardware timing channel. The intended demo is two Pi agents in separate Docker containers. Manual chat uses the same transport.
 
 Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
 
-> **Hardware link: not locked.** Headless simulation chat and game pass. Docker isolation (`--network none`) and OrbStack debian VMs run. Shared-CPU benches show timing contrast. Handshake does not decode frames. See [docs/measurements.md](docs/measurements.md).
+> **Hardware link: not locked.** Headless simulation chat and game pass. Docker isolation (`--network none`) and OrbStack debian VMs run. Shared-CPU benches show timing contrast. The latest isolated cache and CPU probes did not decode frames at 10, 20, or 50 ms slots; hardware chat remains unusable in that test. See [docs/measurements.md](docs/measurements.md).
 
 ## What works now
 
