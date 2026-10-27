@@ -26,7 +26,6 @@ pub struct Phy {
     cpu_iters: u32,
     decoder: Option<Decoder>,
     next_slot: Option<Instant>,
-    hunt_samples: std::collections::VecDeque<Duration>,
 }
 
 struct CacheWork {
@@ -57,7 +56,6 @@ impl Phy {
             cpu_iters: 8_000,
             decoder: None,
             next_slot: None,
-            hunt_samples: std::collections::VecDeque::with_capacity(TRAINING_BITS),
         }
     }
 
@@ -131,12 +129,10 @@ impl Phy {
         match &result {
             Ok(_) => {
                 self.decoder = None;
-                self.hunt_samples.clear();
             }
             Err(Error::Timeout) if self.decoder.is_none() => {}
             Err(_) => {
                 self.decoder = None;
-                self.hunt_samples.clear();
                 self.next_slot = None;
             }
         }
@@ -159,71 +155,51 @@ impl Phy {
         Ok(bytes)
     }
 
-    // Sliding windows require a carrier followed by a complete alternating preamble.
-    // Each candidate trains two clusters from its own samples, so no absolute
-    // timing threshold or assumed direction of contention is required.
+    // Oversample the channel, looking for the complete preamble at every
+    // quarter-slot offset. This is iterative so repeated noise cannot grow the stack.
     fn hunt_preamble(&mut self, deadline: Instant) -> Result<(), Error> {
-        // Fast baseline, then lock to a busy carrier and sample mid-slot.
-        let mut base = Duration::from_secs(1);
-        for _ in 0..12 {
-            self.check(deadline)?;
-            base = base.min(self.observe());
+        let quantum = self.slot / 4;
+        if quantum.is_zero() {
+            return Err(Error::InvalidInput("slot too short to oversample".into()));
         }
-        let thresh = base
+        let mut baseline = Duration::MAX;
+        for _ in 0..8 {
+            let end = Instant::now() + quantum;
+            baseline = baseline.min(self.integrate_until(end, deadline)?);
+        }
+        let threshold = baseline
             .saturating_mul(2)
             .saturating_add(Duration::from_micros(5));
         let decoder = Decoder {
-            threshold: thresh,
+            threshold,
             active_high: true,
         };
-        let mut highs = 0u32;
-        while highs < 20 {
-            self.check(deadline)?;
-            if self.observe() > thresh {
-                highs += 1;
-            } else {
-                highs = 0;
+        let mut windows = [0u128; 4];
+        let mut counts = [0u32; 4];
+        let mut phase = 0usize;
+        loop {
+            let end = Instant::now() + quantum;
+            let sample = self.integrate_until(end, deadline)?;
+            windows[phase] = (windows[phase] << 1) | u128::from(decoder.decode(sample));
+            counts[phase] = counts[phase].saturating_add(1);
+            if counts[phase] >= LOCK_ONES + 8 + PREAMBLE_BITS as u32 {
+                let hamming = ((windows[phase] as u32) ^ PREAMBLE).count_ones();
+                if std::env::var_os("CCC_DEBUG").is_some() && counts[phase] % 32 == 0 {
+                    eprintln!(
+                        "phy hunt window={:#010x} hamming={hamming} threshold={threshold:?}",
+                        windows[phase]
+                    );
+                }
+                if matches_training(windows[phase]) {
+                    // The last quarter-slot sample is centred one eighth of a
+                    // slot before now; centre the next integral one slot later.
+                    self.next_slot = Some(Instant::now() + self.slot * 3 / 8);
+                    self.decoder = Some(decoder);
+                    return Ok(());
+                }
             }
-            thread::sleep(self.slot / 8);
+            phase = (phase + 1) % 4;
         }
-        let began = Instant::now();
-        let mut lows = 0u32;
-        while lows < 6 {
-            self.check(deadline)?;
-            if began.elapsed() > self.slot.saturating_mul(48) {
-                break;
-            }
-            if self.observe() <= thresh {
-                lows += 1;
-            } else {
-                lows = 0;
-            }
-            thread::sleep(self.slot / 8);
-        }
-        self.next_slot = Some(Instant::now() + self.slot / 2);
-        self.decoder = Some(decoder);
-        let mut window = 0u32;
-        for _ in 0..PREAMBLE_BITS {
-            let (bit, _) = self.sample_slot(deadline)?;
-            window = (window << 1) | u32::from(bit);
-        }
-        let ham = |a: u32, b: u32| (a ^ b).count_ones();
-        if std::env::var_os("CCC_DEBUG").is_some() {
-            eprintln!(
-                "phy hunt window={window:#010x} ham_pre={} ham_inv={}",
-                ham(window, PREAMBLE),
-                ham(window, !PREAMBLE)
-            );
-        }
-        if ham(window, PREAMBLE) <= 8 || ham(window, !PREAMBLE) <= 8 {
-            self.decoder = Some(Decoder {
-                threshold: thresh,
-                active_high: window.count_ones() >= 16,
-            });
-            return Ok(());
-        }
-        // Try again until deadline.
-        self.hunt_preamble(deadline)
     }
 
     fn send_u32(&mut self, v: u32, deadline: Instant) -> Result<(), Error> {
@@ -289,16 +265,28 @@ impl Phy {
 
     fn sample_cost(&mut self, deadline: Instant) -> Result<Duration, Error> {
         self.check(deadline)?;
-        let end = self.slot_end(deadline)?;
-        let cost = self.observe();
-        if Instant::now() > end {
-            // Overrun is a high-cost sample, not a dead link.
-            self.next_slot = Some(Instant::now() + self.slot);
-            self.check(deadline)?;
-            return Ok(cost);
+        if let Some(start) = self.next_slot {
+            self.finish_slot(start, deadline)?;
         }
-        self.finish_slot(end, deadline)?;
-        Ok(cost)
+        let end = self.slot_end(deadline)?;
+        self.integrate_until(end, deadline)
+    }
+
+    // Average the probe latency throughout the entire interval. Repeated probes
+    // reduce sensitivity to one scheduler interruption or unusually fast sample.
+    fn integrate_until(&mut self, end: Instant, deadline: Instant) -> Result<Duration, Error> {
+        let mut total = Duration::ZERO;
+        let mut count = 0u32;
+        while Instant::now() < end {
+            self.check(deadline)?;
+            total = total.saturating_add(self.observe());
+            count = count.saturating_add(1);
+        }
+        self.check(deadline)?;
+        if count == 0 {
+            return Err(Error::Corrupt("empty probe interval"));
+        }
+        Ok(total / count)
     }
 
     fn slot_activity(&mut self, deadline: Instant) -> Result<(), Error> {
@@ -488,6 +476,15 @@ pub fn train_preamble(samples: &[Duration]) -> Option<Decoder> {
         }
     }
     best.map(|(_, decoder)| decoder)
+}
+
+/// Match the carrier, eight idle slots, and alternating preamble in wire order.
+/// Requiring all three reduces accidental locks on alternating payload or noise.
+pub fn matches_training(window: u128) -> bool {
+    let carrier = (window >> 40) as u32;
+    let gap = ((window >> 32) & 0xff) as u8;
+    let preamble = window as u32;
+    carrier.count_ones() >= 28 && gap.count_ones() <= 2 && (preamble ^ PREAMBLE).count_ones() <= 4
 }
 
 /// Bits in wire order, most significant first.

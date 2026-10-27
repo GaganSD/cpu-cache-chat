@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ccc_channel::phy::{bits_msb, crc32_of, train_preamble};
+use ccc_channel::phy::{bits_msb, crc32_of, matches_training, train_preamble};
 use ccc_channel::{run_silent_control, Phy, PhyKind};
 use ccc_core::{ChannelMode, Error, Role};
 
@@ -79,4 +79,14 @@ fn interrupt_stops_waits_and_silent_control_cannot_be_usable() {
     .unwrap();
     assert!(!report.usable);
     assert!(report.notes.contains("unproven"));
+}
+
+#[test]
+fn training_match_requires_carrier_gap_and_preamble() {
+    let training = (u128::from(u32::MAX) << 40) | u128::from(0xaaaa_aaaau32);
+    assert!(matches_training(training));
+    assert!(matches_training(training ^ 0b1111));
+    assert!(!matches_training(training ^ 0b1_1111));
+    assert!(!matches_training(u128::from(0xaaaa_aaaau32)));
+    assert!(!matches_training(training | (0xffu128 << 32)));
 }

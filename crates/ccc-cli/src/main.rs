@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ccc_app::escape_controls;
-use ccc_channel::{open_phy, run_probe_receiver, run_probe_sender};
+use ccc_channel::{open_phy, run_probe_receiver, run_probe_sender, run_silent_control};
 use ccc_core::{
     AppKind, ChannelMode, Error, Role, RuntimeConfig, DEFAULT_PROBE_BITS, DEFAULT_PROBE_TRIALS,
 };
@@ -72,6 +72,11 @@ struct ProbeArgs {
     bits: u32,
     #[arg(long, default_value = "5")]
     slot_ms: u64,
+    /// Listen without a sender and report whether a frame was falsely decoded.
+    #[arg(long)]
+    silent: bool,
+    #[arg(long, default_value = "5")]
+    silent_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -246,6 +251,22 @@ fn probe(args: ProbeArgs) -> Result<(), Error> {
     let stop = Arc::new(AtomicBool::new(false));
     let slot = Duration::from_millis(args.slot_ms);
     let role = Role::from(args.role);
+    if args.silent {
+        if role.is_initiator() || args.silent_seconds == 0 {
+            return Err(Error::InvalidInput(
+                "silent control requires role b and a positive duration".into(),
+            ));
+        }
+        let report = run_silent_control(
+            mode,
+            role,
+            slot,
+            stop,
+            Duration::from_secs(args.silent_seconds),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return Ok(());
+    }
     // Receiver-blind payload: sender chooses bytes the receiver binary does not embed.
     let payload = if role.is_initiator() {
         let mut p = vec![0u8; (args.bits as usize).div_ceil(8).min(32)];
