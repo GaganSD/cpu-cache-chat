@@ -1,0 +1,11 @@
+[package]
+name = "ccc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types for cpu-cache-chat"
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

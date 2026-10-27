@@ -1,0 +1,13 @@
+[package]
+name = "ccc-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hardware and simulation transports for cpu-cache-chat"
+publish = false
+
+[dependencies]
+ccc-core.workspace = true
+ccc-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true

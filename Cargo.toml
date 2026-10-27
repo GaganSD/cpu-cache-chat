@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ccc-core",
+    "crates/ccc-protocol",
+    "crates/ccc-game",
+    "crates/ccc-channel",
+    "crates/ccc-app",
+    "crates/ccc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+repository = "https://github.com/GaganSD/cpu-cache-chat"
+
+[workspace.dependencies]
+ccc-core = { path = "crates/ccc-core" }
+ccc-protocol = { path = "crates/ccc-protocol" }
+ccc-game = { path = "crates/ccc-game" }
+ccc-channel = { path = "crates/ccc-channel" }
+ccc-app = { path = "crates/ccc-app" }
+crc32fast = "1.4"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+ctrlc = "3.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

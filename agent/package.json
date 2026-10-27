@@ -1,0 +1,10 @@
+{
+  "name": "cpu-cache-chat-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Narrow Pi SDK player for cpu-cache-chat",
+  "scripts": {
+    "start": "node src/play.mjs"
+  }
+}

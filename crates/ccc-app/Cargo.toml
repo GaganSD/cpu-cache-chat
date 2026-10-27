@@ -1,0 +1,13 @@
+[package]
+name = "ccc-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chat and game sessions over the hardware link"
+publish = false
+
+[dependencies]
+ccc-core.workspace = true
+ccc-protocol.workspace = true
+ccc-game.workspace = true
+ccc-channel.workspace = true

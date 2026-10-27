@@ -1,0 +1,10 @@
+[package]
+name = "ccc-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tic-tac-toe rules for cpu-cache-chat"
+publish = false
+
+[dependencies]
+ccc-core.workspace = true
