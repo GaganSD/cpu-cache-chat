@@ -1,105 +1,144 @@
 #!/usr/bin/env bash
-# Headless two-container run on OrbStack/Docker Engine.
-# Physical channel by default. Set CHANNEL=cpu to try contention.
-# This is not proof of cache eviction even if messages get through.
+# Headless isolated container run. No host data is passed between peers.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="${IMAGE:-cpu-cache-chat:local}"
 CHANNEL="${CHANNEL:-cpu}"
 MODE="${MODE:-chat}"
-WORKDIR="${TMPDIR:-/tmp}/ccc-dockere2e-$$"
-mkdir -p "$WORKDIR"
-A_IN="$WORKDIR/a.in"
-B_IN="$WORKDIR/b.in"
-A_OUT="$WORKDIR/a.out"
-B_OUT="$WORKDIR/b.out"
-mkfifo "$A_IN" "$B_IN"
+SLOT_MS="${SLOT_MS:-10}"
+CPUSET="${CPUSET:-0}"
+[[ "$CHANNEL" == cpu || "$CHANNEL" == cache ]] || { echo 'CHANNEL must be cpu or cache' >&2; exit 1; }
+[[ "$MODE" == chat ]] || { echo 'e2e-docker currently supports MODE=chat only' >&2; exit 1; }
+workdir=$(mktemp -d "${TMPDIR:-/tmp}/ccc-dockere2e.XXXXXX")
+prefix="ccc-e2e-$$"
+a="$prefix-a"; b="$prefix-b"
+owned_a=0; owned_b=0
 cleanup() {
   exec 3>&- 4>&- || true
-  docker rm -f ccc-e2e-a ccc-e2e-b >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
+  if [[ "$owned_a" == 1 ]]; then docker rm -f "$a" >/dev/null 2>&1 || true; fi
+  if [[ "$owned_b" == 1 ]]; then docker rm -f "$b" >/dev/null 2>&1 || true; fi
+  rm -rf "$workdir"
 }
 trap cleanup EXIT
-
+for name in "$a" "$b"; do
+  if docker inspect "$name" >/dev/null 2>&1; then
+    echo "$name already exists; refusing to remove it" >&2
+    trap - EXIT; rm -rf "$workdir"; exit 1
+  fi
+done
 docker info >/dev/null
-docker inspect "$IMAGE" >/dev/null
+docker image inspect "$IMAGE" >/dev/null
+common=(--init --network none --ipc private --read-only
+  --tmpfs /tmp:rw,nosuid,size=64m --security-opt no-new-privileges
+  --cap-drop ALL --user 65532:65532 --memory 256m --cpuset-cpus "$CPUSET")
+if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
 
-common=(
-  --rm -i
-  --init
-  --network none
-  --ipc private
-  --read-only
-  --tmpfs /tmp:rw,nosuid,size=64m
-  --security-opt no-new-privileges
-  --cap-drop ALL
-  --user 65532:65532
-  --memory 256m
-  --cpus 1
-)
+# A control with no sender must time out without decoding a frame. The report
+# remains diagnostic; this alone cannot establish a working transport.
+docker create --name "$b" "${common[@]}" "$IMAGE" probe --role b --channel "$CHANNEL" \
+  --slot-ms "$SLOT_MS" --silent --silent-seconds 5 >/dev/null
+owned_b=1
+docker start -a "$b" >"$workdir/silent" 2>&1 || { cat "$workdir/silent"; echo 'FAIL: silent control process failed'; exit 1; }
+cat "$workdir/silent"
+if ! grep -Fq 'false decoded frame=false' "$workdir/silent" || ! grep -Fq 'result=Err(Timeout)' "$workdir/silent"; then
+  echo 'FAIL: silent sender control did not pass'; exit 1
+fi
+docker rm "$b" >/dev/null
+owned_b=0
 
-: >"$A_OUT"
-: >"$B_OUT"
-docker run "${common[@]}" --name ccc-e2e-a --hostname ccc-e2e-a \
-  --cpuset-cpus 0 \
-  "$IMAGE" "$MODE" --role a --channel "$CHANNEL" --plain --slot-ms "${SLOT_MS:-5}" \
-  <"$A_IN" >"$A_OUT" 2>&1 &
-A_PID=$!
-docker run "${common[@]}" --name ccc-e2e-b --hostname ccc-e2e-b \
-  --cpuset-cpus 0 \
-  "$IMAGE" "$MODE" --role b --channel "$CHANNEL" --plain --slot-ms "${SLOT_MS:-5}" \
-  <"$B_IN" >"$B_OUT" 2>&1 &
-B_PID=$!
-exec 3>"$A_IN"
-exec 4>"$B_IN"
+# Probe receives without knowing the payload. Compare logs only after both
+# processes exit; no expected bytes are passed to the receiver.
+docker create --name "$b" "${common[@]}" "$IMAGE" probe --role b --channel "$CHANNEL" --bits 32 --slot-ms "$SLOT_MS" >/dev/null
+owned_b=1
+docker create --name "$a" "${common[@]}" "$IMAGE" probe --role a --channel "$CHANNEL" --bits 32 --slot-ms "$SLOT_MS" >/dev/null
+owned_a=1
+"$ROOT/scripts/inspect-isolation.sh" "$a" "$b"
+docker start -a "$b" >"$workdir/probe-b" 2>&1 & probe_b=$!
+sleep 2
+docker start -a "$a" >"$workdir/probe-a" 2>&1 & probe_a=$!
+status=0
+wait "$probe_a" || status=1
+wait "$probe_b" || status=1
+cat "$workdir/probe-a" "$workdir/probe-b"
+[[ "$status" == 0 ]] || { echo 'FAIL: probe process failed'; exit 1; }
+sent=$(sed -n 's/^sender payload .*: \[\(.*\)\]$/\1/p' "$workdir/probe-a" | tr -d ', ')
+received=$(sed -n 's/.*received bytes (hex): \([0-9a-f]*\).*/\1/p' "$workdir/probe-b")
+if [[ -z "$sent" || "$sent" != "$received" ]]; then
+  echo 'FAIL: receiver-blind probe did not decode all expected bits; BER unavailable if no frame decoded'; exit 1
+fi
+echo 'PASS: probe decoded expected bytes (0 bit errors in this frame) and silent control passed'
+docker rm "$a" "$b" >/dev/null
+owned_a=0; owned_b=0
 
+mkfifo "$workdir/a.in" "$workdir/b.in"
+# Open read/write so neither FIFO open can hang if Docker fails early.
+exec 3<>"$workdir/a.in" 4<>"$workdir/b.in"
+docker create -i --name "$a" "${common[@]}" "$IMAGE" chat --role a --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
+owned_a=1
+docker create -i --name "$b" "${common[@]}" "$IMAGE" chat --role b --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
+owned_b=1
+"$ROOT/scripts/inspect-isolation.sh" "$a" "$b"
+docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>&1 & A_PID=$!
+docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>&1 & B_PID=$!
 wait_for() {
-  local file="$1" needle="$2" tries="${3:-480}"
+  local file="$1" needle="$2" tries="${3:-240}"
   for _ in $(seq 1 "$tries"); do
-    if grep -q -- "$needle" "$file"; then
-      return 0
-    fi
-    if ! kill -0 "$A_PID" 2>/dev/null || ! kill -0 "$B_PID" 2>/dev/null; then
-      echo "container process exited early" >&2
-      break
-    fi
+    if grep -Fq -- "$needle" "$file"; then return 0; fi
+    if ! kill -0 "$A_PID" 2>/dev/null || ! kill -0 "$B_PID" 2>/dev/null; then break; fi
     sleep 0.25
   done
-  echo "timeout waiting for '$needle' in $file" >&2
-  echo "----- A -----" >&2
-  cat "$A_OUT" >&2 || true
-  echo "----- B -----" >&2
-  cat "$B_OUT" >&2 || true
+  echo "FAIL: waiting for '$needle'" >&2
+  echo '----- A -----' >&2; tail -30 "$workdir/a.out" >&2 || true
+  echo '----- B -----' >&2; tail -30 "$workdir/b.out" >&2 || true
   return 1
 }
-
-# Isolation inspect on the live names.
-sleep 1
-if docker inspect ccc-e2e-a >/dev/null 2>&1; then
-  docker inspect --format 'A network={{.HostConfig.NetworkMode}} privileged={{.HostConfig.Privileged}}' ccc-e2e-a
-  docker inspect --format 'B network={{.HostConfig.NetworkMode}} privileged={{.HostConfig.Privileged}}' ccc-e2e-b
-fi
-
-if ! wait_for "$A_OUT" "link: connected" 240; then
-  echo "FAIL: no hardware handshake (channel=$CHANNEL). Recorded as unusable, not a silent fallback."
-  exit 2
-fi
-wait_for "$B_OUT" "link: connected" 80
-
+wait_for "$workdir/a.out" 'link: connected'
+wait_for "$workdir/b.out" 'link: connected'
+wait_for_delivery_state() {
+  local file="$1" seq="$2" expected="$3"
+  for _ in $(seq 1 240); do
+    if grep -Fxq "seq $seq: delivery unknown" "$file"; then
+      echo "FAIL: seq $seq reached delivery unknown while waiting for $expected" >&2
+      tail -30 "$file" >&2
+      return 1
+    fi
+    if grep -Fxq "seq $seq: $expected" "$file"; then return 0; fi
+    if ! kill -0 "$A_PID" 2>/dev/null || ! kill -0 "$B_PID" 2>/dev/null; then break; fi
+    sleep 0.25
+  done
+  echo "FAIL: seq $seq did not reach $expected" >&2
+  tail -30 "$file" >&2
+  return 1
+}
+check_delivery() {
+  local sender="$1" receiver="$2" message="$3" seq
+  wait_for "$sender" "queued: $message"
+  wait_for "$sender" ': transmitting'
+  seq=$(sed -n 's/^seq \([0-9][0-9]*\): transmitting$/\1/p' "$sender" | head -n 1)
+  [[ -n "$seq" ]] || { echo "FAIL: missing transmission sequence for $message" >&2; return 1; }
+  wait_for_delivery_state "$sender" "$seq" 'awaiting ack'
+  wait_for_delivery_state "$sender" "$seq" 'delivered'
+  wait_for "$receiver" "peer: $message"
+  # All states must belong to the same message and appear in order. An earlier
+  # unknown result cannot be counted as delivery, even if a stale line exists.
+  if ! awk -v message="$message" -v seq="$seq" '
+    $0 == "queued: " message && !queued { queued = NR }
+    $0 == "seq " seq ": transmitting" && queued && !transmitting { transmitting = NR }
+    $0 == "seq " seq ": awaiting ack" && transmitting && !awaiting { awaiting = NR }
+    $0 == "seq " seq ": delivery unknown" && queued && !delivered { unknown = 1 }
+    $0 == "seq " seq ": delivered" && awaiting && !delivered { delivered = NR }
+    END { exit !(queued && transmitting > queued && awaiting > transmitting && delivered > awaiting && !unknown) }
+  ' "$sender"; then
+    echo "FAIL: delivery states missing, out of order, or unknown for $message" >&2
+    tail -30 "$sender" >&2
+    return 1
+  fi
+  echo "PASS: $message queued, transmitted, acknowledged, and received (seq $seq)"
+}
 printf 'hello-from-a\n' >&3
-if wait_for "$B_OUT" "peer: hello-from-a" 240; then
-  echo "PASS docker $CHANNEL A->B"
-else
-  echo "FAIL docker $CHANNEL A->B"
-  exit 3
-fi
+check_delivery "$workdir/a.out" "$workdir/b.out" 'hello-from-a'
 printf 'hello-from-b\n' >&4
-if wait_for "$A_OUT" "peer: hello-from-b" 240; then
-  echo "PASS docker $CHANNEL B->A"
-else
-  echo "FAIL docker $CHANNEL B->A"
-  exit 4
-fi
-printf '/q\n' >&3
-printf '/q\n' >&4
-wait "$A_PID" "$B_PID" || true
+check_delivery "$workdir/b.out" "$workdir/a.out" 'hello-from-b'
+echo "PASS docker $CHANNEL chat both directions"
+printf '/q\n' >&3; printf '/q\n' >&4
+wait "$A_PID" "$B_PID"

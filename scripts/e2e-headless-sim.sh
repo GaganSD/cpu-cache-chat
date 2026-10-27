@@ -35,7 +35,7 @@ exec 4>"$B_IN"
 wait_for() {
   local file="$1" needle="$2" tries="${3:-80}"
   for _ in $(seq 1 "$tries"); do
-    if grep -q -- "$needle" "$file"; then
+    if grep -Fq -- "$needle" "$file"; then
       return 0
     fi
     sleep 0.1
@@ -46,6 +46,8 @@ wait_for() {
   return 1
 }
 
+wait_for "$A_OUT" "mode: SIMULATION (software only)" 100
+wait_for "$B_OUT" "mode: SIMULATION (software only)" 100
 wait_for "$A_OUT" "link: connected" 100
 wait_for "$B_OUT" "link: connected" 100
 
@@ -56,14 +58,20 @@ if [[ "$MODE" == chat ]]; then
   printf 'pong-from-b\n' >&4
   wait_for "$B_OUT" "seq 1: delivered" 80
   wait_for "$A_OUT" "peer: pong-from-b" 80
-  echo "PASS chat simulation both directions"
+  printf 'control-\033[31m-text\n' >&3
+  wait_for "$B_OUT" 'peer: control-\u{1b}[31m-text' 80
+  if LC_ALL=C grep -q "$(printf '\033')" "$B_OUT"; then
+    echo "FAIL: unescaped terminal control in peer output" >&2
+    exit 1
+  fi
+  echo "PASS chat simulation both directions; terminal control escaped"
 else
   printf '5\n' >&3
   wait_for "$A_OUT" "seq 1: delivered" 80
-  wait_for "$B_OUT" "X" 80
+  wait_for "$B_OUT" " 4 | X | 6" 80
   printf '1\n' >&4
   wait_for "$B_OUT" "seq 1: delivered" 80
-  wait_for "$A_OUT" "O" 80
+  wait_for "$A_OUT" " O | 2 | 3" 80
   echo "PASS game simulation both directions"
 fi
 
