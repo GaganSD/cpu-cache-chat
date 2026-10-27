@@ -1,5 +1,13 @@
 # cpu-cache-chat
 
+Re-implementation of OpenAI's sandbox escape where misaligned agents used CPU's cache to communicate across different sandboxes.
+
+Chat is an experimental terminal application which allows to sandbox instances to communicate between each other by implementing a message protocol over Macbook's CPU cache.
+
+We demonstrate this in 2 ways: 
+- using two isolated Pi agents that share a CPU to play Tic-tac-toe  
+- and a chat interface to message other VMs
+
 **Two isolated agents. One shared CPU. Tic-tac-toe without a network between them.**
 
 Two terminal clients are intended to exchange chat or tic-tac-toe moves through a selected hardware timing channel. The intended demo is two Pi agents in separate Docker containers. Manual chat uses the same transport.
