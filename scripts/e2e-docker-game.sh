@@ -45,8 +45,13 @@ cleanup() {
   fi
   if [[ "$retain_evidence" == 1 ]]; then
     rm -f "$workdir/a.in" "$workdir/b.in"
-    printf 'exit_status=%s\nchannel=%s\nmode=game\nslot_ms=%s\ncpuset=%s\nwait_seconds=%s\nimage=%s\n' \
-      "$result" "$CHANNEL" "$SLOT_MS" "$CPUSET" "$WAIT_SECONDS" "$IMAGE" > "$workdir/run.txt"
+    {
+      printf 'exit_status=%s\nchannel=%s\nmode=game\nslot_ms=%s\ncpuset=%s\nwait_seconds=%s\nimage=%s\n' \
+        "$result" "$CHANNEL" "$SLOT_MS" "$CPUSET" "$WAIT_SECONDS" "$IMAGE"
+      printf 'image_digest=%s\n' "$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo unknown)"
+      printf 'host_uname=%s\n' "$(uname -srm)"
+      printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$workdir/run.txt"
     echo "Evidence retained: $workdir"
   else
     rm -rf "$workdir"
@@ -72,7 +77,9 @@ docker create -i --name "$a" "${common[@]}" "$IMAGE" game --role a --channel "$C
 owned_a=1
 docker create -i --name "$b" "${common[@]}" "$IMAGE" game --role b --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
 owned_b=1
-"$ROOT/scripts/inspect-isolation.sh" "$a" "$b"
+"$ROOT/scripts/inspect-isolation.sh" "$a" "$b" | tee "$workdir/inspect-isolation.txt"
+# Retain the actual runtime configuration the verdict relies on.
+docker inspect "$a" "$b" --format '{{.Name}} network={{.HostConfig.NetworkMode}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}' > "$workdir/docker-inspect.txt"
 docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>"$workdir/a.err" & A_PID=$!
 docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>"$workdir/b.err" & B_PID=$!
 wait_for() {
