@@ -97,6 +97,7 @@ pub fn start(
         }
         let _ = output.send(Update::Snapshot(session.snapshot()));
         let mut agent_paused = false;
+        let mut agent_failures = 0u32;
         while !stop.load(Ordering::SeqCst) {
             while let Ok(line) = input.try_recv() {
                 let result = match cfg.kind {
@@ -121,11 +122,21 @@ pub fn start(
                     None => Err(ccc_core::Error::Agent("no move".into())),
                 }) {
                     Ok(sq) => {
+                        agent_failures = 0;
                         let _ = output.send(Update::Note(format!("agent chose {sq}")));
                     }
                     Err(e) => {
-                        agent_paused = true;
-                        let _ = output.send(Update::Note(format!("agent paused: {e}")));
+                        agent_failures += 1;
+                        if agent_failures >= 3 {
+                            agent_paused = true;
+                            let _ = output.send(Update::Note(format!(
+                                "agent paused after {agent_failures} failed attempts: {e}"
+                            )));
+                        } else {
+                            let _ = output.send(Update::Note(format!(
+                                "agent attempt failed ({agent_failures}/3): {e}"
+                            )));
+                        }
                     }
                 }
                 let _ = output.send(Update::Snapshot(session.snapshot()));

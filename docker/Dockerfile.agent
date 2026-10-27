@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+# Agent image: the cpu-cache-chat binary plus Node and the narrow Pi player.
+# No model weights and no secrets are baked in. With
+# CCC_AGENT_PROVIDER=opencode-go the container needs network egress to
+# https://opencode.ai and the key passed via OPENCODE_GO_API_KEY at run time;
+# game moves still travel only over the selected physical channel.
+ARG CCC_IMAGE=cpu-cache-chat:local
+FROM ${CCC_IMAGE} AS ccc
+
+FROM node:22-bookworm-slim
+COPY --from=ccc /usr/local/bin/cpu-cache-chat /usr/local/bin/cpu-cache-chat
+COPY --from=ccc /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
+WORKDIR /opt/ccc/agent
+COPY agent/package.json agent/package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY agent/src ./src
+USER 65532:65532
+# The Pi SDK credential store needs a writable HOME (read-only rootfs here).
+ENV HOME=/tmp
+WORKDIR /tmp
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["--help"]

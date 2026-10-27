@@ -37,6 +37,8 @@ pub struct Link<W: Wire> {
     have_token: bool,
     token_since: Instant,
     handoff: Option<TokenHandoff>,
+    degraded_since: Option<Instant>,
+    reoffer_backoff: Duration,
 }
 
 struct TokenHandoff {
@@ -68,6 +70,8 @@ impl<W: Wire> Link<W> {
             have_token,
             token_since: Instant::now(),
             handoff: None,
+            degraded_since: None,
+            reoffer_backoff: Duration::ZERO,
         }
     }
 
@@ -220,7 +224,7 @@ impl<W: Wire> Link<W> {
                 .is_some_and(|handoff| handoff.sent_at.elapsed() >= handoff.confirm_wait)
         {
             self.handoff = None;
-            self.state = LinkState::Degraded;
+            self.enter_degraded();
             events.push(LinkEvent::State(self.state));
             events.push(LinkEvent::Error(
                 "token handoff unconfirmed; peer may hold token".into(),
@@ -228,12 +232,56 @@ impl<W: Wire> Link<W> {
             return Ok(events);
         }
 
+        // Token re-arbitration after an unconfirmed handoff. Only the
+        // initiator re-offers, and re-offering never claims the token: the
+        // peer acquires it only by receiving the heartbeat, so this path
+        // cannot create two owners. Without it, a lost handoff plus a lost
+        // confirmation leaves both sides tokenless forever.
+        if !receiving
+            && self.state == LinkState::Degraded
+            && self.cfg.role.is_initiator()
+            && self.inflight.is_none()
+            && self.handoff.is_none()
+            && self
+                .degraded_since
+                .is_some_and(|since| since.elapsed() >= self.reoffer_backoff)
+        {
+            self.have_token = false;
+            let result = self.send_control(FrameType::Heartbeat, 0);
+            let confirm_wait = if result.is_err() {
+                self.cfg
+                    .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD)
+            } else {
+                self.cfg.response_budget(FRAME_OVERHEAD)
+            };
+            self.handoff = Some(TokenHandoff {
+                sent_at: Instant::now(),
+                confirm_wait,
+            });
+            self.degraded_since = Some(Instant::now());
+            let doubled = self.reoffer_backoff.saturating_mul(2);
+            self.reoffer_backoff = doubled
+                .max(self.cfg.response_budget(FRAME_OVERHEAD))
+                .min(Duration::from_secs(60));
+            if matches!(result, Err(Error::Interrupted)) {
+                return Err(Error::Interrupted);
+            }
+            match result {
+                Ok(()) => events.push(LinkEvent::Info(
+                    "re-offering token after unconfirmed handoff".into(),
+                )),
+                Err(e) => events.push(LinkEvent::Error(format!(
+                    "token re-offer send failed: {e}; awaiting confirmation"
+                ))),
+            }
+        }
+
         if let Some(inf) = self.inflight.as_ref().filter(|_| !receiving) {
             if inf.sent_at.elapsed() >= inf.ack_wait {
                 let seq = inf.seq;
                 if inf.attempts > u64::from(self.cfg.max_retries) {
                     self.inflight = None;
-                    self.state = LinkState::Degraded;
+                    self.enter_degraded();
                     events.push(LinkEvent::Delivery {
                         seq,
                         state: Delivery::Unknown,
@@ -300,9 +348,13 @@ impl<W: Wire> Link<W> {
         match frame.ftype {
             FrameType::Ack => {
                 if frame.ack_seq == 0 && self.handoff.take().is_some() {
-                    return Ok(Some(vec![LinkEvent::Info(
-                        "token handoff confirmed".into(),
-                    )]));
+                    let mut events = vec![LinkEvent::Info("token handoff confirmed".into())];
+                    if self.state == LinkState::Degraded {
+                        self.state = LinkState::Connected;
+                        self.degraded_since = None;
+                        events.push(LinkEvent::State(self.state));
+                    }
+                    return Ok(Some(events));
                 }
                 if let Some(inf) = &self.inflight {
                     if frame.ack_seq == inf.seq {
@@ -362,7 +414,16 @@ impl<W: Wire> Link<W> {
                 match AppMessage::decode(&frame.payload) {
                     Ok(msg) => {
                         self.last_rx_seq = Some(frame.seq);
-                        let mut events = vec![LinkEvent::Recv(msg)];
+                        // Valid in-sequence peer data proves the peer holds
+                        // the token and the link works; recover from a
+                        // degraded handoff without claiming the token.
+                        let mut events = Vec::new();
+                        if self.state == LinkState::Degraded {
+                            self.state = LinkState::Connected;
+                            self.degraded_since = None;
+                            events.push(LinkEvent::State(self.state));
+                        }
+                        events.push(LinkEvent::Recv(msg));
                         if let Err(e) = self.send_control(FrameType::Ack, frame.seq) {
                             if matches!(e, Error::Interrupted) {
                                 return Err(e);
@@ -411,6 +472,14 @@ impl<W: Wire> Link<W> {
         self.have_token = true;
         self.token_since = Instant::now();
         self.handoff = None;
+    }
+
+    fn enter_degraded(&mut self) {
+        self.state = LinkState::Degraded;
+        if self.degraded_since.is_none() {
+            self.degraded_since = Some(Instant::now());
+            self.reoffer_backoff = self.cfg.response_budget(FRAME_OVERHEAD);
+        }
     }
 
     fn retransmit_inflight(&mut self, reason: &str) -> Result<Vec<LinkEvent>, Error> {

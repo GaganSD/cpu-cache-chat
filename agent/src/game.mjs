@@ -44,6 +44,23 @@ export function makeTools(state, Type, stop) {
   };
 }
 
+// Narrow allowlist of OpenCode Go hosted models for CCC_AGENT_PROVIDER=opencode-go.
+// Fields mirror the pi-ai provider registry so tool calling behaves the same;
+// thinkingLevel is chosen per model because not every model supports "off".
+export const OPENCODE_GO_MODELS = {
+  "glm-5.3-flash": {
+    reasoning: true,
+    thinkingLevel: "off",
+    compat: { supportsStore: false, supportsDeveloperRole: false, supportsStrictMode: true, maxTokensField: "max_tokens" },
+  },
+  "deepseek-v4.1-flash": {
+    reasoning: true,
+    thinkingLevel: "low",
+    compat: { supportsStore: false, supportsDeveloperRole: false, supportsStrictMode: true, maxTokensField: "max_tokens",
+      requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" },
+  },
+};
+
 export function llamaBaseUrl(raw = "http://127.0.0.1:8080") {
   let url;
   try { url = new URL(raw); } catch { throw new Error("invalid LLAMA_BASE_URL"); }
