@@ -14,7 +14,7 @@ Two terminal clients are intended to exchange chat or tic-tac-toe moves through 
 
 Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
 
-> **Hardware link: not locked.** Headless simulation chat and game pass. Docker isolation (`--network none`) and OrbStack debian VMs run. Shared-CPU benches show timing contrast. Isolated CPU probes have decoded frames at 50 ms, and one chat message was delivered and acknowledged; bidirectional hardware chat is not yet verified. See [docs/measurements.md](docs/measurements.md).
+> **Hardware link: partially verified.** Headless simulation chat and game pass. Docker isolation (`--network none`) holds. Over the CPU-contention channel at 50 ms slots, two isolated containers completed a bidirectional acknowledged chat and a full tic-tac-toe game (`X wins` on both boards) — single runs, not reliability statistics. Cache mode has decoded a receiver-blind frame with a passing CRC and delivered one chat direction, but is not bidirectionally verified. The Pi agent path is untested. See [docs/measurements.md](docs/measurements.md).
 
 ## What works now
 
@@ -35,7 +35,7 @@ cpu-cache-chat inspect-isolation
 
 Two-process software pair: `scripts/host-sim-pair.sh`.
 
-Headless sim: `MODE=chat ./scripts/e2e-headless-sim.sh`. Two-container launch: `scripts/run-pair.sh` or `scripts/e2e-docker.sh`. Isolation uses `--network none` and does not relay messages. Physical handshake is not working yet. Computer-use retest: [docs/codex-computer-use-test.md](docs/codex-computer-use-test.md).
+Headless sim: `MODE=chat ./scripts/e2e-headless-sim.sh`. Two-container launch: `scripts/run-pair.sh` or `scripts/e2e-docker.sh`; physical game: `scripts/e2e-docker-game.sh`. Isolation uses `--network none` and does not relay messages. Computer-use retest: [docs/codex-computer-use-test.md](docs/codex-computer-use-test.md).
 
 ## Isolation
 
