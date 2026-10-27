@@ -29,21 +29,24 @@ impl Wire for ObservedWire {
                 .output
                 .send(Update::Delivery(seq, Delivery::Transmitting));
         }
-        let result = self.inner.send_blob(bytes, timeout);
-        if result.is_err() {
-            if let Some(seq) = seq {
-                let _ = self.output.send(Update::Delivery(seq, Delivery::Unknown));
-            }
-        }
-        result
+        // A failed attempt is not a final delivery state: the link owns the
+        // retry budget and reports Unknown only when it is exhausted.
+        self.inner.send_blob(bytes, timeout)
     }
     fn recv_blob(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
         self.inner.recv_blob(timeout)
+    }
+    fn receive_in_progress(&self) -> bool {
+        self.inner.receive_in_progress()
     }
     fn interrupt(&mut self) {
         self.inner.interrupt();
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/internal/worker.rs"]
+mod tests;
 
 pub fn start(
     cfg: RuntimeConfig,

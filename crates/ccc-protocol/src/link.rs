@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ccc_core::{Delivery, Error, LinkState, RuntimeConfig};
 
-use crate::codec::{decode_frame, encode_frame};
+use crate::codec::{decode_frame, encode_frame, FRAME_OVERHEAD};
 use crate::frame::{AppMessage, Frame, FrameType};
 use crate::Wire;
 
@@ -36,6 +36,12 @@ pub struct Link<W: Wire> {
     peer_seen: bool,
     have_token: bool,
     token_since: Instant,
+    handoff: Option<TokenHandoff>,
+}
+
+struct TokenHandoff {
+    sent_at: Instant,
+    confirm_wait: Duration,
 }
 
 struct Inflight {
@@ -43,6 +49,7 @@ struct Inflight {
     frame: Frame,
     attempts: u64,
     sent_at: Instant,
+    ack_wait: Duration,
 }
 
 impl<W: Wire> Link<W> {
@@ -60,6 +67,7 @@ impl<W: Wire> Link<W> {
             peer_seen: false,
             have_token,
             token_since: Instant::now(),
+            handoff: None,
         }
     }
 
@@ -93,7 +101,7 @@ impl<W: Wire> Link<W> {
         let mut events = vec![LinkEvent::State(self.state)];
         if self.cfg.role.is_initiator() {
             let slice = if self.cfg.channel.is_physical() {
-                Duration::from_secs(4)
+                self.cfg.response_budget(FRAME_OVERHEAD)
             } else {
                 (self.cfg.sync_timeout / self.cfg.max_retries.max(1)).max(Duration::from_millis(50))
             };
@@ -101,6 +109,9 @@ impl<W: Wire> Link<W> {
             let mut ok = false;
             for _ in 0..=self.cfg.max_retries {
                 if let Err(e) = self.send_control(FrameType::Sync, 0) {
+                    if matches!(e, Error::Interrupted) {
+                        return Err(e);
+                    }
                     last = e;
                     continue;
                 }
@@ -110,6 +121,7 @@ impl<W: Wire> Link<W> {
                         ok = true;
                         break;
                     }
+                    Err(Error::Interrupted) => return Err(Error::Interrupted),
                     Err(e) => last = e,
                 }
             }
@@ -118,13 +130,15 @@ impl<W: Wire> Link<W> {
                 return Err(last);
             }
         } else {
-            let frame = self.recv_typed(FrameType::Sync, self.cfg.sync_timeout)?;
+            let frame =
+                self.recv_typed(FrameType::Sync, self.cfg.sync_listen_budget(FRAME_OVERHEAD))?;
             self.accept_session(frame.session);
             self.send_control(FrameType::SyncAck, 0)?;
         }
         self.peer_seen = true;
         self.have_token = self.cfg.role.is_initiator();
         self.token_since = Instant::now();
+        self.handoff = None;
         self.state = LinkState::Connected;
         events.push(LinkEvent::State(self.state));
         events.push(LinkEvent::Info(format!(
@@ -139,30 +153,83 @@ impl<W: Wire> Link<W> {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        if self.inflight.is_none() && self.state == LinkState::Connected && self.have_token {
+        let receiving = self.wire.receive_in_progress();
+        if !receiving
+            && self.inflight.is_none()
+            && self.state == LinkState::Connected
+            && self.have_token
+        {
             if let Some((seq, msg)) = self.queue.pop_front() {
                 let payload = msg.encode()?;
                 let frame = Frame::new(FrameType::Data, self.session, seq, payload)?;
-                self.transmit(&frame)?;
+                // Even an error can occur after enough of the frame reached
+                // the peer. Preserve the sequence and wait for a possible ACK
+                // before retrying; an error never implies delivery either way.
+                let result = self.transmit(&frame);
+                let ack_wait = self.acknowledgement_wait(&frame, result.is_err());
                 self.inflight = Some(Inflight {
                     seq,
                     frame,
                     attempts: 1,
                     sent_at: Instant::now(),
+                    ack_wait,
                 });
+                if matches!(result, Err(Error::Interrupted)) {
+                    return Err(Error::Interrupted);
+                }
                 events.push(LinkEvent::Delivery {
                     seq,
                     state: Delivery::AwaitingAck,
                 });
-            } else if self.token_since.elapsed() >= Duration::from_millis(80)
-                && self.send_control(FrameType::Heartbeat, 0).is_ok()
-            {
+                if let Err(e) = result {
+                    events.push(LinkEvent::Error(format!(
+                        "send seq {seq} attempt 1 failed: {e}; waiting for ack before retry"
+                    )));
+                }
+            } else if self.token_since.elapsed() >= Duration::from_millis(80) {
+                // A send error is ambiguous: the peer may have received the
+                // token. Relinquish it before attempting the handoff and do
+                // not reclaim it if confirmation is lost.
                 self.have_token = false;
+                let result = self.send_control(FrameType::Heartbeat, 0);
+                let confirm_wait = if result.is_err() {
+                    self.cfg
+                        .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD)
+                } else {
+                    self.cfg.response_budget(FRAME_OVERHEAD)
+                };
+                self.handoff = Some(TokenHandoff {
+                    sent_at: Instant::now(),
+                    confirm_wait,
+                });
+                if matches!(result, Err(Error::Interrupted)) {
+                    return Err(Error::Interrupted);
+                }
+                if let Err(e) = result {
+                    events.push(LinkEvent::Error(format!(
+                        "token handoff send failed: {e}; awaiting confirmation"
+                    )));
+                }
             }
         }
 
-        if let Some(inf) = &self.inflight {
-            if inf.sent_at.elapsed() >= self.cfg.ack_timeout {
+        if !receiving
+            && self
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.sent_at.elapsed() >= handoff.confirm_wait)
+        {
+            self.handoff = None;
+            self.state = LinkState::Degraded;
+            events.push(LinkEvent::State(self.state));
+            events.push(LinkEvent::Error(
+                "token handoff unconfirmed; peer may hold token".into(),
+            ));
+            return Ok(events);
+        }
+
+        if let Some(inf) = self.inflight.as_ref().filter(|_| !receiving) {
+            if inf.sent_at.elapsed() >= inf.ack_wait {
                 let seq = inf.seq;
                 if inf.attempts > u64::from(self.cfg.max_retries) {
                     self.inflight = None;
@@ -177,21 +244,28 @@ impl<W: Wire> Link<W> {
                     )));
                     return Ok(events);
                 }
-                let mut inf = self.inflight.take().unwrap();
-                inf.attempts += 1;
-                self.transmit(&inf.frame)?;
-                inf.sent_at = Instant::now();
-                let attempts = inf.attempts;
-                self.inflight = Some(inf);
-                events.push(LinkEvent::Info(format!(
-                    "retransmit seq {seq} attempt {attempts}"
-                )));
+                events.extend(self.retransmit_inflight("retransmit")?);
             }
         }
 
-        let wait = self.inflight.as_ref().map_or(wait, |inf| {
-            wait.min(self.cfg.ack_timeout.saturating_sub(inf.sent_at.elapsed()))
-        });
+        let wait = self
+            .inflight
+            .as_ref()
+            .filter(|_| !receiving)
+            .map_or(wait, |inf| {
+                wait.min(inf.ack_wait.saturating_sub(inf.sent_at.elapsed()))
+            });
+        let wait = if receiving {
+            wait
+        } else {
+            self.handoff.as_ref().map_or(wait, |handoff| {
+                wait.min(
+                    handoff
+                        .confirm_wait
+                        .saturating_sub(handoff.sent_at.elapsed()),
+                )
+            })
+        };
         match self.wire.recv_blob(wait) {
             Ok(bytes) => {
                 if let Some(more) = self.on_bytes(&bytes)? {
@@ -225,6 +299,11 @@ impl<W: Wire> Link<W> {
         }
         match frame.ftype {
             FrameType::Ack => {
+                if frame.ack_seq == 0 && self.handoff.take().is_some() {
+                    return Ok(Some(vec![LinkEvent::Info(
+                        "token handoff confirmed".into(),
+                    )]));
+                }
                 if let Some(inf) = &self.inflight {
                     if frame.ack_seq == inf.seq {
                         let seq = inf.seq;
@@ -245,35 +324,32 @@ impl<W: Wire> Link<W> {
                 Ok(Some(vec![LinkEvent::Info("ignored unmatched ack".into())]))
             }
             FrameType::Nack => {
-                let retry = self.inflight.as_ref().and_then(|inf| {
-                    if frame.ack_seq == inf.seq && inf.attempts <= u64::from(self.cfg.max_retries) {
-                        Some((inf.seq, inf.frame.clone()))
-                    } else {
-                        None
-                    }
+                let retry = self.inflight.as_ref().is_some_and(|inf| {
+                    frame.ack_seq == inf.seq && inf.attempts <= u64::from(self.cfg.max_retries)
                 });
-                if let Some((seq, framed)) = retry {
-                    if let Some(inf) = &mut self.inflight {
-                        inf.attempts += 1;
-                    }
-                    self.transmit(&framed)?;
-                    if let Some(inf) = &mut self.inflight {
-                        inf.sent_at = Instant::now();
-                    }
-                    return Ok(Some(vec![LinkEvent::Info(format!(
-                        "nack retransmit seq {seq}"
-                    ))]));
+                if retry {
+                    return Ok(Some(self.retransmit_inflight("nack retransmit")?));
                 }
                 Ok(None)
             }
             FrameType::Data => {
+                // A valid peer data frame also proves the peer acquired the
+                // token even if its handoff ACK was lost.
+                self.handoff = None;
                 if let Some(prev) = self.last_rx_seq {
                     if frame.seq == prev {
-                        self.send_control(FrameType::Ack, frame.seq)?;
-                        return Ok(Some(vec![LinkEvent::Info(format!(
+                        let result = self.send_control(FrameType::Ack, frame.seq);
+                        if matches!(result, Err(Error::Interrupted)) {
+                            return Err(Error::Interrupted);
+                        }
+                        let mut events = vec![LinkEvent::Info(format!(
                             "duplicate seq {} suppressed",
                             frame.seq
-                        ))]));
+                        ))];
+                        if let Err(e) = result {
+                            events.push(LinkEvent::Error(format!("ack failed: {e}")));
+                        }
+                        return Ok(Some(events));
                     }
                 }
                 let expected = self.last_rx_seq.map_or(1, next_sequence);
@@ -288,6 +364,9 @@ impl<W: Wire> Link<W> {
                         self.last_rx_seq = Some(frame.seq);
                         let mut events = vec![LinkEvent::Recv(msg)];
                         if let Err(e) = self.send_control(FrameType::Ack, frame.seq) {
+                            if matches!(e, Error::Interrupted) {
+                                return Err(e);
+                            }
                             events.push(LinkEvent::Error(format!("ack failed: {e}")));
                         }
                         Ok(Some(events))
@@ -299,8 +378,18 @@ impl<W: Wire> Link<W> {
                 }
             }
             FrameType::Heartbeat => {
+                let result = self.send_control(FrameType::Ack, 0);
+                if matches!(result, Err(Error::Interrupted)) {
+                    return Err(Error::Interrupted);
+                }
                 self.grant_token();
-                Ok(None)
+                if let Err(e) = result {
+                    Ok(Some(vec![LinkEvent::Error(format!(
+                        "token confirmation failed: {e}"
+                    ))]))
+                } else {
+                    Ok(None)
+                }
             }
             FrameType::Close => {
                 self.state = LinkState::Closed;
@@ -321,6 +410,43 @@ impl<W: Wire> Link<W> {
     fn grant_token(&mut self) {
         self.have_token = true;
         self.token_since = Instant::now();
+        self.handoff = None;
+    }
+
+    fn retransmit_inflight(&mut self, reason: &str) -> Result<Vec<LinkEvent>, Error> {
+        let mut inf = self.inflight.take().expect("inflight frame exists");
+        inf.attempts += 1;
+        let seq = inf.seq;
+        let attempts = inf.attempts;
+        let result = self.transmit(&inf.frame);
+        inf.ack_wait = self.acknowledgement_wait(&inf.frame, result.is_err());
+        inf.sent_at = Instant::now();
+        // Restore before examining the result, including interruption. An
+        // ambiguous send must never lose or replace the original sequence.
+        self.inflight = Some(inf);
+        if matches!(result, Err(Error::Interrupted)) {
+            return Err(Error::Interrupted);
+        }
+        let mut events = vec![LinkEvent::Info(format!(
+            "{reason} seq {seq} attempt {attempts}"
+        ))];
+        if let Err(e) = result {
+            events.push(LinkEvent::Error(format!(
+                "send seq {seq} attempt {attempts} failed: {e}; waiting for ack before retry"
+            )));
+        }
+        Ok(events)
+    }
+
+    fn acknowledgement_wait(&self, frame: &Frame, send_failed: bool) -> Duration {
+        if send_failed {
+            self.cfg.failed_send_recovery_budget(
+                FRAME_OVERHEAD.saturating_add(frame.payload.len()),
+                FRAME_OVERHEAD,
+            )
+        } else {
+            self.cfg.response_budget(FRAME_OVERHEAD)
+        }
     }
 
     fn send_control(&mut self, ftype: FrameType, ack_seq: u16) -> Result<(), Error> {
@@ -331,17 +457,13 @@ impl<W: Wire> Link<W> {
     fn transmit(&mut self, frame: &Frame) -> Result<(), Error> {
         let bytes = encode_frame(frame)?;
         self.wire
-            .send_blob(&bytes, self.cfg.ack_timeout)
-            .map_err(|e| match e {
-                Error::Timeout => Error::Timeout,
-                other => other,
-            })
+            .send_blob(&bytes, self.cfg.send_budget(bytes.len()))
     }
 
     fn recv_typed(&mut self, want: FrameType, timeout: Duration) -> Result<Frame, Error> {
-        let deadline = Instant::now() + timeout;
+        let began = Instant::now();
         loop {
-            let remain = deadline.saturating_duration_since(Instant::now());
+            let remain = timeout.saturating_sub(began.elapsed());
             if remain.is_zero() {
                 return Err(Error::Timeout);
             }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -11,6 +12,11 @@ const CARRIER_ONES: u32 = 8;
 const LOCK_ONES: u32 = 32;
 const PREAMBLE_BITS: usize = 32;
 const TRAINING_BITS: usize = CARRIER_ONES as usize + PREAMBLE_BITS;
+// The first interleaved SECDED bit is parity position 1 of the high length
+// byte. For lengths below 512 that byte is 0 or 1, and this parity is zero.
+const _: () = assert!(ccc_core::MAX_PAYLOAD + 64 < 512);
+const FEC_BITS: usize = 13;
+const FEC_BLOCK_BYTES: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PhyKind {
@@ -26,6 +32,108 @@ pub struct Phy {
     cpu_iters: u32,
     decoder: Option<Decoder>,
     next_slot: Option<Instant>,
+    hunt: Option<HuntState>,
+    frame: Option<FrameReceiver>,
+    integral: Option<Integral>,
+    tx_slots: Option<u64>,
+}
+
+#[derive(Default)]
+struct Integral {
+    end: Option<Instant>,
+    total: Duration,
+    count: u32,
+    paused_at: Option<Instant>,
+}
+
+struct HuntState {
+    windows: [VecDeque<Option<Duration>>; 4],
+    phase: usize,
+    end: Instant,
+    count: u64,
+    erasures: u64,
+    began: Instant,
+    candidate: Option<(Decoder, Instant, u128, u8)>,
+    integral: Integral,
+}
+
+struct FrameReceiver {
+    samples: [[Duration; FEC_BITS]; FEC_BLOCK_BYTES],
+    bits: usize,
+    block_bytes: usize,
+    length: Option<usize>,
+    bytes: Vec<u8>,
+    costs: Vec<Duration>,
+}
+
+impl Default for FrameReceiver {
+    fn default() -> Self {
+        Self {
+            samples: [[Duration::ZERO; FEC_BITS]; FEC_BLOCK_BYTES],
+            bits: 0,
+            block_bytes: 2,
+            length: None,
+            bytes: Vec::new(),
+            costs: Vec::new(),
+        }
+    }
+}
+
+impl FrameReceiver {
+    /// Consume one physical frame bit. Incomplete fields remain in this
+    /// object, so a polling deadline never drops a partially received frame.
+    fn push_sample(
+        &mut self,
+        sample: Duration,
+        decoder: Decoder,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let word = self.bits % self.block_bytes;
+        let position = self.bits / self.block_bytes;
+        self.samples[word][position] = sample;
+        self.bits += 1;
+        if self.bits < FEC_BITS * self.block_bytes {
+            return Ok(None);
+        }
+        let mut decoded = Vec::with_capacity(self.block_bytes);
+        for samples in &self.samples[..self.block_bytes] {
+            let (byte, corrected) = soft_fec_decode(samples, decoder)?;
+            if corrected && std::env::var_os("CCC_DEBUG").is_some() {
+                eprintln!("phy FEC corrected a bit");
+            }
+            decoded.push(byte);
+        }
+        self.bits = 0;
+        match self.length {
+            None => {
+                let len = u16::from_be_bytes([decoded[0], decoded[1]]) as usize;
+                if len > ccc_core::MAX_PAYLOAD + 64 {
+                    return Err(Error::Corrupt("bad length"));
+                }
+                self.length = Some(len);
+                self.block_bytes = (len + 4).min(FEC_BLOCK_BYTES);
+                Ok(None)
+            }
+            Some(len) => {
+                self.bytes.extend_from_slice(&decoded);
+                let remaining = len + 4 - self.bytes.len();
+                if remaining > 0 {
+                    self.block_bytes = remaining.min(FEC_BLOCK_BYTES);
+                    return Ok(None);
+                }
+                let actual_crc =
+                    u32::from_be_bytes(self.bytes[len..].try_into().expect("four CRC bytes"));
+                self.bytes.truncate(len);
+                let expected_crc = crc32_of(&self.bytes);
+                if actual_crc != expected_crc {
+                    if std::env::var_os("CCC_DEBUG").is_some() {
+                        eprintln!("phy CRC mismatch received={actual_crc:08x} expected={expected_crc:08x}");
+                    }
+                    return Err(Error::Corrupt("channel crc"));
+                }
+                Ok(Some(std::mem::take(&mut self.bytes)))
+            }
+        }
+    }
 }
 
 struct CacheWork {
@@ -56,6 +164,10 @@ impl Phy {
             cpu_iters: 8_000,
             decoder: None,
             next_slot: None,
+            hunt: None,
+            frame: None,
+            integral: None,
+            tx_slots: None,
         }
     }
 
@@ -73,6 +185,24 @@ impl Phy {
 
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Whether a recognized acquisition or partially decoded frame is still
+    /// within its sampling window. Ordinary idle hunting does not hold the
+    /// link token; a stale receive cannot block sends indefinitely.
+    pub fn receive_in_progress(&self) -> bool {
+        let now = Instant::now();
+        if self.decoder.is_some() {
+            return self
+                .next_slot
+                .is_some_and(|at| now.saturating_duration_since(at) < self.slot);
+        }
+        self.hunt
+            .as_ref()
+            .and_then(|hunt| hunt.candidate)
+            .is_some_and(|(_, at, _, _)| {
+                now.saturating_duration_since(at) < self.slot.saturating_mul(2)
+            })
     }
 
     /// Role A: 32 busy slots then 32 idle. Role B: sample 64 slot costs.
@@ -97,62 +227,101 @@ impl Phy {
     }
 
     pub fn send_blob(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), Error> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidInput("timeout too large".into()))?;
         self.check(deadline)?;
+        // The first encoded length bit is always zero for a valid frame.
+        if bytes.len() > ccc_core::MAX_PAYLOAD + 64 {
+            return Err(Error::TooLarge(bytes.len()));
+        }
         let len = u16::try_from(bytes.len()).map_err(|_| Error::TooLarge(bytes.len()))?;
+        // A half-duplex send interrupts any pending receive. The link should
+        // avoid this while a frame is being decoded; discard stale samples if
+        // it nevertheless asks to transmit.
+        self.hunt = None;
+        self.frame = None;
+        self.integral = None;
+        self.decoder = None;
         self.next_slot = None;
         if std::env::var_os("CCC_DEBUG").is_some() {
             eprintln!("phy send {} bytes", bytes.len());
         }
-        // Inter-frame gap.
-        self.idle_slots(4, deadline)?;
-        for _ in 0..LOCK_ONES {
-            self.slot_activity(deadline)?;
+        self.tx_slots = Some(0);
+        let began = Instant::now();
+        let result = (|| {
+            // Inter-frame gap.
+            self.idle_slots(4, deadline)?;
+            for _ in 0..LOCK_ONES {
+                self.slot_activity(deadline)?;
+            }
+            self.idle_slots(8, deadline)?;
+            self.send_u32(PREAMBLE, deadline)?;
+            self.send_fec_block(&len.to_be_bytes(), deadline)?;
+            let mut encoded = Vec::with_capacity(bytes.len() + 4);
+            encoded.extend_from_slice(bytes);
+            encoded.extend_from_slice(&crc32_of(bytes).to_be_bytes());
+            for block in encoded.chunks(FEC_BLOCK_BYTES) {
+                self.send_fec_block(block, deadline)?;
+            }
+            self.idle_slots(2, deadline)
+        })();
+        if let Err(ref error) = result {
+            if std::env::var_os("CCC_DEBUG").is_some() {
+                eprintln!(
+                    "phy send failed after {:?}, slot {:?}: {error}",
+                    began.elapsed(),
+                    self.tx_slots
+                );
+            }
         }
-        self.idle_slots(8, deadline)?;
-        self.send_u32(PREAMBLE, deadline)?;
-        self.send_u16(len, deadline)?;
-        for &b in bytes {
-            self.send_u8(b, deadline)?;
-        }
-        let crc = crc32_of(bytes);
-        self.send_u32(crc, deadline)?;
-        self.idle_slots(2, deadline)
+        self.tx_slots = None;
+        result
     }
 
     pub fn recv_blob(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
-        let deadline = Instant::now() + timeout;
-        if self.decoder.is_none() {
-            self.hunt_preamble(deadline)?;
-        }
-        let result = self.read_trained_frame(deadline);
-        match &result {
-            Ok(_) => {
-                self.decoder = None;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidInput("timeout too large".into()))?;
+        let result = (|| {
+            if self.decoder.is_none() {
+                self.hunt_preamble(deadline)?;
             }
-            Err(Error::Timeout) if self.decoder.is_none() => {}
-            Err(_) => {
-                self.decoder = None;
-                self.next_slot = None;
-            }
+            self.read_trained_frame(deadline)
+        })();
+        // Timeout is a bounded poll: preserve all acquisition and frame state.
+        if !matches!(result, Err(Error::Timeout)) {
+            self.decoder = None;
+            self.next_slot = None;
+            self.hunt = None;
+            self.frame = None;
+            self.integral = None;
         }
         result
     }
 
     fn read_trained_frame(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
-        let len = self.recv_u16(deadline)? as usize;
-        if len > ccc_core::MAX_PAYLOAD + 64 {
-            return Err(Error::Corrupt("bad length"));
+        loop {
+            let (_, cost) = self.sample_slot(deadline)?;
+            let decoder = self.decoder.ok_or(Error::Corrupt("untrained receiver"))?;
+            let frame = self.frame.get_or_insert_with(FrameReceiver::default);
+            if std::env::var_os("CCC_DEBUG").is_some() {
+                frame.costs.push(cost);
+            }
+            let result = frame.push_sample(cost, decoder);
+            if (frame.bits == 0 || result.is_err()) && !frame.costs.is_empty() {
+                eprintln!("phy decoded field costs={:?}", frame.costs);
+                frame.costs.clear();
+            }
+            if let Err(ref error) = result {
+                if std::env::var_os("CCC_DEBUG").is_some() {
+                    eprintln!("phy frame rejected: {error}");
+                }
+            }
+            if let Some(bytes) = result? {
+                return Ok(bytes);
+            }
         }
-        let mut bytes = vec![0u8; len];
-        for slot in &mut bytes {
-            *slot = self.recv_u8(deadline)?;
-        }
-        let crc = self.recv_u32(deadline)?;
-        if crc != crc32_of(&bytes) {
-            return Err(Error::Corrupt("channel crc"));
-        }
-        Ok(bytes)
     }
 
     // Oversample the channel, looking for the complete preamble at every
@@ -162,43 +331,139 @@ impl Phy {
         if quantum.is_zero() {
             return Err(Error::InvalidInput("slot too short to oversample".into()));
         }
-        let mut baseline = Duration::MAX;
-        for _ in 0..8 {
-            let end = Instant::now() + quantum;
-            baseline = baseline.min(self.integrate_until(end, deadline)?);
+        let now = Instant::now();
+        let end = now
+            .checked_add(quantum)
+            .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+        let mut hunt = self.hunt.take().unwrap_or_else(|| HuntState {
+            windows: std::array::from_fn(|_| VecDeque::with_capacity(72)),
+            phase: 0,
+            end,
+            count: 0,
+            erasures: 0,
+            began: now,
+            candidate: None,
+            integral: Integral::default(),
+        });
+        let result = self.continue_hunt(deadline, quantum, &mut hunt);
+        if matches!(result, Err(Error::Timeout)) {
+            self.hunt = Some(hunt);
         }
-        let threshold = baseline
-            .saturating_mul(2)
-            .saturating_add(Duration::from_micros(5));
-        let decoder = Decoder {
-            threshold,
-            active_high: true,
-        };
-        let mut windows = [0u128; 4];
-        let mut counts = [0u32; 4];
-        let mut phase = 0usize;
+        result
+    }
+
+    fn continue_hunt(
+        &mut self,
+        deadline: Instant,
+        quantum: Duration,
+        hunt: &mut HuntState,
+    ) -> Result<(), Error> {
         loop {
-            let end = Instant::now() + quantum;
-            let sample = self.integrate_until(end, deadline)?;
-            windows[phase] = (windows[phase] << 1) | u128::from(decoder.decode(sample));
-            counts[phase] = counts[phase].saturating_add(1);
-            if counts[phase] >= LOCK_ONES + 8 + PREAMBLE_BITS as u32 {
-                let hamming = ((windows[phase] as u32) ^ PREAMBLE).count_ones();
-                if std::env::var_os("CCC_DEBUG").is_some() && counts[phase] % 32 == 0 {
+            // Scheduling can carry us past the next interval before we start
+            // observing it. Treat this as a lost phase, not a corrupt frame.
+            self.check(deadline)?;
+            let sample = match self.integrate_resumable(hunt.end, deadline, &mut hunt.integral) {
+                Ok(sample) => Some(sample),
+                Err(Error::Corrupt("empty probe interval")) => {
+                    hunt.integral = Integral::default();
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            // Preserve clock phase through scheduling gaps. A measurement that
+            // spans a whole extra quantum cannot represent this interval, so
+            // mark it and each subsequent elapsed interval as erasures.
+            let sample = if Instant::now().saturating_duration_since(hunt.end) >= quantum {
+                None
+            } else {
+                sample
+            };
+            if sample.is_none() {
+                hunt.erasures += 1;
+                if std::env::var_os("CCC_DEBUG").is_some()
+                    && (hunt.erasures <= 3 || hunt.erasures.is_multiple_of(32))
+                {
                     eprintln!(
-                        "phy hunt window={:#010x} hamming={hamming} threshold={threshold:?}",
-                        windows[phase]
+                        "phy hunt erasure elapsed={:?} count={} erasures={} phase={}",
+                        hunt.began.elapsed(),
+                        hunt.count,
+                        hunt.erasures,
+                        hunt.phase
                     );
                 }
-                if matches_training(windows[phase]) {
-                    // The last quarter-slot sample is centred one eighth of a
-                    // slot before now; centre the next integral one slot later.
-                    self.next_slot = Some(Instant::now() + self.slot * 3 / 8);
-                    self.decoder = Some(decoder);
-                    return Ok(());
+            }
+            let window = &mut hunt.windows[hunt.phase];
+            if window.len() == 72 {
+                window.pop_front();
+            }
+            window.push_back(sample);
+            hunt.count += 1;
+            if window.len() == 72 {
+                let samples = window.make_contiguous();
+                let trained = train_lock_erased(samples);
+                if std::env::var_os("CCC_DEBUG").is_some() && hunt.count.is_multiple_of(128) {
+                    eprintln!(
+                        "phy hunt elapsed={:?} count={} erasures={} candidate: {:?}",
+                        hunt.began.elapsed(),
+                        hunt.count,
+                        hunt.erasures,
+                        training_stats_erased(samples)
+                    );
+                }
+                if let Some(decoder) = trained {
+                    let quality =
+                        lock_quality_erased(samples).expect("trained candidate has quality");
+                    if std::env::var_os("CCC_DEBUG").is_some() {
+                        eprintln!(
+                            "phy lock candidate quality={quality}: {:?}",
+                            training_stats_erased(samples)
+                        );
+                    }
+                    if let Some((best_decoder, best_end, best_quality, remaining)) =
+                        &mut hunt.candidate
+                    {
+                        if quality < *best_quality {
+                            *best_decoder = decoder;
+                            *best_end = hunt.end;
+                            *best_quality = quality;
+                        }
+                        *remaining -= 1;
+                    } else {
+                        hunt.candidate = Some((decoder, hunt.end, quality, 3));
+                        hunt.phase = (hunt.phase + 1) % 4;
+                        hunt.end = hunt
+                            .end
+                            .checked_add(quantum)
+                            .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+                        continue;
+                    }
+                } else if let Some((_, _, _, remaining)) = &mut hunt.candidate {
+                    *remaining -= 1;
                 }
             }
-            phase = (phase + 1) % 4;
+            if let Some((decoder, candidate_end, quality, 0)) = hunt.candidate {
+                if std::env::var_os("CCC_DEBUG").is_some() {
+                    eprintln!(
+                        "phy lock selected quality={quality} threshold={:?} active_high={}",
+                        decoder.threshold, decoder.active_high
+                    );
+                }
+                // The last quarter-slot sample is centred one eighth of a
+                // slot before its end; the following bit starts half a slot
+                // after that centre.
+                self.next_slot = Some(
+                    candidate_end
+                        .checked_add(self.slot.saturating_mul(3) / 8)
+                        .ok_or_else(|| Error::InvalidInput("slot too large".into()))?,
+                );
+                self.decoder = Some(decoder);
+                return Ok(());
+            }
+            hunt.phase = (hunt.phase + 1) % 4;
+            hunt.end = hunt
+                .end
+                .checked_add(quantum)
+                .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
         }
     }
 
@@ -209,44 +474,14 @@ impl Phy {
         Ok(())
     }
 
-    fn send_u16(&mut self, v: u16, deadline: Instant) -> Result<(), Error> {
-        for bit in bits_msb(u32::from(v), 16) {
-            self.send_bit(bit, deadline)?;
+    fn send_fec_block(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), Error> {
+        let words: Vec<_> = bytes.iter().map(|&byte| fec_encode(byte)).collect();
+        for position in 0..FEC_BITS {
+            for &word in &words {
+                self.send_bit((word >> position) & 1 != 0, deadline)?;
+            }
         }
         Ok(())
-    }
-
-    fn send_u8(&mut self, v: u8, deadline: Instant) -> Result<(), Error> {
-        for bit in bits_msb(u32::from(v), 8) {
-            self.send_bit(bit, deadline)?;
-        }
-        Ok(())
-    }
-
-    fn recv_u32(&mut self, deadline: Instant) -> Result<u32, Error> {
-        let mut v = 0u32;
-        for _ in 0..32 {
-            let (bit, _) = self.sample_slot(deadline)?;
-            v = (v << 1) | u32::from(bit);
-        }
-        Ok(v)
-    }
-
-    fn recv_u16(&mut self, deadline: Instant) -> Result<u16, Error> {
-        Ok(self.recv_u32_n(16, deadline)? as u16)
-    }
-
-    fn recv_u8(&mut self, deadline: Instant) -> Result<u8, Error> {
-        Ok(self.recv_u32_n(8, deadline)? as u8)
-    }
-
-    fn recv_u32_n(&mut self, n: u32, deadline: Instant) -> Result<u32, Error> {
-        let mut v = 0u32;
-        for _ in 0..n {
-            let (bit, _) = self.sample_slot(deadline)?;
-            v = (v << 1) | u32::from(bit);
-        }
-        Ok(v)
     }
 
     fn send_bit(&mut self, one: bool, deadline: Instant) -> Result<(), Error> {
@@ -265,28 +500,59 @@ impl Phy {
 
     fn sample_cost(&mut self, deadline: Instant) -> Result<Duration, Error> {
         self.check(deadline)?;
-        if let Some(start) = self.next_slot {
-            self.finish_slot(start, deadline)?;
+        let mut integral = self.integral.take().unwrap_or_default();
+        let end = if let Some(end) = integral.end {
+            end
+        } else {
+            if let Some(start) = self.next_slot {
+                if let Err(error) = self.finish_slot(start, deadline) {
+                    self.integral = Some(integral);
+                    return Err(error);
+                }
+            }
+            match self.slot_end(deadline) {
+                Ok(end) => {
+                    integral.end = Some(end);
+                    end
+                }
+                Err(error) => {
+                    self.integral = Some(integral);
+                    return Err(error);
+                }
+            }
+        };
+        let result = self.integrate_resumable(end, deadline, &mut integral);
+        if matches!(result, Err(Error::Timeout)) {
+            self.integral = Some(integral);
         }
-        let end = self.slot_end(deadline)?;
-        self.integrate_until(end, deadline)
+        result
     }
 
-    // Average the probe latency throughout the entire interval. Repeated probes
-    // reduce sensitivity to one scheduler interruption or unusually fast sample.
-    fn integrate_until(&mut self, end: Instant, deadline: Instant) -> Result<Duration, Error> {
-        let mut total = Duration::ZERO;
-        let mut count = 0u32;
-        while Instant::now() < end {
-            self.check(deadline)?;
-            total = total.saturating_add(self.observe());
-            count = count.saturating_add(1);
-        }
-        self.check(deadline)?;
-        if count == 0 {
+    fn integrate_resumable(
+        &mut self,
+        end: Instant,
+        deadline: Instant,
+        integral: &mut Integral,
+    ) -> Result<Duration, Error> {
+        if integral.paused_at.take().is_some() && Instant::now() >= end {
             return Err(Error::Corrupt("empty probe interval"));
         }
-        Ok(total / count)
+        while Instant::now() < end {
+            if let Err(error) = self.check(deadline) {
+                if matches!(error, Error::Timeout) {
+                    integral.paused_at = Some(Instant::now());
+                }
+                return Err(error);
+            }
+            integral.total = integral.total.saturating_add(self.observe());
+            integral.count = integral.count.saturating_add(1);
+        }
+        if integral.count == 0 {
+            return Err(Error::Corrupt("empty probe interval"));
+        }
+        let average = integral.total / integral.count;
+        *integral = Integral::default();
+        Ok(average)
     }
 
     fn slot_activity(&mut self, deadline: Instant) -> Result<(), Error> {
@@ -314,10 +580,23 @@ impl Phy {
             return Err(Error::InvalidInput("slot must be nonzero".into()));
         }
         let start = self.next_slot.unwrap_or_else(Instant::now);
-        let mut end = start + self.slot;
-        // Skip missed slots instead of aborting the frame.
-        while Instant::now() >= end {
-            end += self.slot;
+        let end = start
+            .checked_add(self.slot)
+            .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+        // Dropping a slot changes every subsequent bit's meaning.
+        let now = Instant::now();
+        if now >= end {
+            if std::env::var_os("CCC_DEBUG").is_some() {
+                eprintln!(
+                    "phy slot overrun elapsed={:?} slot={:?}",
+                    now.duration_since(end),
+                    self.slot
+                );
+            }
+            return Err(Error::Corrupt("missed physical slot"));
+        }
+        if let Some(slots) = &mut self.tx_slots {
+            *slots += 1;
         }
         self.next_slot = Some(end);
         Ok(end)
@@ -405,6 +684,114 @@ fn burn(iters: u32) {
     core::hint::black_box(x);
 }
 
+// Extended Hamming (13,8): parity positions 1, 2, 4, 8 and overall
+// parity position 13. Bits are transmitted in position order, interleaved by
+// position across up to eight independently encoded bytes.
+fn fec_encode(byte: u8) -> u16 {
+    let mut word = 0u16;
+    for (index, position) in [3, 5, 6, 7, 9, 10, 11, 12].into_iter().enumerate() {
+        if byte & (1 << (7 - index)) != 0 {
+            word |= 1 << (position - 1);
+        }
+    }
+    for parity in [1, 2, 4, 8] {
+        let mut odd = false;
+        for position in 1..=12 {
+            if position & parity != 0 && word & (1 << (position - 1)) != 0 {
+                odd = !odd;
+            }
+        }
+        if odd {
+            word |= 1 << (parity - 1);
+        }
+    }
+    if !word.count_ones().is_multiple_of(2) {
+        word |= 1 << 12;
+    }
+    word
+}
+
+fn fec_decode(mut word: u16) -> Result<(u8, bool), Error> {
+    let mut syndrome = 0usize;
+    for position in 1..=12 {
+        if word & (1 << (position - 1)) != 0 {
+            syndrome ^= position;
+        }
+    }
+    let odd = !word.count_ones().is_multiple_of(2);
+    let corrected = match (syndrome, odd) {
+        (0, false) => false,
+        (0, true) => {
+            word ^= 1 << 12;
+            true
+        }
+        (1..=12, true) => {
+            word ^= 1 << (syndrome - 1);
+            true
+        }
+        _ => return Err(Error::Corrupt("uncorrectable FEC")),
+    };
+    let mut byte = 0u8;
+    for position in [3, 5, 6, 7, 9, 10, 11, 12] {
+        byte = (byte << 1) | u8::from((word >> (position - 1)) & 1 != 0);
+    }
+    Ok((byte, corrected))
+}
+
+// Decode from measured slot costs, without using expected payload bytes. A
+// capped absolute distance limits the effect of extreme scheduling outliers.
+// CRC remains mandatory: a unique nearest codeword is not proof of correctness.
+fn soft_fec_decode(samples: &[Duration; FEC_BITS], decoder: Decoder) -> Result<(u8, bool), Error> {
+    let spread = decoder.active.abs_diff(decoder.idle).as_nanos();
+    if spread == 0 {
+        return Err(Error::Corrupt("untrained receiver"));
+    }
+    let mut hard_word = 0u16;
+    let mut all_strong = true;
+    for (position, &sample) in samples.iter().enumerate() {
+        let active = decoder.decode(sample);
+        if active {
+            hard_word |= 1 << position;
+        }
+        let reference = if active { decoder.active } else { decoder.idle };
+        all_strong &= sample.abs_diff(reference).as_nanos() <= spread / 8;
+    }
+    // Preserve SECDED's double-error detection for clearly separated samples;
+    // only use soft recovery when at least one decision was uncertain.
+    if all_strong && fec_decode(hard_word).is_err() {
+        return Err(Error::Corrupt("uncorrectable FEC"));
+    }
+    let mut best = u128::MAX;
+    let mut best_byte = 0u8;
+    let mut tied = false;
+    for byte in 0..=u8::MAX {
+        let word = fec_encode(byte);
+        let score: u128 = samples
+            .iter()
+            .enumerate()
+            .map(|(position, &sample)| {
+                let reference = if (word >> position) & 1 != 0 {
+                    decoder.active
+                } else {
+                    decoder.idle
+                };
+                sample.abs_diff(reference).as_nanos().min(spread)
+            })
+            .sum();
+        if score < best {
+            best = score;
+            best_byte = byte;
+            tied = false;
+        } else if score == best {
+            tied = true;
+        }
+    }
+    if tied {
+        return Err(Error::Corrupt("ambiguous FEC"));
+    }
+    Ok((best_byte, fec_encode(best_byte) != hard_word))
+}
+
 pub fn crc32_of(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in bytes {
@@ -422,12 +809,131 @@ pub fn crc32_of(bytes: &[u8]) -> u32 {
 pub struct Decoder {
     threshold: Duration,
     active_high: bool,
+    active: Duration,
+    idle: Duration,
 }
 
 impl Decoder {
     pub fn decode(self, sample: Duration) -> bool {
         (sample > self.threshold) == self.active_high
     }
+}
+
+// The sender transmits 32 active slots, eight idle slots, then the alternating
+// preamble. These known symbols are used only to calibrate the physical layer;
+// payload bytes are never supplied to the receiver.
+fn training_stats_erased(
+    samples: &[Option<Duration>],
+) -> Option<(Duration, Duration, Decoder, u32, u32, u32)> {
+    if samples.len() != 72 {
+        return None;
+    }
+    let carrier_count = samples[..32].iter().flatten().count();
+    let gap_count = samples[32..40].iter().flatten().count();
+    let preamble_count = samples[40..].iter().flatten().count();
+    // Retain both edges of the gap: otherwise missing symbols can conceal a
+    // two-slot-early lock on the periodic preamble.
+    if carrier_count < 20
+        || gap_count < 6
+        || preamble_count < 24
+        || [32, 33, 38, 39].iter().any(|&i| samples[i].is_none())
+    {
+        return None;
+    }
+    let mut active = Vec::with_capacity(48);
+    let mut idle = Vec::with_capacity(24);
+    for (i, &sample) in samples.iter().enumerate() {
+        let Some(sample) = sample else { continue };
+        let expected = i < 32 || (i >= 40 && ((PREAMBLE >> (71 - i)) & 1 != 0));
+        if expected {
+            active.push(sample);
+        } else {
+            idle.push(sample);
+        }
+    }
+    active.sort_unstable();
+    idle.sort_unstable();
+    let a = active[active.len() / 2];
+    let b = idle[idle.len() / 2];
+    let (low, high) = if a < b { (a, b) } else { (b, a) };
+    if high - low < low / 20 || high == low {
+        return None;
+    }
+    let decoder = Decoder {
+        threshold: low + (high - low) / 2,
+        active_high: a > b,
+        active: a,
+        idle: b,
+    };
+    let mut carrier_errors = 0;
+    let mut gap_errors = 0;
+    let mut preamble_errors = 0;
+    for (i, &sample) in samples.iter().enumerate() {
+        let Some(sample) = sample else { continue };
+        let expected = i < 32 || (i >= 40 && ((PREAMBLE >> (71 - i)) & 1 != 0));
+        if decoder.decode(sample) != expected {
+            if i < 32 {
+                carrier_errors += 1;
+            } else if i < 40 {
+                gap_errors += 1;
+            } else {
+                preamble_errors += 1;
+            }
+        }
+    }
+    Some((a, b, decoder, carrier_errors, gap_errors, preamble_errors))
+}
+
+/// Train on a complete carrier, idle gap and preamble at a candidate phase.
+/// Medians tolerate occasional scheduling outliers without imposing a fixed
+/// threshold or assuming which polarity the machine produces.
+pub fn train_lock(samples: &[Duration]) -> Option<Decoder> {
+    let samples: Vec<_> = samples.iter().copied().map(Some).collect();
+    train_lock_erased(&samples)
+}
+
+/// Train while preserving explicitly missing quarter-slot measurements.
+pub fn train_lock_erased(samples: &[Option<Duration>]) -> Option<Decoder> {
+    let (_, _, decoder, carrier, gap, preamble) = training_stats_erased(samples)?;
+    // The preamble repeats every two slots. A candidate two slots early can
+    // otherwise pass with exactly two carrier errors, two gap errors and one
+    // preamble error, then decode every frame bit at the wrong offset. Require
+    // the entire idle gap so that the gap identifies the phase unambiguously.
+    if carrier <= 4 && gap == 0 && preamble <= 4 {
+        Some(decoder)
+    } else {
+        None
+    }
+}
+
+/// Rank valid phases by how tightly their alternating preamble samples fit
+/// the trained active/idle medians. This uses only known training symbols.
+pub fn lock_quality(samples: &[Duration]) -> Option<u128> {
+    let samples: Vec<_> = samples.iter().copied().map(Some).collect();
+    lock_quality_erased(&samples)
+}
+
+fn lock_quality_erased(samples: &[Option<Duration>]) -> Option<u128> {
+    let (active, idle, _, _, _, _) = training_stats_erased(samples)?;
+    let spread = active.abs_diff(idle).as_nanos();
+    if spread == 0 {
+        return None;
+    }
+    let mut error = 0u128;
+    let mut observed = 0u128;
+    for (i, sample) in samples.iter().enumerate().skip(40) {
+        let Some(sample) = sample else { continue };
+        observed += 1;
+        let expected = if (PREAMBLE >> (71 - i)) & 1 != 0 {
+            active
+        } else {
+            idle
+        };
+        error += sample.abs_diff(expected).as_nanos().min(spread) * 1000 / spread;
+    }
+    // Comparable scores even when phases contain different erasure counts;
+    // prefer a better-observed phase when their fit is otherwise similar.
+    Some(error * 32 / observed + (32 - observed) * 10)
 }
 
 /// Train from eight carrier slots followed by the 32-bit alternating preamble.
@@ -455,9 +961,13 @@ pub fn train_preamble(samples: &[Duration]) -> Option<Decoder> {
     let threshold = sorted[split - 1] + largest_gap / 2;
     let mut best: Option<(u32, Decoder)> = None;
     for active_high in [true, false] {
+        let low = sorted[split / 2];
+        let high = sorted[split + (sorted.len() - split) / 2];
         let decoder = Decoder {
             threshold,
             active_high,
+            active: if active_high { high } else { low },
+            idle: if active_high { low } else { high },
         };
         let mut errors = 0u32;
         for &sample in &samples[..CARRIER_ONES as usize] {
@@ -491,3 +1001,7 @@ pub fn matches_training(window: u128) -> bool {
 pub fn bits_msb(value: u32, width: u32) -> impl Iterator<Item = bool> {
     (0..width.min(32)).rev().map(move |i| (value >> i) & 1 != 0)
 }
+
+#[cfg(test)]
+#[path = "../tests/internal/phy.rs"]
+mod tests;

@@ -4,6 +4,7 @@ use crate::frame::{Frame, FrameType};
 
 const HEADER: usize = 2 + 1 + 1 + 1 + 4 + 2 + 2 + 2;
 const CRC: usize = 4;
+pub(crate) const FRAME_OVERHEAD: usize = HEADER + CRC;
 
 pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, Error> {
     if frame.payload.len() > MAX_PAYLOAD {

@@ -17,6 +17,12 @@ pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CALIBRATE: Duration = Duration::from_secs(3);
 pub const DEFAULT_PROBE_TRIALS: u32 = 64;
 pub const DEFAULT_PROBE_BITS: u32 = 64;
+/// Physical slots outside the encoded protocol blob: gap (4), carrier (32),
+/// training gap (8), preamble (32), two FEC length bytes (26), four FEC CRC
+/// bytes (52), and gap (2). Interleaving adds no padding.
+pub const PHYSICAL_FRAME_OVERHEAD_SLOTS: u32 = 156;
+/// Each length, payload, and CRC byte is encoded as a 13-bit SECDED word.
+pub const PHYSICAL_CODEWORD_SLOTS: u32 = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -284,6 +290,66 @@ impl RuntimeConfig {
         } else {
             Duration::from_millis(20)
         }
+    }
+
+    /// Estimated physical transmission time, including framing. Calculations
+    /// saturate rather than wrap for invalid or extreme configurations.
+    pub fn physical_frame_duration(&self, encoded_bytes: usize) -> Duration {
+        let data_slots = u32::try_from(encoded_bytes)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(PHYSICAL_CODEWORD_SLOTS);
+        self.slot
+            .saturating_mul(PHYSICAL_FRAME_OVERHEAD_SLOTS.saturating_add(data_slots))
+    }
+
+    /// Budget a single send from its actual encoded length. The margin covers
+    /// scheduling and turn-around, not additional frame retries.
+    pub fn send_budget(&self, encoded_bytes: usize) -> Duration {
+        if !self.channel.is_physical() {
+            return self.ack_timeout;
+        }
+        let duration = self.physical_frame_duration(encoded_bytes);
+        let margin = (duration / 4).saturating_add(self.slot.saturating_mul(8));
+        self.ack_timeout.max(
+            duration
+                .saturating_add(margin)
+                .saturating_add(Duration::from_secs(1)),
+        )
+    }
+
+    /// Give the peer time to transmit a complete control response after the
+    /// preceding send has finished. Simulation keeps its configured timeout.
+    pub fn response_budget(&self, control_bytes: usize) -> Duration {
+        if !self.channel.is_physical() {
+            return self.ack_timeout;
+        }
+        self.send_budget(control_bytes)
+            .saturating_add(self.slot.saturating_mul(8))
+            .saturating_add(Duration::from_secs(1))
+    }
+
+    /// An interrupted physical frame may have been acquired by the receiver,
+    /// which must finish or abandon it before another transmission begins.
+    pub fn failed_send_recovery_budget(
+        &self,
+        encoded_bytes: usize,
+        control_bytes: usize,
+    ) -> Duration {
+        let response = self.response_budget(control_bytes);
+        if self.channel.is_physical() {
+            response.saturating_add(self.send_budget(encoded_bytes))
+        } else {
+            response
+        }
+    }
+
+    /// A responder may start listening before its peer begins transmitting.
+    pub fn sync_listen_budget(&self, control_bytes: usize) -> Duration {
+        if !self.channel.is_physical() {
+            return self.sync_timeout;
+        }
+        self.sync_timeout
+            .max(self.response_budget(control_bytes).saturating_mul(2))
     }
 }
 

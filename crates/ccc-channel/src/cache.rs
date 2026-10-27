@@ -20,6 +20,9 @@ impl CacheChannel {
 }
 
 impl Wire for CacheChannel {
+    fn receive_in_progress(&self) -> bool {
+        self.phy.receive_in_progress()
+    }
     fn send_blob(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), Error> {
         self.phy.send_blob(bytes, timeout)
     }
