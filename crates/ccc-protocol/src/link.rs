@@ -39,6 +39,7 @@ pub struct Link<W: Wire> {
     handoff: Option<TokenHandoff>,
     degraded_since: Option<Instant>,
     reoffer_backoff: Duration,
+    tokenless_since: Option<Instant>,
 }
 
 struct TokenHandoff {
@@ -72,6 +73,11 @@ impl<W: Wire> Link<W> {
             handoff: None,
             degraded_since: None,
             reoffer_backoff: Duration::ZERO,
+            tokenless_since: if have_token {
+                None
+            } else {
+                Some(Instant::now())
+            },
         }
     }
 
@@ -195,6 +201,7 @@ impl<W: Wire> Link<W> {
                 // token. Relinquish it before attempting the handoff and do
                 // not reclaim it if confirmation is lost.
                 self.have_token = false;
+                self.tokenless_since = Some(Instant::now());
                 let result = self.send_control(FrameType::Heartbeat, 0);
                 let confirm_wait = if result.is_err() {
                     self.cfg
@@ -236,17 +243,28 @@ impl<W: Wire> Link<W> {
         // initiator re-offers, and re-offering never claims the token: the
         // peer acquires it only by receiving the heartbeat, so this path
         // cannot create two owners. Without it, a lost handoff plus a lost
-        // confirmation leaves both sides tokenless forever.
-        if !receiving
-            && self.state == LinkState::Degraded
-            && self.cfg.role.is_initiator()
+        // confirmation leaves both sides tokenless forever. An initiator
+        // that never degraded can still end up tokenless while the peer
+        // waits degraded for a heartbeat it cannot re-offer itself, so a
+        // long tokenless silence also permits a re-offer.
+        let initiator_reoffer = self.cfg.role.is_initiator()
             && self.inflight.is_none()
             && self.handoff.is_none()
-            && self
-                .degraded_since
-                .is_some_and(|since| since.elapsed() >= self.reoffer_backoff)
-        {
+            && ((self.state == LinkState::Degraded
+                && self
+                    .degraded_since
+                    .is_some_and(|since| since.elapsed() >= self.reoffer_backoff))
+                || (self.state == LinkState::Connected
+                    && !self.have_token
+                    && self
+                        .tokenless_since
+                        .is_some_and(|since| since.elapsed() >= self.connected_reoffer_idle())));
+        if !receiving && initiator_reoffer {
+            // Relinquish before offering. Holding the token here means no
+            // heartbeat from us was ever confirmed, so the peer cannot hold
+            // it; re-offering still never claims ownership.
             self.have_token = false;
+            self.tokenless_since = Some(Instant::now());
             let result = self.send_control(FrameType::Heartbeat, 0);
             let confirm_wait = if result.is_err() {
                 self.cfg
@@ -347,14 +365,25 @@ impl<W: Wire> Link<W> {
         }
         match frame.ftype {
             FrameType::Ack => {
-                if frame.ack_seq == 0 && self.handoff.take().is_some() {
-                    let mut events = vec![LinkEvent::Info("token handoff confirmed".into())];
+                if frame.ack_seq == 0 {
+                    let confirmed = self.handoff.take().is_some();
+                    // A stale or duplicate token confirmation still evidences
+                    // that the peer acquired the token; recover a degraded
+                    // link without claiming ownership. If that belief is
+                    // wrong, the tokenless re-offer bounds the wait.
+                    let mut events = Vec::new();
+                    if confirmed {
+                        events.push(LinkEvent::Info("token handoff confirmed".into()));
+                    }
                     if self.state == LinkState::Degraded {
                         self.state = LinkState::Connected;
                         self.degraded_since = None;
                         events.push(LinkEvent::State(self.state));
                     }
-                    return Ok(Some(events));
+                    if !events.is_empty() {
+                        return Ok(Some(events));
+                    }
+                    return Ok(Some(vec![LinkEvent::Info("ignored unmatched ack".into())]));
                 }
                 if let Some(inf) = &self.inflight {
                     if frame.ack_seq == inf.seq {
@@ -444,12 +473,22 @@ impl<W: Wire> Link<W> {
                     return Err(Error::Interrupted);
                 }
                 self.grant_token();
+                // A valid offer resolves our ownership uncertainty too: the
+                // sender relinquished before offering, so accepting the token
+                // cannot create two owners, and the link demonstrably works.
+                let mut events = Vec::new();
+                if self.state == LinkState::Degraded {
+                    self.state = LinkState::Connected;
+                    self.degraded_since = None;
+                    events.push(LinkEvent::State(self.state));
+                }
                 if let Err(e) = result {
-                    Ok(Some(vec![LinkEvent::Error(format!(
-                        "token confirmation failed: {e}"
-                    ))]))
-                } else {
+                    events.push(LinkEvent::Error(format!("token confirmation failed: {e}")));
+                }
+                if events.is_empty() {
                     Ok(None)
+                } else {
+                    Ok(Some(events))
                 }
             }
             FrameType::Close => {
@@ -472,6 +511,20 @@ impl<W: Wire> Link<W> {
         self.have_token = true;
         self.token_since = Instant::now();
         self.handoff = None;
+        self.tokenless_since = None;
+    }
+
+    /// How long a connected, tokenless initiator waits for the peer's token
+    /// use before re-offering. Long enough that an inferring or transmitting
+    /// peer almost always finishes first; collisions degrade to ordinary
+    // bounded retries, never to dual ownership.
+    fn connected_reoffer_idle(&self) -> Duration {
+        let budget = self.cfg.response_budget(FRAME_OVERHEAD).saturating_mul(4);
+        if self.cfg.channel.is_physical() {
+            budget.max(Duration::from_secs(30))
+        } else {
+            budget
+        }
     }
 
     fn enter_degraded(&mut self) {

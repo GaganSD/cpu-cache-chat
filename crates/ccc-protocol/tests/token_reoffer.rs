@@ -100,25 +100,22 @@ fn initiator_reoffers_token_after_unconfirmed_handoff() {
     drive_for(&mut link, Duration::from_millis(40));
     assert!(heartbeats(&shared) > before);
     // A late confirmation recovers the link to connected. Re-offer cycles
-    // leave brief windows with no pending handoff, so re-feed the ack.
-    let mut recovered = false;
-    let mut confirmed = false;
-    for _ in 0..10 {
+    // leave brief windows with no pending handoff, so flood acknowledgments:
+    // any pending handoff is confirmed at the next poll, and a stale one
+    // still recovers the degraded link without claiming ownership.
+    for _ in 0..200 {
         feed(&shared, &Frame::control(FrameType::Ack, 42, 0, 0));
-        let events = drive_for(&mut link, Duration::from_millis(30));
-        recovered |= events
-            .iter()
-            .any(|e| matches!(e, LinkEvent::State(LinkState::Connected)));
-        confirmed |= events.iter().any(|e| {
-            matches!(
-                e,
-                LinkEvent::Info(s) if s.contains("token handoff confirmed")
-            )
-        });
-        if recovered && confirmed {
-            break;
-        }
     }
+    let events = drive_for(&mut link, Duration::from_millis(400));
+    let recovered = events
+        .iter()
+        .any(|e| matches!(e, LinkEvent::State(LinkState::Connected)));
+    let confirmed = events.iter().any(|e| {
+        matches!(
+            e,
+            LinkEvent::Info(s) if s.contains("token handoff confirmed")
+        )
+    });
     assert!(recovered && confirmed);
 }
 
@@ -138,6 +135,48 @@ fn non_initiator_never_reoffers_token() {
         before,
         "non-initiator must not re-offer"
     );
+}
+
+#[test]
+fn connected_tokenless_initiator_eventually_reoffers() {
+    let (mut link, shared) = link_for(Role::A);
+    // Complete one handoff: the initiator ends connected but tokenless.
+    drive_for(&mut link, Duration::from_millis(100));
+    for _ in 0..50 {
+        feed(&shared, &Frame::control(FrameType::Ack, 42, 0, 0));
+    }
+    drive_for(&mut link, Duration::from_millis(40));
+    assert_eq!(link.state(), LinkState::Connected);
+    let before = heartbeats(&shared);
+    // The peer never uses the token; the initiator must eventually re-offer
+    // even though it never degraded.
+    drive_for(&mut link, Duration::from_millis(80));
+    assert!(heartbeats(&shared) > before);
+    assert_eq!(link.state(), LinkState::Connected);
+}
+
+#[test]
+fn heartbeat_recovers_degraded_peer_and_token_flows_back() {
+    // The stall seen on the physical channel: B degraded without a token,
+    // the initiator re-offers, B must accept the token AND recover so it can
+    // offer the token back to the peer that has data queued.
+    let (mut link, shared) = link_for(Role::B);
+    // B offers the token, nobody confirms: B degrades.
+    feed(&shared, &Frame::control(FrameType::Heartbeat, 42, 0, 0));
+    let events = drive_for(&mut link, Duration::from_millis(200));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, LinkEvent::State(LinkState::Degraded))));
+    // The initiator's re-offer arrives: B takes the token and recovers.
+    feed(&shared, &Frame::control(FrameType::Heartbeat, 42, 0, 0));
+    let events = drive_for(&mut link, Duration::from_millis(20));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, LinkEvent::State(LinkState::Connected))));
+    // With nothing to send, B offers the token back within its idle delay.
+    let before = heartbeats(&shared);
+    drive_for(&mut link, Duration::from_millis(120));
+    assert!(heartbeats(&shared) > before);
 }
 
 #[test]
