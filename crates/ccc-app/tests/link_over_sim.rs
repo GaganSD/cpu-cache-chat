@@ -88,3 +88,64 @@ fn app_message_rejects_bad_square() {
     .encode()
     .is_err());
 }
+
+#[test]
+fn queued_messages_keep_distinct_delivery_states_and_escape_peer_controls() {
+    use ccc_core::Delivery;
+    let pair = SimPair::new();
+    let mut cfg = RuntimeConfig::new(Role::A, ChannelMode::Sim, AppKind::Chat);
+    cfg.sim_path = Some("/unused".into());
+    let mut a = Session::wrap(cfg.clone(), pair.a, 42);
+    cfg.role = Role::B;
+    let mut b = Session::wrap(cfg, pair.b, 0);
+    let peer = thread::spawn(move || {
+        b.connect().unwrap();
+        for _ in 0..100 {
+            b.tick(Duration::from_millis(10)).unwrap();
+        }
+        b.snapshot()
+    });
+    a.connect().unwrap();
+    let first = a.queue_chat("first\u{1b}[2J".into()).unwrap();
+    let second = a.queue_chat("second".into()).unwrap();
+    assert_ne!(first, second);
+    for _ in 0..100 {
+        a.tick(Duration::from_millis(10)).unwrap();
+        if a.snapshot()
+            .chat
+            .iter()
+            .all(|line| line.delivery == Delivery::Delivered)
+        {
+            break;
+        }
+    }
+    assert!(a
+        .snapshot()
+        .chat
+        .iter()
+        .all(|line| line.delivery == Delivery::Delivered));
+    let received = peer.join().unwrap();
+    assert_eq!(received.chat[0].text, "first\\u{1b}[2J");
+    assert!(!received.chat[0].text.contains('\u{1b}'));
+}
+
+#[test]
+fn agent_command_accepts_arguments_and_json_output_and_move_is_validated() {
+    let pair = SimPair::new();
+    let mut cfg = RuntimeConfig::new(Role::A, ChannelMode::Sim, AppKind::Game);
+    cfg.sim_path = Some("/unused".into());
+    cfg.agent = true;
+    cfg.agent_cmd = Some(
+        "sh -c 'cat >/dev/null; printf \"{\\\"square\\\":1,\\\"source\\\":\\\"test\\\"}\"'".into(),
+    );
+    let mut a = Session::wrap(cfg.clone(), pair.a, 43);
+    cfg.role = Role::B;
+    let mut b = Session::wrap(cfg, pair.b, 0);
+    let peer = thread::spawn(move || b.connect().unwrap());
+    a.connect().unwrap();
+    peer.join().unwrap();
+    assert_eq!(a.try_agent_move().unwrap(), Some(1));
+    a.queue_move(1).unwrap();
+    assert!(a.queue_move(2).is_err());
+    assert_eq!(a.board().ply(), 1);
+}

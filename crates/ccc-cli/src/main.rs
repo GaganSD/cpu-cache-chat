@@ -1,11 +1,12 @@
 mod ui;
+mod worker;
 
-use std::io::{self, Write};
+use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ccc_app::{escape_controls, Session};
+use ccc_app::escape_controls;
 use ccc_channel::{run_probe_receiver, run_probe_sender};
 use ccc_core::{
     AppKind, ChannelMode, Error, Role, RuntimeConfig, DEFAULT_PROBE_BITS, DEFAULT_PROBE_TRIALS,
@@ -41,6 +42,7 @@ struct ClientArgs {
     sim: bool,
     #[arg(long)]
     sim_path: Option<String>,
+    /// Line-oriented input/output. EOF leaves the session running; enter /q to quit.
     #[arg(long)]
     plain: bool,
     #[arg(long, default_value = "2")]
@@ -149,104 +151,87 @@ fn client(
         });
     }
 
-    let mut session = Session::open(cfg.clone(), stop.clone())?;
-    if cfg.plain {
-        plain_loop(&mut session, &cfg, stop)
+    let (commands, updates, worker) = worker::start(cfg.clone(), stop.clone());
+    let result = if cfg.plain {
+        plain_loop(&cfg, stop.clone(), commands, updates)
     } else {
-        ui::run(session, cfg, stop)
-    }
+        ui::run(cfg, stop.clone(), commands, updates)
+    };
+    stop.store(true, Ordering::SeqCst);
+    let _ = worker.join();
+    result
 }
 
 fn plain_loop(
-    session: &mut Session<Box<dyn ccc_protocol::Wire>>,
     cfg: &RuntimeConfig,
     stop: Arc<AtomicBool>,
+    commands: std::sync::mpsc::Sender<String>,
+    updates: std::sync::mpsc::Receiver<worker::Update>,
 ) -> Result<(), Error> {
     println!(
-        "cpu-cache-chat / {} / {}  mode: {}",
+        "cpu-cache-chat / {} / {} mode: {}",
         cfg.role,
         cfg.role.mark().glyph(),
-        cfg.channel
+        if cfg.channel.is_physical() {
+            cfg.channel.to_string()
+        } else {
+            "SIMULATION (software only)".into()
+        }
     );
-    if !cfg.channel.is_physical() {
-        println!("WARNING: simulation transport — not a hardware channel");
-    }
-    println!("connecting…");
-    io::stdout().flush().ok();
-    for note in session.connect()? {
-        println!("{note}");
-    }
-    if cfg.kind == AppKind::Game && cfg.role.is_initiator() {
-        session.request_start()?;
-    }
-    while !stop.load(Ordering::SeqCst) {
-        if cfg.kind == AppKind::Game && session.our_turn() {
-            if cfg.agent {
-                match session.try_agent_move() {
-                    Ok(Some(sq)) => match session.queue_move(sq) {
-                        Ok(_) => println!("agent move {sq}"),
-                        Err(e) => println!("agent move rejected: {e}"),
-                    },
-                    Ok(None) => {}
-                    Err(e) => println!("agent error: {e}"),
-                }
-            } else {
-                println!("{}", session.snapshot().board.unwrap_or_default());
-                print!("your move 1-9 (or q): ");
-                io::stdout().flush().ok();
-                if let Some(line) = try_read_line(Duration::from_millis(50)) {
-                    if line == "q" {
-                        break;
-                    }
-                    if let Ok(sq) = line.parse::<u8>() {
-                        match session.queue_move(sq) {
-                            Ok(_) => {}
-                            Err(e) => println!("{e}"),
-                        }
-                    }
-                }
-            }
-        }
-        for note in session.tick(Duration::from_millis(80))? {
-            println!("{note}");
-        }
+    println!(
+        "connecting; enter {} or /q to quit",
         if cfg.kind == AppKind::Chat {
-            if let Some(line) = try_read_line(Duration::from_millis(10)) {
-                if line == "/q" {
+            "messages"
+        } else {
+            "squares 1-9"
+        }
+    );
+    let input_stop = stop.clone();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            match line {
+                Ok(line) if line.trim() == "/q" => {
+                    input_stop.store(true, Ordering::SeqCst);
                     break;
                 }
-                match session.queue_chat(line) {
-                    Ok(_) => {}
-                    Err(e) => println!("{e}"),
+                Ok(line) => {
+                    println!("queued: {}", escape_controls(&line));
+                    if commands.send(line).is_err() {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
         }
-        let snap = session.snapshot();
-        if let Some(end) = &snap.outcome {
-            println!("{}", snap.board.unwrap_or_default());
-            println!("{end}");
-            break;
+    });
+    let mut previous = String::new();
+    while !stop.load(Ordering::SeqCst) {
+        match updates.recv_timeout(Duration::from_millis(50)) {
+            Ok(worker::Update::Note(note)) => println!("{}", escape_controls(&note)),
+            Ok(worker::Update::Snapshot(s)) => {
+                let view = format!(
+                    "link: {}\n{}{}",
+                    s.link,
+                    s.board.as_deref().unwrap_or(""),
+                    s.outcome
+                        .as_ref()
+                        .map(|o| format!("\n{o}"))
+                        .unwrap_or_default()
+                );
+                if view != previous {
+                    println!("{view}");
+                    previous = view;
+                }
+            }
+            Ok(worker::Update::Accepted) => {}
+            Ok(worker::Update::Delivery(seq, state)) => println!("seq {seq}: {state}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    session.interrupt();
+    stop.store(true, Ordering::SeqCst);
     println!("stopped");
     Ok(())
-}
-
-fn try_read_line(timeout: Duration) -> Option<String> {
-    use std::io::IsTerminal;
-    if !io::stdin().is_terminal() {
-        let mut s = String::new();
-        return match io::stdin().read_line(&mut s) {
-            Ok(0) => None,
-            Ok(_) => Some(s.trim().to_string()),
-            Err(_) => None,
-        };
-    }
-    // Non-blocking stdin is awkward in portable Rust; the TUI path handles input.
-    // In plain mode we poll with a short sleep only when piped input is absent.
-    let _ = timeout;
-    None
 }
 
 fn probe(args: ProbeArgs) -> Result<(), Error> {

@@ -1,7 +1,7 @@
 //! Session orchestration. No terminal drawing.
 
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +40,8 @@ pub struct Session<W: Wire> {
     started: bool,
     status: String,
     next_chat_id: u16,
+    next_seq: u16,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl Session<Box<dyn Wire>> {
@@ -71,7 +73,13 @@ impl<W: Wire> Session<W> {
             started: false,
             status,
             next_chat_id: 1,
+            next_seq: 1,
+            stop: None,
         }
+    }
+
+    pub fn set_stop_flag(&mut self, stop: Arc<AtomicBool>) {
+        self.stop = Some(stop);
     }
 
     pub fn connect(&mut self) -> Result<Vec<String>, Error> {
@@ -83,10 +91,11 @@ impl<W: Wire> Session<W> {
         let text = sanitize_user_text(&text)?;
         let id = self.next_chat_id;
         self.next_chat_id = self.next_chat_id.saturating_add(1);
-        let seq = self.link.enqueue(AppMessage::Chat {
+        self.link.enqueue(AppMessage::Chat {
             id,
             text: text.clone(),
         })?;
+        let seq = self.reserve_seq();
         self.chat.push(ChatLine {
             from: self.cfg.role,
             text,
@@ -99,17 +108,35 @@ impl<W: Wire> Session<W> {
     pub fn queue_move(&mut self, square: u8) -> Result<Outcome, Error> {
         let mark = self.cfg.role.mark();
         let ply = self.board.ply();
-        let outcome = self.board.play(square, mark)?;
-        let seq = self.link.enqueue(AppMessage::Move { ply, square, mark })?;
+        if !self.our_turn() {
+            return Err(Error::IllegalMove(
+                "not your turn or link is not connected".into(),
+            ));
+        }
+        let mut board = self.board.clone();
+        let outcome = board.play(square, mark)?;
+        self.link.enqueue(AppMessage::Move { ply, square, mark })?;
+        let seq = self.reserve_seq();
+        self.board = board;
         self.status = format!("queued move {square} (seq {seq})");
         Ok(outcome)
     }
 
     pub fn request_start(&mut self) -> Result<(), Error> {
         self.link.enqueue(AppMessage::Ctrl(GameCtrl::Start))?;
+        self.reserve_seq();
         self.started = true;
         self.status = "game start sent".into();
         Ok(())
+    }
+
+    fn reserve_seq(&mut self) -> u16 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if self.next_seq == 0 {
+            self.next_seq = 1;
+        }
+        seq
     }
 
     pub fn tick(&mut self, wait: Duration) -> Result<Vec<String>, Error> {
@@ -161,15 +188,27 @@ impl<W: Wire> Session<W> {
         if !self.cfg.agent || !self.our_turn() {
             return Ok(None);
         }
-        let cmd = self.cfg.agent_cmd.clone().unwrap_or_else(|| "node".into());
-        let mut child = Command::new(&cmd)
-            .arg(
-                self.cfg
-                    .agent_cmd
-                    .as_ref()
-                    .map(|_| "")
-                    .unwrap_or("/opt/ccc/agent/play.mjs"),
-            )
+        let mut command = match self.cfg.agent_cmd.as_deref() {
+            Some(cmd) if cmd.trim().is_empty() => {
+                return Err(Error::Agent("empty agent command".into()))
+            }
+            Some(cmd) if cmd.chars().any(char::is_whitespace) => {
+                let mut command = Command::new("sh");
+                command.arg("-c").arg(format!("exec {cmd}"));
+                command
+            }
+            Some(binary) => {
+                let mut command = Command::new(binary);
+                command.arg("/opt/ccc/agent/src/play.mjs");
+                command
+            }
+            None => {
+                let mut command = Command::new("node");
+                command.arg("/opt/ccc/agent/src/play.mjs");
+                command
+            }
+        };
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -186,6 +225,32 @@ impl<W: Wire> Session<W> {
             stdin
                 .write_all(body.as_bytes())
                 .map_err(|e| Error::Agent(e.to_string()))?;
+        }
+        drop(child.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|e| Error::Agent(e.to_string()))?
+                .is_some()
+            {
+                break;
+            }
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst))
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Interrupted);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Agent("agent timed out after 60 seconds".into()));
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
         let out = child
             .wait_with_output()
@@ -227,6 +292,14 @@ impl<W: Wire> Session<W> {
                     notes.push(format!("peer: {shown}"));
                 }
                 LinkEvent::Recv(AppMessage::Move { ply, square, mark }) => {
+                    if ply != self.board.ply() || mark != self.cfg.role.peer().mark() {
+                        self.status = format!(
+                            "rejected peer move: unexpected ply or mark ({ply}, {})",
+                            mark.glyph()
+                        );
+                        notes.push(self.status.clone());
+                        continue;
+                    }
                     match self.board.play(square, mark) {
                         Ok(outcome) => {
                             self.status = format!("peer move {square} (ply {ply})");
@@ -296,17 +369,18 @@ fn parse_square(text: &str) -> Result<u8, Error> {
             return Ok(n);
         }
     }
-    if let Some(rest) = t.strip_prefix("{\"square\":") {
-        let n: u8 = rest
-            .trim_start()
-            .trim_end_matches(|c: char| c == '}' || c == ',' || c.is_whitespace())
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .map_err(|_| Error::Agent("bad square json".into()))?;
-        if (1..=9).contains(&n) {
-            return Ok(n);
+    if let Some((_, rest)) = t.split_once("\"square\"") {
+        if let Some(rest) = rest.trim_start().strip_prefix(':') {
+            let digits: String = rest
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(n) = digits.parse::<u8>() {
+                if (1..=9).contains(&n) {
+                    return Ok(n);
+                }
+            }
         }
     }
     Err(Error::Agent(format!("could not parse move from {t:?}")))
