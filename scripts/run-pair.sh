@@ -1,48 +1,25 @@
 #!/usr/bin/env bash
-# Launch two isolated containers. The host does not forward messages.
 set -euo pipefail
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CHANNEL="${CHANNEL:-cache}"
 MODE="${MODE:-chat}"
 IMAGE="${IMAGE:-cpu-cache-chat:local}"
-
-if [[ "${CHANNEL}" != "cache" && "${CHANNEL}" != "cpu" ]]; then
-  echo "CHANNEL must be cache or cpu (not sim) for the isolated demo" >&2
+[[ "$CHANNEL" == cache || "$CHANNEL" == cpu ]] || { echo 'CHANNEL must be cache or cpu' >&2; exit 1; }
+[[ "$MODE" == chat || "$MODE" == game ]] || { echo 'MODE must be chat or game' >&2; exit 1; }
+docker info >/dev/null
+common=(--init --network none --ipc private --read-only --tmpfs '/tmp:rw,nosuid,size=64m'
+  --security-opt no-new-privileges --cap-drop ALL --user 65532:65532 --memory 512m)
+if [[ -n "${CPUSET:-}" ]]; then common+=(--cpuset-cpus "$CPUSET"); fi
+# Refuse existing names instead of removing unrelated or active containers.
+for name in ccc-a ccc-b; do
+  if docker inspect "$name" >/dev/null 2>&1; then echo "$name already exists; remove it explicitly before starting" >&2; exit 1; fi
+done
+docker run -d -it --name ccc-a --hostname ccc-a "${common[@]}" "$IMAGE" "$MODE" --role a --channel "$CHANNEL"
+if ! docker run -d -it --name ccc-b --hostname ccc-b "${common[@]}" "$IMAGE" "$MODE" --role b --channel "$CHANNEL"; then
+  docker rm -f ccc-a >/dev/null || true
   exit 1
 fi
-
-if ! docker info >/dev/null 2>&1; then
-  echo "docker daemon is not reachable" >&2
-  exit 1
-fi
-
-common=(
-  --rm
-  --init
-  --network none
-  --ipc private
-  --read-only
-  --tmpfs /tmp:rw,nosuid,size=64m
-  --security-opt no-new-privileges
-  --cap-drop ALL
-  --user 65532:65532
-  --memory 512m
-  --cpus 1
-)
-
-echo "Starting ${IMAGE} role A/B channel=${CHANNEL} mode=${MODE}"
-echo "Attach: docker attach ccc-a    and    docker attach ccc-b"
-
-docker rm -f ccc-a ccc-b >/dev/null 2>&1 || true
-
-docker run -d --name ccc-a --hostname ccc-a -it "${common[@]}" \
-  --cpuset-cpus 0 \
-  "${IMAGE}" "${MODE}" --role a --channel "${CHANNEL}"
-
-docker run -d --name ccc-b --hostname ccc-b -it "${common[@]}" \
-  --cpuset-cpus 0 \
-  "${IMAGE}" "${MODE}" --role b --channel "${CHANNEL}"
-
-echo "containers started. Host must not relay payloads."
-echo "inspect: ${ROOT}/scripts/inspect-isolation.sh"
+"$ROOT/scripts/inspect-isolation.sh"
+printf '%s\n' 'Attach in separate terminals: docker attach ccc-a   and   docker attach ccc-b' \
+  'Detach without stopping: Ctrl-p Ctrl-q. Stop and remove: docker rm -f ccc-a ccc-b.' \
+  'The host does not forward messages.'
