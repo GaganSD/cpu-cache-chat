@@ -6,7 +6,7 @@ Two terminal clients are intended to exchange chat or tic-tac-toe moves through 
 
 Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
 
-> **Hardware link: not locked.** Headless simulation chat and game pass. Docker isolation (`--network none`) and OrbStack debian VMs run. Shared-CPU benches show timing contrast. The latest isolated cache and CPU probes did not decode frames at 10, 20, or 50 ms slots; hardware chat remains unusable in that test. See [docs/measurements.md](docs/measurements.md).
+> **Hardware link: not locked.** Headless simulation chat and game pass. Docker isolation (`--network none`) and OrbStack debian VMs run. Shared-CPU benches show timing contrast. Isolated CPU probes have decoded frames at 50 ms, and one chat message was delivered and acknowledged; bidirectional hardware chat is not yet verified. See [docs/measurements.md](docs/measurements.md).
 
 ## What works now
 
