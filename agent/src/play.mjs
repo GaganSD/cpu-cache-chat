@@ -1,90 +1,76 @@
 #!/usr/bin/env node
-// Narrow player. Prefers Pi SDK when available; otherwise refuses to invent a minimax.
-
 import { stdin } from "node:process";
-
-const raw = await readStdin();
-let state;
-try {
-  state = JSON.parse(raw.trim());
-} catch {
-  console.error("agent: expected JSON board on stdin");
-  process.exit(2);
-}
-
-const legal = Array.isArray(state.legal) ? state.legal.map(Number) : [];
-if (legal.length === 0) {
-  console.error("agent: no legal moves");
-  process.exit(3);
-}
-
-if (process.env.CCC_ALLOW_FIRST_LEGAL === "1") {
-  // Explicit test hook only. Never the demo player.
-  console.log(JSON.stringify({ square: legal[0], source: "test-hook" }));
-  process.exit(0);
-}
+import { makeTools, parseBoard, llamaBaseUrl } from "./game.mjs";
 
 try {
-  const { createAgentSession, SessionManager } = await import("@earendil-works/pi-coding-agent");
-  const chosen = { square: null };
-  const { session } = await createAgentSession({
-    sessionManager: SessionManager.inMemory(),
-    noTools: true,
-    customTools: [
-      {
-        name: "get_board",
-        label: "get_board",
-        description: "Read the local tic-tac-toe board",
-        parameters: { type: "object", properties: {} },
-        execute: async () => JSON.stringify(state),
-      },
-      {
-        name: "submit_move",
-        label: "submit_move",
-        description: "Submit one legal square 1-9",
-        parameters: {
-          type: "object",
-          properties: { square: { type: "integer", minimum: 1, maximum: 9 } },
-          required: ["square"],
-        },
-        execute: async (toolCall) => {
-          const square = Number(toolCall?.arguments?.square);
-          if (!legal.includes(square)) {
-            return `illegal square ${square}. legal: ${legal.join(",")}`;
-          }
-          chosen.square = square;
-          return `accepted ${square}`;
-        },
-      },
-    ],
-  });
-  try {
-    await session.prompt(
-      `You are a tic-tac-toe player. Mark=${state.turn}. Board compact=${state.board}. ` +
-        `Call get_board if needed, then submit_move with one legal square from ${legal.join(",")}. ` +
-        `Do not claim a win you have not submitted. No other tools.`,
-    );
-  } finally {
-    session.dispose();
+  let raw = "";
+  for await (const chunk of stdin) {
+    raw += chunk;
+    if (raw.length > 4096) throw new Error("board input too large");
   }
-  if (!chosen.square) {
-    console.error("agent: model did not submit a move");
-    process.exit(4);
-  }
-  console.log(JSON.stringify({ square: chosen.square, source: "pi" }));
-} catch (err) {
-  console.error(`agent: Pi SDK unavailable or failed: ${err?.message || err}`);
-  process.exit(5);
-}
-
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    let data = "";
-    stdin.setEncoding("utf8");
-    stdin.on("data", (c) => {
-      data += c;
+  const state = parseBoard(raw);
+  if (process.env.CCC_ALLOW_FIRST_LEGAL === "1") {
+    console.log(JSON.stringify({ square: state.legal[0], source: "test-hook" }));
+  } else {
+    // A hard deadline covers SDK startup, inference, and abort cleanup.
+    const deadline = setTimeout(() => {
+      console.error("agent: timed out");
+      process.exit(124);
+    }, 90_000);
+    deadline.unref();
+    const baseUrl = llamaBaseUrl(process.env.LLAMA_BASE_URL);
+    // Keep all SDK fetches on this exact loopback origin, including redirects.
+    const localOrigin = new URL(baseUrl).origin;
+    const localFetch = globalThis.fetch;
+    globalThis.fetch = (input, init = {}) => {
+      const target = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+      if (target.origin !== localOrigin) throw new Error("refusing non-local model request");
+      return localFetch(input, { ...init, redirect: "error" });
+    };
+    const { createAgentSession, createExtensionRuntime, ModelRuntime, SessionManager, SettingsManager } =
+      await import("@earendil-works/pi-coding-agent");
+    const { Type } = await import("typebox");
+    const runtime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+    const modelId = process.env.LLAMA_MODEL || "local-model";
+    runtime.registerProvider("ccc-local", {
+      baseUrl, api: "openai-completions", apiKey: "local", authHeader: false,
+      models: [{ id: modelId, name: modelId, reasoning: false, input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 4096, maxTokens: 256,
+        compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false,
+          supportsUsageInStreaming: true, supportsStrictMode: false, maxTokensField: "max_tokens" } }],
     });
-    stdin.on("end", () => resolve(data));
-    stdin.on("error", reject);
-  });
+    const model = runtime.getModel("ccc-local", modelId);
+    if (!model) throw new Error("local model registration failed");
+    // No discovered extensions, files, skills, prompts, settings, or session persistence.
+    const resourceLoader = {
+      getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+      getSkills: () => ({ skills: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: [], diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }),
+      getAgentsFiles: () => ({ agentsFiles: [] }),
+      getSystemPrompt: () => "Play tic-tac-toe. Submit one legal square using submit_move.",
+      getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [],
+      getAppendSystemPromptSources: () => [], extendResources: () => {}, reload: async () => {},
+    };
+    let session;
+    const game = makeTools(state, Type, () => setImmediate(() => { void session?.abort(); }));
+    ({ session } = await createAgentSession({ model, modelRuntime: runtime, thinkingLevel: "off",
+      tools: ["get_board", "submit_move"], customTools: game.tools, resourceLoader,
+      sessionManager: SessionManager.inMemory(),
+      settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+    }));
+    try {
+      const active = session.getActiveToolNames().sort();
+      if (active.join(",") !== "get_board,submit_move") throw new Error("unexpected active tools");
+      await session.prompt(`Board: ${state.board}. Turn: ${state.turn}. Legal: ${state.legal.join(",")}. Submit one move.`);
+    } finally {
+      session.dispose();
+      clearTimeout(deadline);
+    }
+    if (game.square === null) throw new Error("model did not submit a valid move");
+    console.log(JSON.stringify({ square: game.square, source: "pi" }));
+  }
+} catch (err) {
+  console.error(`agent: ${err?.message || err}`);
+  process.exitCode = 1;
 }
