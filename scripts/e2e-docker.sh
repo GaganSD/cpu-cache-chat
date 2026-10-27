@@ -7,23 +7,62 @@ CHANNEL="${CHANNEL:-cpu}"
 MODE="${MODE:-chat}"
 SLOT_MS="${SLOT_MS:-10}"
 CPUSET="${CPUSET:-0}"
+WAIT_SECONDS="${WAIT_SECONDS:-60}"
 [[ "$CHANNEL" == cpu || "$CHANNEL" == cache ]] || { echo 'CHANNEL must be cpu or cache' >&2; exit 1; }
 [[ "$MODE" == chat ]] || { echo 'e2e-docker currently supports MODE=chat only' >&2; exit 1; }
-workdir=$(mktemp -d "${TMPDIR:-/tmp}/ccc-dockere2e.XXXXXX")
+[[ "$WAIT_SECONDS" =~ ^[0-9]{1,4}$ ]] || { echo 'WAIT_SECONDS must be an integer from 1 to 3600' >&2; exit 1; }
+WAIT_SECONDS=$((10#$WAIT_SECONDS))
+(( WAIT_SECONDS >= 1 && WAIT_SECONDS <= 3600 )) || { echo 'WAIT_SECONDS must be an integer from 1 to 3600' >&2; exit 1; }
+WAIT_TRIES=$((WAIT_SECONDS * 4))
+# Evidence is host-side only. No container receives a mount of this directory.
+# Make a new private directory for each run so previous evidence is not replaced.
+umask 077
+if [[ -n "${EVIDENCE_DIR:-}" ]]; then
+  mkdir -p -- "$EVIDENCE_DIR"
+  workdir=$(mktemp -d "$EVIDENCE_DIR/ccc-dockere2e.XXXXXX")
+  retain_evidence=1
+  echo "Evidence directory: $workdir"
+else
+  workdir=$(mktemp -d "${TMPDIR:-/tmp}/ccc-dockere2e.XXXXXX")
+  retain_evidence=0
+fi
 prefix="ccc-e2e-$$"
 a="$prefix-a"; b="$prefix-b"
 owned_a=0; owned_b=0
 cleanup() {
+  local result=$? pid
   exec 3>&- 4>&- || true
   if [[ "$owned_a" == 1 ]]; then docker rm -f "$a" >/dev/null 2>&1 || true; fi
   if [[ "$owned_b" == 1 ]]; then docker rm -f "$b" >/dev/null 2>&1 || true; fi
-  rm -rf "$workdir"
+  # The attached Docker clients can still be draining logs after removal.
+  for pid in "${probe_a:-}" "${probe_b:-}" "${A_PID:-}" "${B_PID:-}"; do
+    [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
+  done
+  if [[ "$result" != 0 ]]; then
+    # Keep stdout and stderr separate: container debug writes can otherwise
+    # splice themselves into the middle of a delivery-state line.
+    local log
+    for log in silent.out silent.err probe-a.out probe-a.err probe-b.out probe-b.err a.out a.err b.out b.err; do
+      if [[ -f "$workdir/$log" ]]; then
+        printf '%s\n' "----- $log (last 30 lines) -----" >&2
+        tail -30 "$workdir/$log" >&2 || true
+      fi
+    done
+  fi
+  if [[ "$retain_evidence" == 1 ]]; then
+    rm -f "$workdir/a.in" "$workdir/b.in"
+    printf 'exit_status=%s\nchannel=%s\nmode=%s\nslot_ms=%s\ncpuset=%s\nwait_seconds=%s\nimage=%s\n' \
+      "$result" "$CHANNEL" "$MODE" "$SLOT_MS" "$CPUSET" "$WAIT_SECONDS" "$IMAGE" > "$workdir/run.txt"
+    echo "Evidence retained: $workdir"
+  else
+    rm -rf "$workdir"
+  fi
 }
 trap cleanup EXIT
 for name in "$a" "$b"; do
   if docker inspect "$name" >/dev/null 2>&1; then
     echo "$name already exists; refusing to remove it" >&2
-    trap - EXIT; rm -rf "$workdir"; exit 1
+    exit 1
   fi
 done
 docker info >/dev/null
@@ -38,9 +77,9 @@ if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
 docker create --name "$b" "${common[@]}" "$IMAGE" probe --role b --channel "$CHANNEL" \
   --slot-ms "$SLOT_MS" --silent --silent-seconds 5 >/dev/null
 owned_b=1
-docker start -a "$b" >"$workdir/silent" 2>&1 || { cat "$workdir/silent"; echo 'FAIL: silent control process failed'; exit 1; }
-cat "$workdir/silent"
-if ! grep -Fq 'false decoded frame=false' "$workdir/silent" || ! grep -Fq 'result=Err(Timeout)' "$workdir/silent"; then
+docker start -a "$b" >"$workdir/silent.out" 2>"$workdir/silent.err" || { echo 'FAIL: silent control process failed'; exit 1; }
+cat "$workdir/silent.out"
+if ! grep -Fq 'false decoded frame=false' "$workdir/silent.out" || ! grep -Fq 'result=Err(Timeout)' "$workdir/silent.out"; then
   echo 'FAIL: silent sender control did not pass'; exit 1
 fi
 docker rm "$b" >/dev/null
@@ -53,16 +92,16 @@ owned_b=1
 docker create --name "$a" "${common[@]}" "$IMAGE" probe --role a --channel "$CHANNEL" --bits 32 --slot-ms "$SLOT_MS" >/dev/null
 owned_a=1
 "$ROOT/scripts/inspect-isolation.sh" "$a" "$b"
-docker start -a "$b" >"$workdir/probe-b" 2>&1 & probe_b=$!
+docker start -a "$b" >"$workdir/probe-b.out" 2>"$workdir/probe-b.err" & probe_b=$!
 sleep 2
-docker start -a "$a" >"$workdir/probe-a" 2>&1 & probe_a=$!
+docker start -a "$a" >"$workdir/probe-a.out" 2>"$workdir/probe-a.err" & probe_a=$!
 status=0
 wait "$probe_a" || status=1
 wait "$probe_b" || status=1
-cat "$workdir/probe-a" "$workdir/probe-b"
+cat "$workdir/probe-a.out" "$workdir/probe-b.out"
 [[ "$status" == 0 ]] || { echo 'FAIL: probe process failed'; exit 1; }
-sent=$(sed -n 's/^sender payload .*: \[\(.*\)\]$/\1/p' "$workdir/probe-a" | tr -d ', ')
-received=$(sed -n 's/.*received bytes (hex): \([0-9a-f]*\).*/\1/p' "$workdir/probe-b")
+sent=$(sed -n 's/^sender payload .*: \[\(.*\)\]$/\1/p' "$workdir/probe-a.out" | tr -d ', ')
+received=$(sed -n 's/.*received bytes (hex): \([0-9a-f]*\).*/\1/p' "$workdir/probe-b.out")
 if [[ -z "$sent" || "$sent" != "$received" ]]; then
   echo 'FAIL: receiver-blind probe did not decode all expected bits; BER unavailable if no frame decoded'; exit 1
 fi
@@ -78,28 +117,25 @@ owned_a=1
 docker create -i --name "$b" "${common[@]}" "$IMAGE" chat --role b --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
 owned_b=1
 "$ROOT/scripts/inspect-isolation.sh" "$a" "$b"
-docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>&1 & A_PID=$!
-docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>&1 & B_PID=$!
+docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>"$workdir/a.err" & A_PID=$!
+docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>"$workdir/b.err" & B_PID=$!
 wait_for() {
-  local file="$1" needle="$2" tries="${3:-240}"
+  local file="$1" needle="$2" tries="${3:-$WAIT_TRIES}"
   for _ in $(seq 1 "$tries"); do
     if grep -Fq -- "$needle" "$file"; then return 0; fi
     if ! kill -0 "$A_PID" 2>/dev/null || ! kill -0 "$B_PID" 2>/dev/null; then break; fi
     sleep 0.25
   done
   echo "FAIL: waiting for '$needle'" >&2
-  echo '----- A -----' >&2; tail -30 "$workdir/a.out" >&2 || true
-  echo '----- B -----' >&2; tail -30 "$workdir/b.out" >&2 || true
   return 1
 }
 wait_for "$workdir/a.out" 'link: connected'
 wait_for "$workdir/b.out" 'link: connected'
 wait_for_delivery_state() {
   local file="$1" seq="$2" expected="$3"
-  for _ in $(seq 1 240); do
+  for _ in $(seq 1 "$WAIT_TRIES"); do
     if grep -Fxq "seq $seq: delivery unknown" "$file"; then
       echo "FAIL: seq $seq reached delivery unknown while waiting for $expected" >&2
-      tail -30 "$file" >&2
       return 1
     fi
     if grep -Fxq "seq $seq: $expected" "$file"; then return 0; fi
@@ -107,7 +143,6 @@ wait_for_delivery_state() {
     sleep 0.25
   done
   echo "FAIL: seq $seq did not reach $expected" >&2
-  tail -30 "$file" >&2
   return 1
 }
 check_delivery() {
@@ -130,7 +165,6 @@ check_delivery() {
     END { exit !(queued && transmitting > queued && awaiting > transmitting && delivered > awaiting && !unknown) }
   ' "$sender"; then
     echo "FAIL: delivery states missing, out of order, or unknown for $message" >&2
-    tail -30 "$sender" >&2
     return 1
   fi
   echo "PASS: $message queued, transmitted, acknowledged, and received (seq $seq)"
