@@ -93,9 +93,6 @@ impl AppMessage {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         match self {
             AppMessage::Chat { id, text } => {
-                if !text.is_ascii() && text.len() > MAX_CHAT_BYTES {
-                    return Err(Error::TooLarge(text.len()));
-                }
                 let raw = text.as_bytes();
                 if raw.len() > MAX_CHAT_BYTES {
                     return Err(Error::TooLarge(raw.len()));
@@ -134,6 +131,9 @@ impl AppMessage {
                     .to_string();
                 if text.len() > MAX_CHAT_BYTES {
                     return Err(Error::TooLarge(text.len()));
+                }
+                if text.as_bytes().contains(&0) {
+                    return Err(Error::Corrupt("chat contains NUL"));
                 }
                 Ok(AppMessage::Chat { id, text })
             }

@@ -52,3 +52,62 @@ fn render_uses_numbers_for_empty() {
     assert!(b.render().contains('5'));
     assert_eq!(b.compact(), "123456789");
 }
+
+#[test]
+fn all_win_lines_and_finished_boards() {
+    let lines = [
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+        [1, 4, 7],
+        [2, 5, 8],
+        [3, 6, 9],
+        [1, 5, 9],
+        [3, 5, 7],
+    ];
+    for line in lines {
+        // Pick two non-line squares that cannot block the winning line.
+        let other: Vec<_> = (1..=9).filter(|s| !line.contains(s)).take(2).collect();
+        let mut board = Board::new();
+        for (square, mark) in [
+            (line[0], Mark::X),
+            (other[0], Mark::O),
+            (line[1], Mark::X),
+            (other[1], Mark::O),
+        ] {
+            assert_eq!(board.play(square, mark).unwrap(), Outcome::InProgress);
+        }
+        assert_eq!(board.play(line[2], Mark::X).unwrap(), Outcome::Win(Mark::X));
+        assert!(board.legal_squares().is_empty());
+        assert!(board.play(other[0], Mark::O).is_err());
+    }
+    let mut board = Board::new();
+    for (i, square) in [1, 2, 3, 5, 4, 6, 8, 7, 9].into_iter().enumerate() {
+        assert_eq!(
+            board
+                .play(square, if i % 2 == 0 { Mark::X } else { Mark::O })
+                .unwrap(),
+            if i == 8 {
+                Outcome::Draw
+            } else {
+                Outcome::InProgress
+            }
+        );
+    }
+    assert!(board.play(1, Mark::O).is_err());
+    assert!(board.legal_squares().is_empty());
+}
+
+#[test]
+fn illegal_moves_leave_board_unchanged() {
+    let mut board = Board::new();
+    for (square, mark) in [(0, Mark::X), (10, Mark::X), (1, Mark::O)] {
+        let before = board.clone();
+        assert!(board.play(square, mark).is_err());
+        assert_eq!(board, before);
+    }
+    board.play(1, Mark::X).unwrap();
+    let before = board.clone();
+    assert!(board.play(1, Mark::O).is_err());
+    assert_eq!(board, before);
+}

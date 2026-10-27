@@ -32,14 +32,14 @@ pub struct Link<W: Wire> {
     next_seq: u16,
     last_rx_seq: Option<u16>,
     inflight: Option<Inflight>,
-    queue: VecDeque<AppMessage>,
+    queue: VecDeque<(u16, AppMessage)>,
     peer_seen: bool,
 }
 
 struct Inflight {
     seq: u16,
     frame: Frame,
-    attempts: u32,
+    attempts: u64,
     sent_at: Instant,
 }
 
@@ -72,7 +72,9 @@ impl<W: Wire> Link<W> {
 
     pub fn enqueue(&mut self, msg: AppMessage) -> Result<u16, Error> {
         let seq = self.next_seq;
-        self.queue.push_back(msg);
+        msg.encode()?;
+        self.next_seq = next_sequence(seq);
+        self.queue.push_back((seq, msg));
         Ok(seq)
     }
 
@@ -109,13 +111,8 @@ impl<W: Wire> Link<W> {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
-        if self.inflight.is_none() {
-            if let Some(msg) = self.queue.pop_front() {
-                let seq = self.next_seq;
-                self.next_seq = self.next_seq.wrapping_add(1);
-                if self.next_seq == 0 {
-                    self.next_seq = 1;
-                }
+        if self.inflight.is_none() && self.state == LinkState::Connected {
+            if let Some((seq, msg)) = self.queue.pop_front() {
                 let payload = msg.encode()?;
                 let frame = Frame::new(FrameType::Data, self.session, seq, payload)?;
                 self.transmit(&frame)?;
@@ -135,7 +132,7 @@ impl<W: Wire> Link<W> {
         if let Some(inf) = &self.inflight {
             if inf.sent_at.elapsed() >= self.cfg.ack_timeout {
                 let seq = inf.seq;
-                if inf.attempts >= self.cfg.max_retries {
+                if inf.attempts > u64::from(self.cfg.max_retries) {
                     self.inflight = None;
                     self.state = LinkState::Degraded;
                     events.push(LinkEvent::Delivery {
@@ -160,6 +157,9 @@ impl<W: Wire> Link<W> {
             }
         }
 
+        let wait = self.inflight.as_ref().map_or(wait, |inf| {
+            wait.min(self.cfg.ack_timeout.saturating_sub(inf.sent_at.elapsed()))
+        });
         match self.wire.recv_blob(wait) {
             Ok(bytes) => {
                 if let Some(more) = self.on_bytes(&bytes)? {
@@ -215,7 +215,7 @@ impl<W: Wire> Link<W> {
             }
             FrameType::Nack => {
                 let retry = self.inflight.as_ref().and_then(|inf| {
-                    if frame.ack_seq == inf.seq && inf.attempts < self.cfg.max_retries {
+                    if frame.ack_seq == inf.seq && inf.attempts <= u64::from(self.cfg.max_retries) {
                         Some((inf.seq, inf.frame.clone()))
                     } else {
                         None
@@ -245,11 +245,21 @@ impl<W: Wire> Link<W> {
                         ))]));
                     }
                 }
+                let expected = self.last_rx_seq.map_or(1, next_sequence);
+                if frame.seq != expected {
+                    return Ok(Some(vec![LinkEvent::Error(format!(
+                        "unexpected data seq {}; expected {expected}",
+                        frame.seq
+                    ))]));
+                }
                 match AppMessage::decode(&frame.payload) {
                     Ok(msg) => {
                         self.last_rx_seq = Some(frame.seq);
-                        self.send_control(FrameType::Ack, frame.seq)?;
-                        Ok(Some(vec![LinkEvent::Recv(msg)]))
+                        let mut events = vec![LinkEvent::Recv(msg)];
+                        if let Err(e) = self.send_control(FrameType::Ack, frame.seq) {
+                            events.push(LinkEvent::Error(format!("ack failed: {e}")));
+                        }
+                        Ok(Some(events))
                     }
                     Err(e) => {
                         self.send_control(FrameType::Nack, frame.seq)?;
@@ -294,7 +304,12 @@ impl<W: Wire> Link<W> {
             }
             let bytes = self.wire.recv_blob(remain)?;
             match decode_frame(&bytes) {
-                Ok(frame) if frame.ftype == want => return Ok(frame),
+                Ok(frame)
+                    if frame.ftype == want
+                        && (!self.cfg.role.is_initiator() || frame.session == self.session) =>
+                {
+                    return Ok(frame)
+                }
                 Ok(_) => continue,
                 Err(_) => continue,
             }
@@ -333,5 +348,13 @@ fn fill_random(buf: &mut [u8]) {
         x ^= x >> 7;
         x ^= x << 17;
         *slot = (x >> 24) as u8;
+    }
+}
+
+fn next_sequence(seq: u16) -> u16 {
+    if seq == u16::MAX {
+        1
+    } else {
+        seq + 1
     }
 }
