@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+.idea
+.DS_Store
+*.swp
+/models
+/tmp
+.env
+node_modules
+dist
+*.gguf
+measurements/*.json
+measurements/*.log
+agent/node_modules
+
+!measurements/.gitkeep
