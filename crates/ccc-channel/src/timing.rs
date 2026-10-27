@@ -20,7 +20,8 @@ pub fn ticks() -> u64 {
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        Instant::now().elapsed().as_nanos() as u64
+        static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed().as_nanos() as u64
     }
 }
 

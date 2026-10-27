@@ -6,20 +6,18 @@ use ccc_core::{ChannelMode, Error, ProbeReport, Role};
 
 use crate::phy::{Phy, PhyKind};
 
+/// Send only the supplied bytes; the receiver does not need them to decode.
 pub fn run_probe_sender(
     mode: ChannelMode,
-    bits: u32,
+    _bits: u32,
     slot: Duration,
     stop: Arc<AtomicBool>,
     payload: &[u8],
 ) -> Result<(), Error> {
-    let mut phy = phy(mode, slot, stop)?;
-    // Known then unknown payload. Receiver must not be told the unknown bits.
-    phy.send_blob(payload, Duration::from_secs(60))?;
-    let _ = bits;
-    Ok(())
+    phy(mode, slot, stop)?.send_blob(payload, Duration::from_secs(60))
 }
 
+/// One receive attempt. Expected bytes, if available, are used only after decoding.
 pub fn run_probe_receiver(
     mode: ChannelMode,
     role: Role,
@@ -30,52 +28,68 @@ pub fn run_probe_receiver(
     expected: Option<&[u8]>,
 ) -> Result<ProbeReport, Error> {
     let mut phy = phy(mode, slot, stop)?;
-    let (ones, zeros, silent) = phy.local_ones_zeros(16);
-    let mut timeouts = 0;
-    let mut bit_errors = 0;
-    let mut got: Option<Vec<u8>> = None;
-    match phy.recv_blob(Duration::from_secs(60)) {
-        Ok(bytes) => got = Some(bytes),
-        Err(Error::Timeout) => timeouts += 1,
+    let result = phy.recv_blob(Duration::from_secs(60));
+    if matches!(result, Err(Error::Interrupted)) {
+        return Err(Error::Interrupted);
+    }
+    let mut report = ProbeReport {
+        mode, role, trials: 1, bits, bit_errors: 0, timeouts: 0,
+        silent_false_ones: 0, usable: false,
+        notes: format!("unproven: one receive attempt (requested {trials}); two-process operation and reliability are not established; silent-sender control not measured; "),
+    };
+    match result {
+        Ok(bytes) => {
+            report.notes.push_str("received bytes (hex): ");
+            for byte in &bytes {
+                report.notes.push_str(&format!("{byte:02x}"));
+            }
+            if let Some(exp) = expected {
+                let common = bytes.len().min(exp.len());
+                let errors: u64 = bytes[..common]
+                    .iter()
+                    .zip(&exp[..common])
+                    .map(|(a, b)| (a ^ b).count_ones() as u64)
+                    .sum::<u64>()
+                    + (bytes.len().abs_diff(exp.len()) as u64) * 8;
+                report.bit_errors = errors.min(u32::MAX as u64) as u32;
+                report.notes.push_str(&format!("; compared after decoding against {} expected bits; bit errors={}; length difference counts as errors", exp.len() * 8, report.bit_errors));
+                // A single matching frame is evidence, not proof of a usable link.
+            } else {
+                report.notes.push_str("; BER unavailable: expected bytes were not supplied; bit_errors field is not a measurement");
+            }
+        }
         Err(e) => {
-            return Ok(ProbeReport {
-                mode,
-                role,
-                trials,
-                bits,
-                bit_errors: bits,
-                timeouts: 1,
-                silent_false_ones: 0,
-                usable: false,
-                notes: format!("recv failed: {e}; local ones={ones:.0}ns zeros={zeros:.0}ns silent={silent:.0}ns"),
-            });
+            if matches!(e, Error::Timeout) {
+                report.timeouts = 1;
+            }
+            report.notes.push_str(&format!(
+                "receive failed: {e}; BER unavailable; bit_errors field is not a measurement"
+            ));
         }
     }
-    if let (Some(got), Some(exp)) = (got.as_deref(), expected) {
-        let n = exp.len().max(got.len());
-        for i in 0..n {
-            let a = got.get(i).copied().unwrap_or(0);
-            let b = exp.get(i).copied().unwrap_or(0);
-            bit_errors += (a ^ b).count_ones();
-        }
+    Ok(report)
+}
+
+/// Listen with the sender deliberately silent. A decoded frame is a false positive,
+/// never evidence of a working link. The operator must ensure the sender is silent.
+pub fn run_silent_control(
+    mode: ChannelMode,
+    role: Role,
+    slot: Duration,
+    stop: Arc<AtomicBool>,
+    timeout: Duration,
+) -> Result<ProbeReport, Error> {
+    let mut phy = phy(mode, slot, stop)?;
+    let result = phy.recv_blob(timeout);
+    if matches!(result, Err(Error::Interrupted)) {
+        return Err(Error::Interrupted);
     }
-    let usable = timeouts == 0
-        && expected
-            .map(|exp| got.as_deref() == Some(exp))
-            .unwrap_or(false);
+    let false_frame = result.is_ok();
     Ok(ProbeReport {
-        mode,
-        role,
-        trials,
-        bits,
-        bit_errors,
-        timeouts,
-        silent_false_ones: 0,
-        usable,
-        notes: format!(
-            "local ones={ones:.0}ns zeros={zeros:.0}ns silent={silent:.0}ns; received={} bytes; this is a single trial, not a reliability claim",
-            got.as_ref().map(|g| g.len()).unwrap_or(0)
-        ),
+        mode, role, trials: 1, bits: 0, bit_errors: 0,
+        timeouts: u32::from(matches!(result, Err(Error::Timeout))),
+        silent_false_ones: 0, usable: false,
+        notes: format!("unproven: silent-sender control; sender silence must be ensured independently; false decoded frame={false_frame}; result={result:?}; silent_false_ones and bit_errors are not measured"),
     })
 }
 
