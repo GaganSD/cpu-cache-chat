@@ -78,7 +78,7 @@ fn wrapper_forwards_partial_receive_and_does_not_label_control_frames() {
     assert!(!wire.receive_in_progress());
     receiving.store(true, Ordering::SeqCst);
     assert!(wire.receive_in_progress());
-    let heartbeat = encode_frame(&Frame::control(FrameType::Heartbeat, 12, 0, 0)).unwrap();
+    let heartbeat = encode_frame(&Frame::control(FrameType::Heartbeat, 12, 1, 0)).unwrap();
     wire.send_blob(&heartbeat, Duration::from_secs(1)).unwrap();
     assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
 }

@@ -38,6 +38,15 @@ pub struct Snapshot {
     pub status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AcceptedMove {
+    pub ply: u8,
+    pub square: u8,
+    pub mark: Mark,
+    pub sequence: u16,
+    pub local_ack: bool,
+}
+
 pub struct Session<W: Wire> {
     cfg: RuntimeConfig,
     link: Link<W>,
@@ -48,6 +57,7 @@ pub struct Session<W: Wire> {
     status: String,
     next_chat_id: u16,
     pending_move: Option<(u16, u8, Mark, Board)>,
+    accepted_moves: Vec<AcceptedMove>,
     frozen: bool,
     stop: Option<Arc<AtomicBool>>,
 }
@@ -83,6 +93,7 @@ impl<W: Wire> Session<W> {
             status,
             next_chat_id: 1,
             pending_move: None,
+            accepted_moves: Vec::new(),
             frozen: false,
             stop: None,
         }
@@ -158,8 +169,9 @@ impl<W: Wire> Session<W> {
         let chat = &mut self.chat;
         let status = &mut self.status;
         let pending = &self.pending_move;
+        let accepted_moves = &mut self.accepted_moves;
         let mut notes = Vec::new();
-        let events = self.link.drive_with_accept(wait, |msg| {
+        let events = self.link.drive_with_accept_seq(wait, |sequence, msg| {
             let result = match msg {
                 AppMessage::Chat { text, .. } if cfg.kind == AppKind::Chat => {
                     let shown = escape_controls(text);
@@ -201,6 +213,13 @@ impl<W: Wire> Session<W> {
                         && *mark == cfg.role.peer().mark() =>
                 {
                     board.play(*square, *mark).map(|outcome| {
+                        accepted_moves.push(AcceptedMove {
+                            ply: *ply,
+                            square: *square,
+                            mark: *mark,
+                            sequence,
+                            local_ack: false,
+                        });
                         *status = match outcome {
                             Outcome::Win(m) => format!("{} wins", m.glyph()),
                             Outcome::Draw => "draw".into(),
@@ -223,6 +242,10 @@ impl<W: Wire> Session<W> {
         })?;
         notes.extend(self.apply(events));
         Ok(notes)
+    }
+
+    pub fn take_accepted_moves(&mut self) -> Vec<AcceptedMove> {
+        std::mem::take(&mut self.accepted_moves)
     }
 
     pub fn interrupt(&mut self) {
@@ -337,10 +360,17 @@ impl<W: Wire> Session<W> {
                     if let Some(line) = self.chat.iter_mut().find(|c| c.seq == seq) {
                         line.delivery = state;
                     }
-                    if let Some((pseq, square, _, board)) = &self.pending_move {
+                    if let Some((pseq, square, mark, board)) = &self.pending_move {
                         if *pseq == seq {
                             match state {
                                 Delivery::Delivered => {
+                                    self.accepted_moves.push(AcceptedMove {
+                                        ply: self.board.ply(),
+                                        square: *square,
+                                        mark: *mark,
+                                        sequence: seq,
+                                        local_ack: true,
+                                    });
                                     self.board = board.clone();
                                     self.status = format!("move {square} delivered");
                                     self.pending_move = None;

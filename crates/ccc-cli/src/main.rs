@@ -46,6 +46,9 @@ struct ClientArgs {
     sim: bool,
     #[arg(long)]
     sim_path: Option<String>,
+    /// Write versioned semantic game evidence as JSONL.
+    #[arg(long)]
+    events_path: Option<String>,
     /// Line-oriented input/output. EOF leaves the session running; enter /q to quit.
     #[arg(long)]
     plain: bool,
@@ -171,7 +174,7 @@ fn client(
         });
     }
 
-    let (commands, updates, worker) = worker::start(cfg.clone(), stop.clone());
+    let (commands, updates, worker) = worker::start(cfg.clone(), stop.clone(), args.events_path);
     let result = if cfg.plain {
         plain_loop(&cfg, stop.clone(), commands, updates)
     } else {

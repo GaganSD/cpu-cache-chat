@@ -52,6 +52,7 @@ mod tests;
 pub fn start(
     cfg: RuntimeConfig,
     stop: Arc<AtomicBool>,
+    events_path: Option<String>,
 ) -> (
     mpsc::Sender<String>,
     mpsc::Receiver<Update>,
@@ -60,6 +61,23 @@ pub fn start(
     let (commands, input) = mpsc::channel::<String>();
     let (output, updates) = mpsc::channel();
     let handle = std::thread::spawn(move || {
+        use std::io::Write;
+        let mut evidence = match events_path {
+            Some(path) => match std::fs::File::create(path) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    let _ = output.send(Update::Fatal(Error::Io(e.to_string())));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let mut emit = |event: serde_json::Value| -> Result<(), Error> {
+            if let Some(file) = &mut evidence {
+                writeln!(file, "{event}").map_err(|e| Error::Io(format!("event evidence: {e}")))?;
+            }
+            Ok(())
+        };
         let wire = match ccc_channel::open_wire(&cfg, stop.clone()) {
             Ok(wire) => wire,
             Err(e) => {
@@ -96,7 +114,16 @@ pub fn start(
                 return;
             }
         }
-        let _ = output.send(Update::Snapshot(session.snapshot()));
+        let initial = session.snapshot();
+        if let Err(e) = emit(
+            serde_json::json!({"type":"session","version":1,"session":initial.session,"role":cfg.role.to_string()}),
+        ) {
+            let _ = output.send(Update::Fatal(e));
+            return;
+        }
+        let _ = output.send(Update::Snapshot(initial));
+        let mut final_emitted = false;
+        let mut successful = true;
         let mut job: Option<ccc_app::agent::AgentJob> = None;
         let mut request_id = 0u64;
         while !stop.load(Ordering::SeqCst) {
@@ -148,8 +175,16 @@ pub fn start(
                                         && current.generation == result.generation
                                         && current.request_id == result.request_id
                                     {
+                                        if let Err(e) = emit(
+                                            serde_json::json!({"type":"agent_choice","ply":current.generation,"square":result.square}),
+                                        ) {
+                                            let _ = output.send(Update::Fatal(e));
+                                            successful = false;
+                                            break;
+                                        }
                                         if let Err(e) = session.queue_move(result.square) {
                                             let _ = output.send(Update::Fatal(e));
+                                            successful = false;
                                             break;
                                         }
                                     }
@@ -157,6 +192,7 @@ pub fn start(
                             }
                             Err(e) => {
                                 let _ = output.send(Update::Fatal(e));
+                                successful = false;
                                 break;
                             }
                         }
@@ -166,6 +202,7 @@ pub fn start(
                         let _ = output.send(Update::Fatal(Error::Agent(
                             "agent supervisor disconnected".into(),
                         )));
+                        successful = false;
                         break;
                     }
                 }
@@ -189,6 +226,7 @@ pub fn start(
                         }
                         Err(e) => {
                             let _ = output.send(Update::Fatal(e));
+                            successful = false;
                             break;
                         }
                     }
@@ -203,17 +241,55 @@ pub fn start(
                         let _ = output.send(Update::Fatal(Error::Io(
                             "link failed; delivery unknown".into(),
                         )));
+                        successful = false;
                         break;
                     }
                 }
                 Err(e) => {
                     let _ = output.send(Update::Fatal(e));
+                    successful = false;
                     break;
                 }
             }
-            let _ = output.send(Update::Snapshot(session.snapshot()));
+            for mv in session.take_accepted_moves() {
+                if let Err(e) = emit(
+                    serde_json::json!({"type":"move","ply":mv.ply,"square":mv.square,"mark":mv.mark.glyph().to_string(),"sequence":mv.sequence,"acceptance":if mv.local_ack {"local_ack"} else {"peer_accepted"}}),
+                ) {
+                    let _ = output.send(Update::Fatal(e));
+                    successful = false;
+                    break;
+                }
+            }
+            if !successful {
+                break;
+            }
+            let snapshot = session.snapshot();
+            if !final_emitted {
+                if let Some(outcome) = &snapshot.outcome {
+                    let outcome = match outcome.as_str() {
+                        "X wins" => "x_win",
+                        "O wins" => "o_win",
+                        "draw" => "draw",
+                        _ => "unknown",
+                    };
+                    if let Err(e) = emit(
+                        serde_json::json!({"type":"final","board":snapshot.board_compact,"ply":snapshot.ply,"outcome":outcome}),
+                    ) {
+                        let _ = output.send(Update::Fatal(e));
+                        successful = false;
+                        break;
+                    }
+                    final_emitted = true;
+                }
+            }
+            let _ = output.send(Update::Snapshot(snapshot));
         }
         session.interrupt();
+        if let Err(e) = emit(
+            serde_json::json!({"type":"stopped","successful":successful,"evidence_complete":successful}),
+        ) {
+            let _ = output.send(Update::Fatal(e));
+        }
     });
     (commands, updates, handle)
 }
