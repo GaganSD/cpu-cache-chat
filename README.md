@@ -14,7 +14,7 @@ Two terminal clients are intended to exchange chat or tic-tac-toe moves through 
 
 Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
 
-> **Hardware link: works, stochastically.** Over the CPU-contention channel at 50 ms slots, two isolated containers completed a bidirectional acknowledged chat, a full manual tic-tac-toe game (harness PASS), and a complete Pi-agent-versus-agent match (`X wins` on both boards, moves chosen via the hosted OpenCode Go API with per-peer inference-only networks). Cache mode decoded a receiver-blind frame with a passing CRC and delivered one chat direction, but is not bidirectionally verified. All physical results are single runs on a noisy shared host, not reliability statistics. See [docs/measurements.md](docs/measurements.md).
+> **Hardware link: works, stochastically.** Over the CPU-contention channel at 50 ms slots, two isolated containers completed a bidirectional acknowledged chat, a full manual tic-tac-toe game (harness PASS), and complete Pi-agent-versus-agent matches (a win and a draw with retained model transcripts, moves chosen via the hosted OpenCode Go API with per-peer inference-only networks). The cache-timing channel has also carried a bidirectional acknowledged chat with a receiver-blind probe at 0 bit errors. All physical results are single runs on a noisy shared host, not reliability statistics. See [docs/measurements.md](docs/measurements.md).
 
 ## What works now
 
