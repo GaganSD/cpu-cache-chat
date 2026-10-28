@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { makeTools, parseBoard, llamaBaseUrl } from "../src/game.mjs";
 
 const board = { board: "X23456789", turn: "O", legal: [2, 3, 4, 5, 6, 7, 8, 9] };
@@ -32,12 +33,12 @@ test("illegal moves return feedback and do not choose a square", async () => {
 });
 
 test("test hook runs without importing Pi", () => {
-  const run = spawnSync(process.execPath, [new URL("./first-legal.mjs", import.meta.url).pathname], {
+  const run = spawnSync(process.execPath, [fileURLToPath(new URL("./first-legal.mjs", import.meta.url))], {
     input: JSON.stringify(board), encoding: "utf8",
   });
   assert.equal(run.status, 0, run.stderr);
   assert.deepEqual(JSON.parse(run.stdout), { square: 2, source: "test-hook" });
-  const bad = spawnSync(process.execPath, [new URL("./first-legal.mjs", import.meta.url).pathname], {
+  const bad = spawnSync(process.execPath, [fileURLToPath(new URL("./first-legal.mjs", import.meta.url))], {
     input: "broken", encoding: "utf8",
   });
   assert.notEqual(bad.status, 0);

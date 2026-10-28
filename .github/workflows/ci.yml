@@ -36,6 +36,16 @@ jobs:
           if grep -Eiq '#[[:space:]]*skip\b|^#[[:space:]]*skipped[[:space:]]+[1-9]' test-output.txt; then
             echo 'Node tests skipped' >&2; exit 1
           fi
+      - name: Node checkout path with spaces
+        shell: bash
+        run: |
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          cp -R agent "$work/agent with spaces"
+          node --test --test-reporter=tap "$work/agent with spaces"/tests/*.test.mjs | tee "$work/results.txt"
+          if grep -Eiq '#[[:space:]]*skip\b|^#[[:space:]]*skipped[[:space:]]+[1-9]' "$work/results.txt"; then
+            echo 'Node tests skipped' >&2; exit 1
+          fi
       - name: Shell syntax and fixtures
         shell: bash
         run: |
@@ -48,7 +58,7 @@ jobs:
       - name: Simulation e2e
         shell: bash
         run: |
-          cargo build --locked --release -p cpu-cache-chat
+          cargo build --locked --release -p cpu-cache-chat -p ccc-game
           MODE=chat ./scripts/e2e-headless-sim.sh
           MODE=game ./scripts/e2e-headless-sim.sh
   shellcheck:
