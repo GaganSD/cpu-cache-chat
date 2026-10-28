@@ -1,56 +1,57 @@
 #!/usr/bin/env bash
+# Inspect configuration only; this is not a live network isolation test.
 set -euo pipefail
-fail=0
-mounts_a=''
-mounts_b=''
-if [[ $# -ne 0 && $# -ne 2 ]]; then
-  echo 'Usage: inspect-isolation.sh [container-a container-b]' >&2; exit 2
+policy=none
+if [[ ${1:-} == --hosted ]]; then policy=hosted; shift; fi
+if [[ $# != 2 || $1 == "$2" ]]; then
+  echo 'Usage: inspect-isolation.sh [--hosted] container-a container-b' >&2; exit 2
 fi
-name_a=${1:-ccc-a}
-name_b=${2:-ccc-b}
-if [[ "$name_a" == "$name_b" ]]; then
-  echo 'FAIL: containers must be distinct' >&2; exit 1
-fi
-for name in "$name_a" "$name_b"; do
-  if ! details=$(docker inspect --format '{{.HostConfig.NetworkMode}}|{{.HostConfig.Privileged}}|{{.HostConfig.PidMode}}|{{.HostConfig.IpcMode}}' "$name"); then
-    echo "FAIL: cannot inspect $name" >&2; fail=1; continue
-  fi
-  IFS='|' read -r net privileged pid ipc <<< "$details"
-  echo "$name: network=$net privileged=$privileged pid=$pid ipc=$ipc"
-  [[ "$net" == none ]] || { echo "FAIL: $name network is not none" >&2; fail=1; }
-  [[ "$privileged" == false ]] || { echo "FAIL: $name is privileged" >&2; fail=1; }
-  [[ -z "$pid" ]] || { echo "FAIL: $name does not use a private PID namespace" >&2; fail=1; }
-  [[ "$ipc" == private ]] || { echo "FAIL: $name IPC is not private" >&2; fail=1; }
-  if ! mounts=$(docker inspect --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}{{println}}{{end}}' "$name"); then
-    echo "FAIL: cannot inspect mounts of $name" >&2; fail=1; continue
-  fi
-  printf '%s mounts:\n%s\n' "$name" "$mounts"
-  while IFS='|' read -r type source dest _; do
-    [[ -n "$type" ]] || continue
-    if [[ "$source" == *docker.sock* || "$dest" == *docker.sock* \
-       || "$source" == /var/run || "$source" == /run \
-       || "$source" == /var/run/* || "$source" == /run/* ]]; then
-      echo "FAIL: $name exposes a docker host socket path ($source -> $dest)" >&2; fail=1
-    fi
-  done <<< "$mounts"
-  if [[ "$name" == "$name_a" ]]; then mounts_a="$mounts"; else mounts_b="$mounts"; fi
+command -v python3 >/dev/null || { echo 'python3 required' >&2; exit 1; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+for i in 1 2; do
+  name=$1; shift
+  docker inspect "$name" > "$tmp/$i.json" || { echo "FAIL: cannot inspect $name" >&2; exit 1; }
 done
-# Bind paths can overlap without being identical. Docker supplies resolved source paths.
-# A read-only mount on one side is still unsafe if the other side can write it.
-while IFS='|' read -r type_a source_a _ rw_a; do
-  [[ "$type_a" == bind || "$type_a" == volume ]] || continue
-  while IFS='|' read -r type_b source_b _ rw_b; do
-    [[ "$type_b" == bind || "$type_b" == volume ]] || continue
-    [[ -n "$source_a" && -n "$source_b" ]] || continue
-    source_a="${source_a%/}"; source_b="${source_b%/}"
-    [[ -n "$source_a" ]] || source_a=/
-    [[ -n "$source_b" ]] || source_b=/
-    if [[ "$source_a" == "$source_b" || "$source_a" == / || "$source_b" == / || "$source_a" == "$source_b/"* || "$source_b" == "$source_a/"* ]]; then
-      if [[ "$rw_a" == true || "$rw_b" == true ]]; then
-        echo "FAIL: shared writable mount sources $source_a and $source_b" >&2; fail=1
-      fi
-    fi
-  done <<< "$mounts_b"
-done <<< "$mounts_a"
-[[ "$fail" -eq 0 ]] || exit 1
-echo 'Container configuration checks passed; this does not establish a working hardware channel.'
+python3 - "$policy" "$tmp/1.json" "$tmp/2.json" <<'PY'
+import json, sys
+policy = sys.argv[1]
+try:
+    cs = [json.load(open(p, encoding='utf-8')) for p in sys.argv[2:]]
+    if any(not isinstance(c, list) or len(c) != 1 for c in cs):
+        raise ValueError('expected one inspect result per container')
+    cs = [c[0] for c in cs]
+    networks = []
+    for c in cs:
+        h, config, n = c['HostConfig'], c['Config'], c['NetworkSettings']['Networks']
+        name = c['Name']
+        def require(ok, reason):
+            if not ok: raise ValueError(f'{name}: {reason}')
+        require(h['Privileged'] is False, 'privileged')
+        require(h['PidMode'] in ('', 'private'), 'PID namespace not private')
+        require(h['IpcMode'] == 'private', 'IPC namespace not private')
+        require(h['UTSMode'] in ('', 'private'), 'UTS namespace not private')
+        require(h['UsernsMode'] != 'host', 'host user namespace')
+        require(h['ReadonlyRootfs'] is True, 'root filesystem writable')
+        require(config['User'] == '65532:65532', 'unexpected user')
+        require('ALL' in (h['CapDrop'] or []), 'capabilities not dropped')
+        require(not h['CapAdd'], 'added capabilities')
+        require(any(x in ('no-new-privileges', 'no-new-privileges:true') for x in (h['SecurityOpt'] or [])), 'no-new-privileges missing')
+        require(not h['Devices'] and not h.get('DeviceRequests') and not h.get('DeviceCgroupRules'), 'devices exposed')
+        require(not h['PortBindings'] and not config.get('ExposedPorts') and not h['PublishAllPorts'], 'ports exposed')
+        require(not c['Mounts'] and not h.get('Binds') and not h.get('VolumesFrom'), 'host or volume mounts are not allowed')
+        require(h['Memory'] > 0 and h['PidsLimit'] is not None and h['PidsLimit'] > 0, 'memory/pid limits missing')
+        require(bool(h['CpusetCpus']) or h.get('NanoCpus', 0) > 0, 'CPU bound missing')
+        require(isinstance(n, dict), 'invalid network membership')
+        if policy == 'none':
+            require(h['NetworkMode'] == 'none' and set(n).issubset({'none'}), 'network not none')
+        else:
+            require(h['NetworkMode'] not in ('none', 'host', 'bridge', 'default', '') and len(n) == 1 and h['NetworkMode'] in n, 'expected one dedicated network')
+        networks.append(set(n))
+    if policy == 'hosted' and networks[0] & networks[1]:
+        raise ValueError('shared network')
+except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as e:
+    print(f'FAIL: inspection: {e}', file=sys.stderr)
+    sys.exit(1)
+print('Configuration checks passed; live network policy is UNVERIFIED; hardware channel is not established.')
+PY

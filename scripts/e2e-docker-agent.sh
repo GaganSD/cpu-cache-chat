@@ -4,12 +4,8 @@
 # Isolation notes, honestly stated:
 # - Game moves, acks, and turn coordination travel ONLY over the selected
 #   physical channel; the harness passes no data between the containers.
-# - Each container gets network egress to a single inference API origin
-#   (CCC_AGENT_PROVIDER=opencode-go) because the operator chose hosted
-#   inference instead of container-local weights. The two containers are on
-#   SEPARATE bridge networks with no route to each other; there is no peer
-#   network path and no host relay. This differs from the --network none
-#   manual/chat setup and is reported as such.
+# - Hosted inference uses separate egress-enabled bridges. These are not
+#   destination-restricted firewalls; live peer isolation is unverified.
 # - The API key is read from the operator's environment and passed via
 #   --env; it is never written into the image or the evidence directory.
 set -euo pipefail
@@ -21,7 +17,13 @@ CPUSET="${CPUSET:-0}"
 WAIT_SECONDS="${WAIT_SECONDS:-3600}"
 [[ "$CHANNEL" == cpu || "$CHANNEL" == cache ]] || { echo 'CHANNEL must be cpu or cache' >&2; exit 1; }
 export CCC_AGENT_PROVIDER="${CCC_AGENT_PROVIDER:-opencode-go}"
-if [[ "$CCC_AGENT_PROVIDER" == opencode-go && -z "${OPENCODE_GO_API_KEY:-}" ]]; then
+if [[ "$CCC_AGENT_PROVIDER" != opencode-go ]]; then
+  echo 'Offline/other providers are unsupported: local runtime and weights are not provisioned.' >&2; exit 1
+fi
+if [[ "${CCC_HOSTED_OPT_IN:-}" != 1 ]]; then
+  echo 'Set CCC_HOSTED_OPT_IN=1 to allow egress-enabled hosted inference; board prompts are sent to the provider and charges may apply.' >&2; exit 1
+fi
+if [[ -z "${OPENCODE_GO_API_KEY:-}" ]]; then
   echo 'OPENCODE_GO_API_KEY must be set for CCC_AGENT_PROVIDER=opencode-go' >&2
   exit 1
 fi
@@ -39,6 +41,7 @@ prefix="ccc-agent-$$"
 a="$prefix-a"; b="$prefix-b"
 net_a="$prefix-net-a"; net_b="$prefix-net-b"
 owned_a=0; owned_b=0; owned_net_a=0; owned_net_b=0
+repo_head=unknown; repo_dirty=unknown
 cleanup() {
   local result=$? pid
   exec 3>&- 4>&- || true
@@ -94,7 +97,7 @@ docker network create "$net_a" >/dev/null; owned_net_a=1
 docker network create "$net_b" >/dev/null; owned_net_b=1
 common=(--init --ipc private --read-only
   --tmpfs /tmp:rw,nosuid,size=64m --security-opt no-new-privileges
-  --cap-drop ALL --user 65532:65532 --memory 768m --cpuset-cpus "$CPUSET"
+  --cap-drop ALL --user 65532:65532 --memory 768m --pids-limit 128 --cpuset-cpus "$CPUSET"
   --env CCC_AGENT_PROVIDER --env OPENCODE_GO_API_KEY)
 if [[ -n "${CCC_AGENT_MODEL:-}" ]]; then common+=(--env CCC_AGENT_MODEL); fi
 if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
@@ -117,6 +120,7 @@ echo "container networks: A=[$nets_a] B=[$nets_b] (must be disjoint, no host, no
 if docker inspect "$a" "$b" --format '{{.HostConfig.Privileged}} {{.HostConfig.NetworkMode}}' | grep -q true; then
   echo 'FAIL: privileged container' >&2; exit 1
 fi
+"$ROOT/scripts/inspect-isolation.sh" --hosted "$a" "$b" > "$workdir/policy.txt"
 docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>"$workdir/a.err" & A_PID=$!
 docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>"$workdir/b.err" & B_PID=$!
 sleep 2
@@ -127,21 +131,7 @@ sleep 2
   docker network inspect "$net_a" "$net_b" --format '{{.Name}} internal={{.Internal}} containers={{json .Containers}}'
   docker image inspect "$IMAGE" --format 'image created={{.Created}} id={{.Id}}'
 } > "$workdir/docker-inspect.txt"
-# Negative probe: A must NOT be able to open a TCP connection to B's address.
-b_ip=$(docker inspect -f "{{index .NetworkSettings.Networks \"$net_b\" \"IPAddress\"}}" "$b")
-if [[ -n "$b_ip" ]]; then
-  if docker exec "$a" node -e "
-    const net = require('node:net');
-    const s = net.connect({ host: process.argv[1], port: 9, timeout: 3000 });
-    s.on('connect', () => { console.log('CONNECTED'); process.exit(0); });
-    s.on('timeout', () => { s.destroy(); console.log('blocked: timeout'); process.exit(1); });
-    s.on('error', (e) => { console.log('blocked: ' + e.code); process.exit(1); });
-  " "$b_ip" > "$workdir/peer-probe.txt" 2>&1; then
-    echo "FAIL: container A reached container B at $b_ip — peer route exists" >&2
-    exit 1
-  fi
-  echo "peer probe: A cannot reach B at $b_ip ($(cat "$workdir/peer-probe.txt"))"
-fi
+echo 'UNVERIFIED: no known-listener positive/negative live network controls were run.' >&2
 wait_for() {
   local file="$1" needle="$2" tries="${3:-$WAIT_SECONDS}"
   for _ in $(seq 1 "$tries"); do
@@ -177,6 +167,7 @@ grep -q "agent chose" "$workdir/a.out" || { echo 'FAIL: A never recorded an agen
 grep -q "agent chose" "$workdir/b.out" || { echo 'FAIL: B never recorded an agent move' >&2; exit 1; }
 moves_a=$(grep -c 'agent chose' "$workdir/a.out")
 moves_b=$(grep -c 'agent chose' "$workdir/b.out")
-echo "PASS physical $CHANNEL agent game finished: $a_result (both boards agree; agent moves A=$moves_a B=$moves_b)"
+echo "UNVERIFIED physical $CHANNEL agent game: matching outcome text $a_result; boards and live network policy not verified (agent moves A=$moves_a B=$moves_b)"
 printf '/q\n' >&3; printf '/q\n' >&4
 wait "$A_PID" "$B_PID"
+exit 1

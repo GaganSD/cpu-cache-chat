@@ -5,11 +5,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE="${IMAGE:-cpu-cache-chat:local}"
 CHANNEL="${CHANNEL:-cpu}"
 MODE="${MODE:-chat}"
-SLOT_MS="${SLOT_MS:-10}"
+SLOT_MS="${SLOT_MS:-50}"
 CPUSET="${CPUSET:-0}"
 WAIT_SECONDS="${WAIT_SECONDS:-60}"
 [[ "$CHANNEL" == cpu || "$CHANNEL" == cache ]] || { echo 'CHANNEL must be cpu or cache' >&2; exit 1; }
 [[ "$MODE" == chat ]] || { echo 'e2e-docker currently supports MODE=chat only' >&2; exit 1; }
+[[ "$SLOT_MS" =~ ^[0-9]{1,3}$ ]] && (( 10#$SLOT_MS >= 1 && 10#$SLOT_MS <= 500 )) || { echo 'SLOT_MS must be 1..500' >&2; exit 1; }
+SLOT_MS=$((10#$SLOT_MS))
+# Three complete empty protocol control frame windows, rounded up to seconds.
+SILENT_SECONDS=$(((3 * (156 + 13 * 19) * SLOT_MS + 999) / 1000))
 [[ "$WAIT_SECONDS" =~ ^[0-9]{1,4}$ ]] || { echo 'WAIT_SECONDS must be an integer from 1 to 3600' >&2; exit 1; }
 WAIT_SECONDS=$((10#$WAIT_SECONDS))
 (( WAIT_SECONDS >= 1 && WAIT_SECONDS <= 3600 )) || { echo 'WAIT_SECONDS must be an integer from 1 to 3600' >&2; exit 1; }
@@ -69,13 +73,14 @@ docker info >/dev/null
 docker image inspect "$IMAGE" >/dev/null
 common=(--init --network none --ipc private --read-only
   --tmpfs /tmp:rw,nosuid,size=64m --security-opt no-new-privileges
-  --cap-drop ALL --user 65532:65532 --memory 256m --cpuset-cpus "$CPUSET")
+  --cap-drop ALL --user 65532:65532 --memory 256m --pids-limit 128 --cpuset-cpus "$CPUSET")
 if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
 
 # A control with no sender must time out without decoding a frame. The report
 # remains diagnostic; this alone cannot establish a working transport.
+echo "Silent no-sender control: ${SILENT_SECONDS}s (three nominal empty control-frame windows); unrelated-load control not run."
 docker create --name "$b" "${common[@]}" "$IMAGE" probe --role b --channel "$CHANNEL" \
-  --slot-ms "$SLOT_MS" --silent --silent-seconds 5 >/dev/null
+  --slot-ms "$SLOT_MS" --silent --silent-seconds "$SILENT_SECONDS" >/dev/null
 owned_b=1
 docker start -a "$b" >"$workdir/silent.out" 2>"$workdir/silent.err" || { echo 'FAIL: silent control process failed'; exit 1; }
 cat "$workdir/silent.out"

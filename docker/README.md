@@ -1,22 +1,11 @@
 # Container packaging
 
-Use Docker Engine on Linux or OrbStack on macOS. Build natively for the Linux architecture: ARM64 is the first target for Apple silicon and ARM Linux; x86-64 Linux can use the same Dockerfile. The image contains the Rust release binary and agent source stub only. It does not install Pi, Node, llama.cpp, model weights, or secrets. Agent-backed games need separate future provisioning; no model is downloaded here.
+Docker Engine on Linux or OrbStack on macOS is required. `./docker/build.sh` builds the manual image; `./docker/build-agent.sh` builds the separate Node/Pi agent image. These commands build locally and may download dependencies. No build or physical validation is implied by this document.
 
-```sh
-./docker/build.sh
-CHANNEL=cache ./scripts/run-pair.sh  # or CHANNEL=cpu; MODE=game is also available
-./scripts/inspect-isolation.sh
-```
+`scripts/run-pair.sh` starts manual peers with the explicit CPU-contention 50 ms preset and CPUSET=0 by default. Set `CPUSET` to a Linux guest CPU available to Docker: CPU 0 may not be permitted, and a guest vCPU is not a host physical core. Set `CHANNEL=cache` explicitly for the distinct experimental cache workload. Attach commands are printed by the script. Physical compatibility and reliability are unvalidated on new hosts.
 
-Attach in separate terminals with `docker attach ccc-a` and `docker attach ccc-b`. Detach with Ctrl-p Ctrl-q; stop and remove with `docker rm -f ccc-a ccc-b`. Existing containers are not replaced. `IMAGE` selects another image tag. Set `CPUSET`, for example `CPUSET=0,1`, to apply an optional Docker CPU set to both players; without it the runtime chooses CPUs. On OrbStack, Linux guest CPUs are virtual CPUs and this does not pin host physical cores. Hardware sharing and timing are not guaranteed by a CPU set.
+`scripts/inspect-isolation.sh container-a container-b` checks configuration, not live isolation or channel operation. It requires nonroot, private namespaces, network none, dropped capabilities, no-new-privileges, a read-only root filesystem, no host/volume mounts, no devices or exposed ports, and resource bounds. Its hosted option checks disjoint dedicated networks but cannot establish that routing is blocked. Live policy remains unverified.
 
-For separate cache and CPU measurements, stop the interactive pair first to avoid extra load, then run:
+Hosted agents require `CCC_HOSTED_OPT_IN=1`, `OPENCODE_GO_API_KEY`, and the agent image. The separate bridge networks permit general egress; they are not inference-only firewalls. The provider receives board prompts and charges may apply. Offline agents are not provisioned and fail before network creation. The current agent harness cannot verify board equality or live isolation and will not report an overall PASS.
 
-```sh
-./scripts/probe-pair.sh
-# Optional: CPUSET=0,1 TRIALS=1 BITS=64 SLOT_MS=2 ./scripts/probe-pair.sh
-```
-
-The script launches independent sender and receiver containers for each channel and prints their actual output. A two-second receiver head start is only a startup heuristic, not synchronization. The current probe performs a single receive attempt despite reporting the `trials` parameter; its receiver cannot verify the sender's payload and reports `usable: false` without an expected payload. A successful process exit is not evidence of a reliable channel. Repeat and evaluate measurements and controls separately; cache and CPU results are distinct.
-
-These are containers sharing the Linux kernel, not microVMs. On macOS that kernel runs in OrbStack. The launch uses no network, private IPC, separate writable filesystems, no Docker socket or shared writable mounts, no privileged mode, and no host relay. The inspector checks the runtime configuration, including overlapping writable bind or volume sources, but does not prove that all possible covert paths are absent or that a physical channel works. Image layers are shared read-only. `docker info` must succeed; these scripts do not start or reconfigure OrbStack.
+No script here configures host security settings or starts Docker. Containers share a Linux kernel; they are not VMs. Historical 50 ms results are not a guarantee. See `plan.md` for unresolved release and hardware gates.

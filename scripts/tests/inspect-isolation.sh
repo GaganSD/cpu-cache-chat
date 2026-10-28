@@ -8,7 +8,8 @@ a="$prefix-a"; b="$prefix-b"
 tmp=$(mktemp -d)
 cleanup() { docker rm -f "$a" "$b" >/dev/null 2>&1 || true; rm -rf "$tmp"; }
 trap cleanup EXIT
-common=(--network none --ipc private --entrypoint /bin/true)
+common=(--network none --ipc private --read-only --user 65532:65532 --cap-drop ALL
+  --security-opt no-new-privileges --memory 128m --pids-limit 64 --cpuset-cpus "${CPUSET:-0}" --entrypoint /bin/true)
 make_pair() {
   docker rm -f "$a" "$b" >/dev/null 2>&1 || true
   docker create --name "$a" "${common[@]}" "$@" "$IMAGE" >/dev/null
@@ -24,7 +25,7 @@ expect_fail() {
 make_pair
 "$ROOT/scripts/inspect-isolation.sh" "$a" "$b"
 docker rm -f "$a" "$b" >/dev/null
-docker create --name "$a" --network bridge --ipc private --entrypoint /bin/true "$IMAGE" >/dev/null
+docker create --name "$a" "${common[@]}" --network bridge "$IMAGE" >/dev/null
 docker create --name "$b" "${common[@]}" "$IMAGE" >/dev/null
 expect_fail 'network bridge'
 make_pair --privileged

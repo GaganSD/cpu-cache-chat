@@ -6,6 +6,13 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccc-e2e-diagnostics-test.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/state" "$tmp/evidence" "$tmp/transient"
+python3 - "$tmp/inspect.json" <<'PY'
+import json, sys
+h = dict(Privileged=False, PidMode='', IpcMode='private', UTSMode='', UsernsMode='', ReadonlyRootfs=True, CapDrop=['ALL'], CapAdd=None, SecurityOpt=['no-new-privileges:true'], Devices=[], DeviceRequests=None, DeviceCgroupRules=None, PortBindings={}, PublishAllPorts=False, Binds=None, VolumesFrom=None, Memory=268435456, PidsLimit=128, CpusetCpus='0', NetworkMode='none')
+c = dict(Name='/mock', HostConfig=h, Config=dict(User='65532:65532', ExposedPorts=None), NetworkSettings=dict(Networks={'none': {}}), Mounts=[])
+with open(sys.argv[1], 'w') as f: json.dump([c], f)
+PY
+export MOCK_INSPECT="$tmp/inspect.json"
 cat > "$tmp/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -18,7 +25,8 @@ case "$cmd" in
       [[ -f "$MOCK_STATE/$name" ]] || exit 1
       if [[ "$format" != *'.Mounts'* ]]; then echo 'none|false||private'; fi
     else
-      [[ -f "$MOCK_STATE/$1" ]]
+      [[ -f "$MOCK_STATE/$1" ]] || exit 1
+      cat "$MOCK_INSPECT"
     fi ;;
   create)
     args=" $* "
