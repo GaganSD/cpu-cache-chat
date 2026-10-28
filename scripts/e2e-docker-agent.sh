@@ -65,6 +65,9 @@ cleanup() {
         "$result" "$CHANNEL" "$SLOT_MS" "$CPUSET" "$WAIT_SECONDS" "$IMAGE" \
         "$CCC_AGENT_PROVIDER" "${CCC_AGENT_MODEL:-glm-5.3-flash}"
       printf 'image_digest=%s\n' "$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo unknown)"
+      printf 'repo_head=%s\n' "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+      printf 'repo_dirty=%s\n' "$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo yes || echo no)"
+      printf 'ccc_debug=%s\nccc_agent_debug=%s\n' "${CCC_DEBUG:-0}" "${CCC_AGENT_DEBUG:-0}"
       printf 'host_uname=%s\n' "$(uname -srm)"
       printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$workdir/run.txt"
@@ -92,6 +95,7 @@ common=(--init --ipc private --read-only
   --env CCC_AGENT_PROVIDER --env OPENCODE_GO_API_KEY)
 if [[ -n "${CCC_AGENT_MODEL:-}" ]]; then common+=(--env CCC_AGENT_MODEL); fi
 if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
+if [[ "${CCC_AGENT_DEBUG:-}" == 1 ]]; then common+=(--env CCC_AGENT_DEBUG=1); fi
 
 mkfifo "$workdir/a.in" "$workdir/b.in"
 exec 3<>"$workdir/a.in" 4<>"$workdir/b.in"
