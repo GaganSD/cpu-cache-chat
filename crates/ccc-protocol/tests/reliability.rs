@@ -176,11 +176,17 @@ fn unknown_sequence_never_resumes_after_prolonged_driving() {
 
 #[test]
 fn stale_and_old_data_are_rejected_and_duplicate_is_acked() {
-    let (mut a, mut b, _, sb) = pair(None, None);
+    // Exercise sequence semantics without idle token handoff or retry timing.
+    // Extra idle rounds could grant B the token under a slow CI scheduler.
+    let (mut a, mut b, _, sb) = pair_with_timeout(None, None, Duration::from_secs(60));
+    let mut events = Vec::new();
     for text in ["one", "two"] {
         a.enqueue(chat(text)).unwrap();
+        a.drive(Duration::ZERO).unwrap();
+        events.extend(b.drive(Duration::ZERO).unwrap());
+        let ack = a.drive(Duration::ZERO).unwrap();
+        assert!(delivered(&ack, Delivery::Delivered));
     }
-    let (_, events) = drive_pair(&mut a, &mut b, 8);
     assert_eq!(received(&events), 2);
     let mut wire = a.into_wire();
     for (session, seq) in [(42, 2), (42, 1), (99, 3)] {
