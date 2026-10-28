@@ -1,57 +1,32 @@
 # cpu-cache-chat
 
-Re-implementation of OpenAI's sandbox escape where misaligned agents used CPU's cache to communicate across different sandboxes.
+Two sandboxed programs share a CPU and attempt to exchange chat or tic-tac-toe moves using timing rather than a peer network. This experiment was inspired by accounts of agent communication through shared hardware; no equivalence to any specific research is asserted here.
 
-Chat is an experimental terminal application which allows to sandbox instances to communicate between each other by implementing a message protocol over Macbook's CPU cache.
+## Status and scope
 
-We demonstrate this in 2 ways: 
-- using two isolated Pi agents that share a CPU to play Tic-tac-toe  
-- and a chat interface to message other VMs
+| Configuration | Evidence and limits |
+| --- | --- |
+| Simulation | Unix datagrams, for software testing only; not isolation or physical-channel evidence. |
+| CPU contention / cache timing | Historical single-run results on Apple M2 and OrbStack exist; failures also occurred. The newer wire format needs fresh physical validation. |
+| Hosted agents | Historical hosted runs used external inference and separate bridge networks, not offline operation. Egress was not restricted to inference destinations. |
+| Offline agents, other Macs, Linux | Physical release gates blocked pending measurements; do not infer support from CI. |
 
-**Two isolated agents. One shared CPU. Tic-tac-toe without a network between them.**
+See [measurements](docs/measurements.md). Containers share a Linux kernel; they are not a security boundary against all covert channels. Cache timing does not establish a particular eviction mechanism. The link can fail or report unknown delivery; never treat it as reliable or secure.
 
-Two terminal clients are intended to exchange chat or tic-tac-toe moves through a selected hardware timing channel. The intended demo is two Pi agents in separate Docker containers. Manual chat uses the same transport.
+## Prerequisites and quickstart
 
-Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
+Docker Engine on Linux or OrbStack on Apple silicon, Bash, and a native image are required for physical demos. The following launcher interface is **planned** and must be verified against the checkout before use; physical gates are not yet complete:
 
-> **Hardware link: works, stochastically.** Over the CPU-contention channel at 50 ms slots, two isolated containers completed a bidirectional acknowledged chat, a full manual tic-tac-toe game (harness PASS), and complete Pi-agent-versus-agent matches (a win and a draw with retained model transcripts, moves chosen via the hosted OpenCode Go API with per-peer inference-only networks). The cache-timing channel has also carried a bidirectional acknowledged chat with a receiver-blind probe at 0 bit errors. All physical results are single runs on a noisy shared host, not reliability statistics. See [docs/measurements.md](docs/measurements.md).
-
-## What works now
-
-```text
-cargo test --workspace
-cargo run -p cpu-cache-chat -- chat --role a --channel cache --sim --plain
-cargo run -p cpu-cache-chat -- game --role b --channel cache --sim
+```sh
+./docker/build.sh
+./scripts/demo.sh doctor
+./scripts/demo.sh chat --channel cpu
+# Use the run ID printed by the launcher:
+./scripts/demo.sh stop --run-id RUN_ID
 ```
 
-`--sim` is a Unix-datagram software path. The UI labels it `simulation`. It is for protocol development, not the isolated demo.
+A pair should show its channel, connection and delivery state; no-lock and unknown delivery are possible. At 50 ms per slot, even an empty physical frame can take several seconds; handshakes, retries and games can take minutes or time out. Do not expect interactive-network latency. To try a manual game, use `./scripts/demo.sh game --channel cpu`. Hosted agents are opt-in with `./scripts/demo.sh agents --channel cpu --provider opencode-go`, require credentials and incur external inference costs. Never put keys in logs or images.
 
-```text
-cpu-cache-chat chat  --role a|b --channel cache|cpu [--sim]
-cpu-cache-chat game  --role a|b --channel cache|cpu [--agent] [--sim]
-cpu-cache-chat probe --role a|b --channel cache|cpu
-cpu-cache-chat inspect-isolation
-```
+For software-only checks, use `cargo test --workspace --locked` and `MODE=chat ./scripts/e2e-headless-sim.sh`. The latter is not a physical test. If Docker is unavailable, start the runtime; if connection fails, stop the run and inspect its diagnostics rather than assuming success or switching channels silently.
 
-Two-process software pair: `scripts/host-sim-pair.sh`.
-
-Headless sim: `MODE=chat ./scripts/e2e-headless-sim.sh`. Two-container launch: `scripts/run-pair.sh` or `scripts/e2e-docker.sh`; physical game: `scripts/e2e-docker-game.sh`; agent-versus-agent over the physical channel: `scripts/e2e-docker-agent.sh` (needs `OPENCODE_GO_API_KEY`; agents may also use a container-local llama.cpp instead). Agent sim game: `scripts/e2e-agent-sim.sh`. Isolation uses `--network none` for manual play and per-peer bridge networks for hosted inference; neither relays messages. Computer-use retest: [docs/codex-computer-use-test.md](docs/codex-computer-use-test.md).
-
-## Isolation
-
-Containers, not microVMs. Shared-kernel Docker on OrbStack (macOS) or Docker Engine (Linux). See [product.md](product.md) and [docs/architecture.md](docs/architecture.md).
-
-## Models
-
-Two agent configurations exist. The verified one uses the hosted OpenCode Go inference API (`CCC_AGENT_PROVIDER=opencode-go`, key via `OPENCODE_GO_API_KEY`, model allowlist in `agent/src/game.mjs`) with per-peer bridge networks for inference egress only. The offline plan remains a container-local llama.cpp per player (first candidate: quantized Qwen3-0.6B), which is implemented in `agent/` but has not been evaluated for tool reliability or 8 GB two-instance memory.
-
-## Honesty rules
-
-- Cache success is not implied by CPU-contention success.
-- Simulation success is not a hardware result.
-- A failed calibration is reported, not replaced with sockets.
-
-- [Product plan](product.md)
-- [Architecture](docs/architecture.md)
-- [Measurements](docs/measurements.md)
-- [Handoff](prompt.md)
+[Architecture](docs/architecture.md) · [Measurements](docs/measurements.md) · [Release checklist](docs/release.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)

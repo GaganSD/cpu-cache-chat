@@ -9,3 +9,7 @@ Docker Engine on Linux or OrbStack on macOS is required. `./docker/build.sh` bui
 Hosted agents require `CCC_HOSTED_OPT_IN=1`, `OPENCODE_GO_API_KEY`, and the agent image. The separate bridge networks permit general egress; they are not inference-only firewalls. The provider receives board prompts and charges may apply. Offline agents are not provisioned and fail before network creation. The current agent harness cannot verify board equality or live isolation and will not report an overall PASS.
 
 No script here configures host security settings or starts Docker. Containers share a Linux kernel; they are not VMs. Historical 50 ms results are not a guarantee. See `plan.md` for unresolved release and hardware gates.
+
+See the [main quickstart](../README.md). `./docker/build.sh` builds the native base image; `./docker/build-agent.sh` additionally installs Node dependencies with `npm ci`. No model weights or secrets are included. Hosted agents need external inference access and credentials at runtime; bridge networking is not an inference-only firewall.
+
+The Dockerfile defaults use mutable tags. They are convenient for development, not release pins. For release provenance, supply verified platform-appropriate base image digests and source revision build arguments as described in [the release checklist](../docs/release.md). The default revision label is `unknown`, not proof of source identity.

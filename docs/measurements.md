@@ -1,3 +1,5 @@
+> **Current release status:** Physical validation of the newer wire format is blocked pending new controlled runs. The chronology below records historical single-run observations on a specific M2/OrbStack setup, not release-candidate validation or reliability estimates. Historical references to inference-only networking are incorrect: bridge egress was not restricted to inference destinations. A refused connection does not prove isolation. No cache eviction mechanism is established.
+
 # Channel measurements
 
 Recorded 2026-10-27 on Apple M2, OrbStack 2.2.5, Docker 29.8.2, ARM64.
