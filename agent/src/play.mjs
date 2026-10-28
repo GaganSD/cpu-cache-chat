@@ -95,7 +95,12 @@ try {
     } finally {
       if (process.env.CCC_AGENT_DEBUG) {
         try {
-          console.error(`agent-debug messages: ${JSON.stringify(session.messages ?? []).slice(0, 4000)}`);
+          // One line per message, no truncation: evidence runs need the
+          // full thinking and the tool call of every session.
+          const messages = session.messages ?? [];
+          for (let i = 0; i < messages.length; i++) {
+            console.error(`agent-debug message ${i}: ${JSON.stringify(messages[i])}`);
+          }
         } catch (e) { console.error(`agent-debug failed: ${e?.message || e}`); }
       }
       session.dispose();

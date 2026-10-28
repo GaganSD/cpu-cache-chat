@@ -65,8 +65,8 @@ cleanup() {
         "$result" "$CHANNEL" "$SLOT_MS" "$CPUSET" "$WAIT_SECONDS" "$IMAGE" \
         "$CCC_AGENT_PROVIDER" "${CCC_AGENT_MODEL:-glm-5.3-flash}"
       printf 'image_digest=%s\n' "$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo unknown)"
-      printf 'repo_head=%s\n' "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-      printf 'repo_dirty=%s\n' "$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo yes || echo no)"
+      printf 'repo_head=%s\n' "$repo_head"
+      printf 'repo_dirty=%s\n' "$repo_dirty"
       printf 'ccc_debug=%s\nccc_agent_debug=%s\n' "${CCC_DEBUG:-0}" "${CCC_AGENT_DEBUG:-0}"
       printf 'host_uname=%s\n' "$(uname -srm)"
       printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -85,6 +85,9 @@ for name in "$a" "$b"; do
 done
 docker info >/dev/null
 docker image inspect "$IMAGE" >/dev/null
+# Provenance at launch, not cleanup.
+repo_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+repo_dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo yes || echo no)
 # Separate bridge networks: egress to the inference API for each player, but
 # no layer-2 or routed path between the two containers.
 docker network create "$net_a" >/dev/null; owned_net_a=1
@@ -120,9 +123,25 @@ sleep 2
 # Capture the RUNTIME network state after start, not just the configured one.
 {
   echo "container networks (configured): A=[$nets_a] B=[$nets_b]"
-  docker inspect "$a" "$b" --format '{{.Name}} state={{.State.Status}} networks={{json .NetworkSettings.Networks}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}'
+  docker inspect "$a" "$b" --format '{{.Name}} state={{.State.Status}} image={{.Image}} networkmode={{.HostConfig.NetworkMode}} networks={{json .NetworkSettings.Networks}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}'
   docker network inspect "$net_a" "$net_b" --format '{{.Name}} internal={{.Internal}} containers={{json .Containers}}'
+  docker image inspect "$IMAGE" --format 'image created={{.Created}} id={{.Id}}'
 } > "$workdir/docker-inspect.txt"
+# Negative probe: A must NOT be able to open a TCP connection to B's address.
+b_ip=$(docker inspect -f "{{index .NetworkSettings.Networks \"$net_b\" \"IPAddress\"}}" "$b")
+if [[ -n "$b_ip" ]]; then
+  if docker exec "$a" node -e "
+    const net = require('node:net');
+    const s = net.connect({ host: process.argv[1], port: 9, timeout: 3000 });
+    s.on('connect', () => { console.log('CONNECTED'); process.exit(0); });
+    s.on('timeout', () => { s.destroy(); console.log('blocked: timeout'); process.exit(1); });
+    s.on('error', (e) => { console.log('blocked: ' + e.code); process.exit(1); });
+  " "$b_ip" > "$workdir/peer-probe.txt" 2>&1; then
+    echo "FAIL: container A reached container B at $b_ip — peer route exists" >&2
+    exit 1
+  fi
+  echo "peer probe: A cannot reach B at $b_ip ($(cat "$workdir/peer-probe.txt"))"
+fi
 wait_for() {
   local file="$1" needle="$2" tries="${3:-$WAIT_SECONDS}"
   for _ in $(seq 1 "$tries"); do
