@@ -22,9 +22,16 @@ A_OUT="$WORKDIR/a.out"
 B_OUT="$WORKDIR/b.out"
 mkfifo "$A_IN" "$B_IN"
 cleanup() {
+  local status=$?
+  trap - EXIT
   kill "${A_PID:-}" "${B_PID:-}" 2>/dev/null || true
   wait "${A_PID:-}" "${B_PID:-}" 2>/dev/null || true
-  rm -rf "$WORKDIR"
+  if [[ "$status" == 0 && -z "${RETAIN:-}" ]]; then
+    rm -rf "$WORKDIR"
+  else
+    echo "Simulation diagnostics retained: $WORKDIR" >&2
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
