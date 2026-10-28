@@ -348,7 +348,7 @@ impl<W: Wire> Session<W> {
         if std::env::var_os("CCC_AGENT_DEBUG").is_some() && !result.stderr.is_empty() {
             eprintln!(
                 "agent stderr: {}",
-                escape_controls(&String::from_utf8_lossy(&result.stderr))
+                safe_diagnostic(&String::from_utf8_lossy(&result.stderr))
             );
         }
         Ok(Some(result.square))
