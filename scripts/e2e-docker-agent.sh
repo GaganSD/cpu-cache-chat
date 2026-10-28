@@ -43,7 +43,8 @@ net_a="$prefix-net-a"; net_b="$prefix-net-b"
 owned_a=0; owned_b=0; owned_net_a=0; owned_net_b=0
 repo_head=unknown; repo_dirty=unknown
 # Invoked by the EXIT trap.
-# shellcheck disable=SC2329
+# EXIT trap callback; ShellCheck 0.9/0.11 disagree about reachability.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   local result=$? pid
   exec 3>&- 4>&- || true

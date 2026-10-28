@@ -23,7 +23,8 @@ sender_pid=''
 name_a=ccc-probe-a-$$
 name_b=ccc-probe-b-$$
 # Invoked by the EXIT trap.
-# shellcheck disable=SC2329
+# EXIT trap callback; ShellCheck 0.9/0.11 disagree about reachability.
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   [[ -z "$receiver_pid" ]] || kill "$receiver_pid" 2>/dev/null || true
   [[ -z "$sender_pid" ]] || kill "$sender_pid" 2>/dev/null || true
