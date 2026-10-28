@@ -131,3 +131,58 @@ fn abort_freezes_started_receiver() {
     assert!(snapshot.started && snapshot.frozen);
     assert_eq!(snapshot.ply, Some(0));
 }
+
+#[test]
+fn slow_agent_does_not_prevent_link_from_receiving_abort() {
+    use ccc_app::agent::{AgentJob, CommandSpec, Limits};
+    use ccc_protocol::{AppMessage, GameCtrl, Link, LinkEvent};
+    let pair = SimPair::new();
+    let mut cfg = RuntimeConfig::new(Role::A, ChannelMode::Sim, AppKind::Game);
+    cfg.sim_path = Some("/unused".into());
+    cfg.agent = true;
+    let mut session = Session::wrap(cfg.clone(), pair.a, 99);
+    cfg.role = Role::B;
+    let mut peer = Link::new(cfg, pair.b, 0);
+    let peer_thread = thread::spawn(move || {
+        peer.handshake().unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut started = false;
+        while Instant::now() < until {
+            for event in peer.drive(Duration::from_millis(5)).unwrap() {
+                if matches!(event, LinkEvent::Recv(AppMessage::Ctrl(GameCtrl::Start))) {
+                    started = true;
+                }
+            }
+            if started {
+                peer.enqueue(AppMessage::Ctrl(GameCtrl::Abort)).unwrap();
+                break;
+            }
+        }
+        assert!(started);
+        for _ in 0..100 {
+            let _ = peer.drive(Duration::from_millis(5));
+        }
+    });
+    session.connect().unwrap();
+    session.request_start().unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while !session.our_turn() && Instant::now() < until {
+        session.tick(Duration::from_millis(5)).unwrap();
+    }
+    let request = session.agent_request(1).unwrap();
+    let job = AgentJob::spawn(
+        CommandSpec::TrustedShell("sleep 2; printf '{\"source\":\"pi\",\"square\":1}'".into()),
+        request,
+        Limits::default(),
+        None,
+    )
+    .unwrap();
+    while !session.snapshot().frozen && Instant::now() < until {
+        session.tick(Duration::from_millis(5)).unwrap();
+    }
+    assert!(session.snapshot().frozen);
+    assert!(job.try_result().unwrap().is_none());
+    assert!(session.agent_request(1).is_none());
+    drop(job);
+    peer_thread.join().unwrap();
+}
