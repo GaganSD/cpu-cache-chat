@@ -2,6 +2,14 @@
 import { stdin } from "node:process";
 import { makeTools, parseBoard, llamaBaseUrl, OPENCODE_GO_MODELS } from "./game.mjs";
 
+function redact(text) {
+  let safe = String(text);
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value && /KEY|TOKEN|SECRET/i.test(name)) safe = safe.split(value).join("[redacted]");
+  }
+  return safe.replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 // Covers input, SDK startup, inference, and cleanup.
 const deadline = setTimeout(() => {
   console.error("agent: timed out");
@@ -27,7 +35,7 @@ try {
       if (!apiKey) throw new Error("OPENCODE_GO_API_KEY is required for CCC_AGENT_PROVIDER=opencode-go");
       baseUrl = "https://opencode.ai/inference/go/v1";
       providerId = "opencode-go";
-      modelId = process.env.CCC_AGENT_MODEL || "glm-5.3-flash";
+      modelId = process.env.CCC_AGENT_MODEL || "deepseek-v4.1-flash";
       spec = OPENCODE_GO_MODELS[modelId];
       if (!spec) throw new Error(`unsupported opencode-go model ${modelId}; allowed: ${Object.keys(OPENCODE_GO_MODELS).join(", ")}`);
       registration = {
@@ -35,6 +43,19 @@ try {
         models: [{ id: modelId, name: modelId, reasoning: spec.reasoning, input: ["text"],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 8192, maxTokens: 2048, compat: spec.compat }],
+      };
+    } else if (providerName === "vercel-ai-gateway") {
+      const apiKey = process.env.AI_GATEWAY_API_KEY;
+      if (!apiKey) throw new Error("AI_GATEWAY_API_KEY is required for CCC_AGENT_PROVIDER=vercel-ai-gateway");
+      modelId = process.env.CCC_AGENT_MODEL || "reflection/beam-free";
+      if (modelId !== "reflection/beam-free") throw new Error("unsupported vercel-ai-gateway model");
+      baseUrl = "https://ai-gateway.vercel.sh/v1";
+      providerId = "vercel-ai-gateway";
+      registration = {
+        baseUrl, api: "openai-completions", apiKey, authHeader: true,
+        models: [{ id: modelId, name: modelId, reasoning: false, input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 2048,
+          compat: { supportsStore: false, supportsDeveloperRole: false, supportsStrictMode: false, maxTokensField: "max_tokens" } }],
       };
     } else if (providerName === "llama") {
       baseUrl = llamaBaseUrl(process.env.LLAMA_BASE_URL);
@@ -121,9 +142,9 @@ try {
               console.error("agent transcript quota exceeded; evidence incomplete");
               break;
             }
-            console.error(line);
+            console.error(redact(line));
           }
-        } catch (e) { console.error(`agent-debug failed: ${e?.message || e}`); }
+        } catch (e) { console.error(`agent-debug failed: ${redact(e?.message || String(e))}`); }
       }
       session.dispose();
     }
@@ -132,7 +153,7 @@ try {
     console.log(JSON.stringify({ square: game.square, source: "pi" }));
   }
 } catch (err) {
-  console.error(`agent: ${err?.message || err}`);
+  console.error(`agent: ${redact(err?.message || String(err))}`);
   process.exitCode = 1;
 } finally {
   clearTimeout(deadline);

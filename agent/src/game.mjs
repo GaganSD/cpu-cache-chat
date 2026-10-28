@@ -48,11 +48,6 @@ export function makeTools(state, Type, stop) {
 // Fields mirror the pi-ai provider registry so tool calling behaves the same;
 // thinkingLevel is chosen per model because not every model supports "off".
 export const OPENCODE_GO_MODELS = {
-  "glm-5.3-flash": {
-    reasoning: true,
-    thinkingLevel: "off",
-    compat: { supportsStore: false, supportsDeveloperRole: false, supportsStrictMode: true, maxTokensField: "max_tokens" },
-  },
   "deepseek-v4.1-flash": {
     reasoning: true,
     thinkingLevel: "low",
