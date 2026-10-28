@@ -26,8 +26,8 @@ try {
   {
     // Provider selection. Default is a container-local llama.cpp server on
     // loopback. "opencode-go" uses the hosted OpenCode Go inference API with a
-    // key supplied via the environment; the container then needs network
-    // egress to that one origin, but never a route to the peer container.
+    // key supplied via the environment. Hosted bridges allow general egress;
+    // the application fetch wrapper restricts requests, not the network itself.
     const providerName = process.env.CCC_AGENT_PROVIDER || "llama";
     let baseUrl, providerId, modelId, registration, spec;
     if (providerName === "opencode-go") {
@@ -54,7 +54,7 @@ try {
       registration = {
         baseUrl, api: "openai-completions", apiKey, authHeader: true,
         models: [{ id: modelId, name: modelId, reasoning: false, input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 2048,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 16384, maxTokens: 8192,
           compat: { supportsStore: false, supportsDeveloperRole: false, supportsStrictMode: false, maxTokensField: "max_tokens" } }],
       };
     } else if (providerName === "llama") {
@@ -107,7 +107,7 @@ try {
       getPrompts: () => ({ prompts: [], diagnostics: [] }),
       getThemes: () => ({ themes: [], diagnostics: [] }),
       getAgentsFiles: () => ({ agentsFiles: [] }),
-      getSystemPrompt: () => "Play tic-tac-toe. Submit one legal square using submit_move.",
+      getSystemPrompt: () => "Play tic-tac-toe. Squares are ONE-BASED, row-major: top row 1 2 3, middle 4 5 6, bottom 7 8 9. X and O are occupied; each digit labels an empty square. Choose any legal move yourself and promptly call submit_move. Optimal strategy is not required. Do not answer only in prose.",
       getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [],
       getAppendSystemPromptSources: () => [], extendResources: () => {}, reload: async () => {},
     };
@@ -122,7 +122,8 @@ try {
     try {
       const active = session.getActiveToolNames().sort();
       if (active.join(",") !== "get_board,submit_move") throw new Error("unexpected active tools");
-      await session.prompt(`Board: ${state.board}. Turn: ${state.turn}. Legal: ${state.legal.join(",")}. Submit one move.`);
+      const rows = [0, 3, 6].map(i => [...state.board.slice(i, i + 3)].join(" | ")).join("\n");
+      await session.prompt(`Board (squares 1-9, one-based):\n${rows}\nTurn: ${state.turn}. Legal squares: ${state.legal.join(",")}. Submit one legal square.`);
       if (transcriptExceeded) throw new Error("agent transcript quota exceeded; evidence incomplete");
       if (game.square === null) {
         // One bounded corrective reprompt; a second silence is a visible failure.
