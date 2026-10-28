@@ -98,7 +98,7 @@ impl FrameReceiver {
         for samples in &self.samples[..self.block_bytes] {
             let (byte, corrected) = soft_fec_decode(samples, decoder)?;
             if corrected && std::env::var_os("CCC_DEBUG").is_some() {
-                eprintln!("phy FEC corrected a bit");
+                eprintln!("phy FEC selected a different codeword");
             }
             decoded.push(byte);
         }

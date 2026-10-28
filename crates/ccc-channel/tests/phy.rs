@@ -81,7 +81,7 @@ fn interrupt_stops_waits_and_silent_control_cannot_be_usable() {
     )
     .unwrap();
     assert!(!report.usable);
-    assert!(report.notes.contains("unproven"));
+    assert!(report.notes.contains("Silent control"));
 }
 
 #[test]
@@ -91,13 +91,16 @@ fn hunt_resynchronizes_when_the_probe_exceeds_its_quantum() {
     let report = run_silent_control(
         ChannelMode::Cpu,
         Role::B,
-        Duration::from_micros(1),
+        Duration::from_micros(50),
         Arc::new(AtomicBool::new(false)),
         Duration::from_millis(20),
     )
     .unwrap();
-    assert_eq!(report.timeouts, 1);
-    assert!(report.notes.contains("result=Err(Timeout)"));
+    assert_eq!(
+        report.trials[0].outcome,
+        ccc_core::ProbeOutcome::SilentNoFrame
+    );
+    assert_eq!(report.silent_false_ones, None);
 }
 
 #[test]

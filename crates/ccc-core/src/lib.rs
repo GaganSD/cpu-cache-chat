@@ -11,11 +11,14 @@ pub const MAX_PAYLOAD: usize = 256;
 pub const MAX_CHAT_BYTES: usize = 200;
 pub const MAX_RETRIES: u32 = 5;
 pub const PREAMBLE: u32 = 0xAAAA_AAAA;
-pub const DEFAULT_SLOT: Duration = Duration::from_millis(5);
+pub const DEFAULT_SLOT: Duration = Duration::from_millis(50);
+pub const MIN_SLOT: Duration = Duration::from_micros(50);
+pub const MAX_SLOT: Duration = Duration::from_secs(1);
 pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(45);
 pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(90);
 pub const DEFAULT_CALIBRATE: Duration = Duration::from_secs(3);
-pub const DEFAULT_PROBE_TRIALS: u32 = 64;
+pub const DEFAULT_PROBE_TRIALS: u32 = 1;
+pub const MAX_PHY_BYTES: usize = MAX_PAYLOAD + 64;
 pub const DEFAULT_PROBE_BITS: u32 = 64;
 /// Physical slots outside the encoded protocol blob: gap (4), carrier (32),
 /// training gap (8), preamble (32), two FEC length bytes (26), four FEC CRC
@@ -260,6 +263,30 @@ impl RuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        validate_slot(self.slot)?;
+        if self.ack_timeout.is_zero()
+            || self.sync_timeout.is_zero()
+            || self.calibrate.is_zero()
+            || self.ack_timeout > Duration::from_secs(86400)
+            || self.sync_timeout > Duration::from_secs(86400)
+            || self.calibrate > Duration::from_secs(86400)
+        {
+            return Err(Error::InvalidInput(
+                "timeouts and calibration must be between zero and 24 hours".into(),
+            ));
+        }
+        if self
+            .agent_cmd
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 4096 || s.contains('\0'))
+        {
+            return Err(Error::InvalidInput(
+                "agent command must be nonempty, at most 4096 bytes, and contain no NUL".into(),
+            ));
+        }
+        if self.agent_cmd.is_some() && !self.agent {
+            return Err(Error::InvalidInput("--agent-cmd requires --agent".into()));
+        }
         if self.agent && self.kind != AppKind::Game {
             return Err(Error::InvalidInput(
                 "--agent is only valid for game mode".into(),
@@ -274,9 +301,6 @@ impl RuntimeConfig {
             return Err(Error::InvalidInput(
                 "physical channel cannot use --sim-path".into(),
             ));
-        }
-        if self.slot < Duration::from_micros(50) {
-            return Err(Error::InvalidInput("slot is too short".into()));
         }
         Ok(())
     }
@@ -366,15 +390,67 @@ pub struct CalibrationReport {
     pub notes: String,
 }
 
+pub fn validate_slot(slot: Duration) -> Result<(), Error> {
+    if !(MIN_SLOT..=MAX_SLOT).contains(&slot) {
+        return Err(Error::InvalidInput(
+            "slot must be between 50 microseconds and 1 second".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub const PROBE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeOutcome {
+    Decoded,
+    Timeout,
+    Corrupt,
+    Error,
+    SilentNoFrame,
+    SilentFrame,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeTrial {
+    pub outcome: ProbeOutcome,
+    pub decoded_bytes: Option<usize>,
+    pub decoded_hex: Option<String>,
+    /// True only for a decoded frame; CRC failures are reported as false.
+    pub crc_valid: Option<bool>,
+    /// Post-decode comparison, not raw carrier BER.
+    pub payload_bit_errors: Option<u32>,
+    pub elapsed: Duration,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeReport {
+    pub schema_version: u32,
     pub mode: ChannelMode,
     pub role: Role,
-    pub trials: u32,
-    pub bits: u32,
-    pub bit_errors: u32,
-    pub timeouts: u32,
-    pub silent_false_ones: u32,
+    pub requested_trials: u32,
+    pub attempted_trials: u32,
+    pub completed_trials: u32,
+    pub requested_bits: u32,
+    pub elapsed: Duration,
+    pub trials: Vec<ProbeTrial>,
+    /// Raw carrier BER and false-one rate are not measured by frame decoding.
+    pub raw_bit_errors: Option<u64>,
+    pub silent_false_ones: Option<u64>,
     pub usable: bool,
     pub notes: String,
+}
+
+impl ProbeReport {
+    pub fn has_failures(&self) -> bool {
+        self.trials.iter().any(|t| {
+            !matches!(
+                t.outcome,
+                ProbeOutcome::Decoded | ProbeOutcome::SilentNoFrame
+            ) || t.error.is_some()
+                || t.payload_bit_errors.is_some_and(|n| n != 0)
+        })
+    }
 }

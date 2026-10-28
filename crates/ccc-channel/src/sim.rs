@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use ccc_core::{Error, Role};
 use ccc_protocol::Wire;
+
+pub const SIM_QUEUE_CAPACITY: usize = 256;
+const SIM_MAX_BLOB: usize = 2048;
 
 pub struct SimWire {
     tx: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -64,21 +68,30 @@ impl Wire for SimWire {
         if self.stop.load(Ordering::SeqCst) {
             return Err(Error::Interrupted);
         }
-        self.sent += 1;
+        if bytes.len() > SIM_MAX_BLOB {
+            return Err(Error::TooLarge(bytes.len()));
+        }
+        self.sent = self.sent.wrapping_add(1);
         if let Some(n) = self.drop_every {
             if n > 0 && self.sent.is_multiple_of(n) {
                 return Ok(());
             }
         }
-        self.tx
+        let mut queue = self
+            .tx
             .lock()
-            .map_err(|_| Error::Channel("sim lock".into()))?
-            .push_back(bytes.to_vec());
+            .map_err(|_| Error::Channel("sim lock".into()))?;
+        if queue.len() >= SIM_QUEUE_CAPACITY {
+            return Err(Error::Channel("simulation queue full".into()));
+        }
+        queue.push_back(bytes.to_vec());
         Ok(())
     }
 
     fn recv_blob(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidInput("timeout too large".into()))?;
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Err(Error::Interrupted);
@@ -107,33 +120,75 @@ pub struct SimSocket {
     sock: UnixDatagram,
     peer: PathBuf,
     stop: Arc<AtomicBool>,
+    mine: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 
 impl SimSocket {
     pub fn bind(role: Role, base: &str, stop: Arc<AtomicBool>) -> Result<Self, Error> {
         let base = Path::new(base);
-        if let Some(parent) = base.parent() {
-            std::fs::create_dir_all(parent).ok();
+        let parent = base
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidInput("simulation path requires a private parent directory".into())
+            })?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let meta = std::fs::symlink_metadata(parent)?;
+        if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+            return Err(Error::InvalidInput(format!(
+                "simulation directory {} must be private (mode 0700)",
+                parent.display()
+            )));
         }
-        let mine = match role {
-            Role::A => base.with_extension("a.sock"),
-            Role::B => base.with_extension("b.sock"),
+        let suffix = |suffix: &str| {
+            let mut p = base.as_os_str().to_os_string();
+            p.push(suffix);
+            PathBuf::from(p)
         };
-        let peer = match role {
-            Role::A => base.with_extension("b.sock"),
-            Role::B => base.with_extension("a.sock"),
+        let (mine, peer) = match role {
+            Role::A => (suffix(".a.sock"), suffix(".b.sock")),
+            Role::B => (suffix(".b.sock"), suffix(".a.sock")),
         };
-        let _ = std::fs::remove_file(&mine);
-        let sock = UnixDatagram::bind(&mine).map_err(|e| Error::Io(e.to_string()))?;
-        sock.set_nonblocking(true)
-            .map_err(|e| Error::Io(e.to_string()))?;
-        Ok(Self { sock, peer, stop })
+        let sock = UnixDatagram::bind(&mine)
+            .map_err(|e| Error::Io(format!("bind {}: {e}", mine.display())))?;
+        let meta = std::fs::symlink_metadata(&mine)?;
+        let socket = Self {
+            sock,
+            peer,
+            stop,
+            mine,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        std::fs::set_permissions(&socket.mine, std::fs::Permissions::from_mode(0o600))?;
+        socket.sock.set_nonblocking(true)?;
+        Ok(socket)
+    }
+}
+
+impl Drop for SimSocket {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::symlink_metadata(&self.mine) {
+            if meta.dev() == self.dev && meta.ino() == self.ino {
+                let _ = std::fs::remove_file(&self.mine);
+            }
+        }
     }
 }
 
 impl Wire for SimSocket {
     fn send_blob(&mut self, bytes: &[u8], timeout: Duration) -> Result<(), Error> {
-        let deadline = Instant::now() + timeout;
+        if bytes.len() > SIM_MAX_BLOB {
+            return Err(Error::TooLarge(bytes.len()));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidInput("timeout too large".into()))?;
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return Err(Error::Interrupted);
@@ -161,7 +216,9 @@ impl Wire for SimSocket {
     }
 
     fn recv_blob(&mut self, timeout: Duration) -> Result<Vec<u8>, Error> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidInput("timeout too large".into()))?;
         let mut buf = vec![0u8; 2048];
         loop {
             if self.stop.load(Ordering::SeqCst) {

@@ -11,7 +11,10 @@ mod timing;
 pub use cache::CacheChannel;
 pub use cpu::CpuChannel;
 pub use phy::{Phy, PhyKind};
-pub use probe::{run_probe_receiver, run_probe_sender, run_silent_control};
+pub use probe::{
+    probe_payload_len, random_probe_payload, run_probe_receiver, run_probe_sender,
+    run_silent_control,
+};
 pub use sim::{SimPair, SimSocket, SimWire};
 pub use timing::{ticks, Timer};
 
@@ -23,6 +26,7 @@ use ccc_core::{ChannelMode, Error, RuntimeConfig};
 use ccc_protocol::Wire;
 
 pub fn open_wire(cfg: &RuntimeConfig, stop: Arc<AtomicBool>) -> Result<Box<dyn Wire>, Error> {
+    cfg.validate()?;
     match cfg.channel {
         ChannelMode::Sim => {
             let path = cfg
@@ -37,6 +41,7 @@ pub fn open_wire(cfg: &RuntimeConfig, stop: Arc<AtomicBool>) -> Result<Box<dyn W
 }
 
 pub fn open_phy(mode: ChannelMode, slot: Duration, stop: Arc<AtomicBool>) -> Result<Phy, Error> {
+    ccc_core::validate_slot(slot)?;
     match mode {
         ChannelMode::Cache => Ok(Phy::new(PhyKind::Cache, slot, stop)),
         ChannelMode::Cpu => Ok(Phy::new(PhyKind::Cpu, slot, stop)),
