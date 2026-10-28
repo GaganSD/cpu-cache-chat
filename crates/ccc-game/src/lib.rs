@@ -1,5 +1,7 @@
 //! Deterministic tic-tac-toe. No AI.
 
+pub mod evidence;
+
 use ccc_core::{Error, Mark};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
