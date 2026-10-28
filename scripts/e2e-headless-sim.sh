@@ -69,14 +69,31 @@ else
   printf '5\n' >&3
   wait_for "$A_OUT" "seq 1: delivered" 80
   wait_for "$B_OUT" " 4 | X | 6" 80
-  printf '1\n' >&4
+  printf '2\n' >&4
   wait_for "$B_OUT" "seq 1: delivered" 80
-  wait_for "$A_OUT" " O | 2 | 3" 80
-  echo "PASS game simulation both directions"
+  wait_for "$A_OUT" " 1 | O | 3" 80
+  printf '1\n' >&3
+  wait_for "$B_OUT" 'peer move 1 (ply 2)' 80
+  printf '8\n' >&4
+  wait_for "$A_OUT" 'peer move 8 (ply 3)' 80
+  printf '9\n' >&3
+  wait_for "$A_OUT" 'X wins' 80
+  wait_for "$B_OUT" 'X wins' 80
+  for output in "$A_OUT" "$B_OUT"; do
+    wait_for "$output" ' X | O | 3' 80
+    wait_for "$output" ' 7 | O | X' 80
+  done
+  echo "PASS complete game simulation on both boards"
 fi
 
 printf '/q\n' >&3
 printf '/q\n' >&4
 exec 3>&-
 exec 4>&-
-wait "$A_PID" "$B_PID" || true
+status=0
+wait "$A_PID" || status=1
+wait "$B_PID" || status=1
+if [[ "$status" != 0 ]]; then
+  echo 'FAIL: a simulation process exited unsuccessfully' >&2
+  exit 1
+fi
