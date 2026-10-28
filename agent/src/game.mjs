@@ -64,7 +64,8 @@ export const OPENCODE_GO_MODELS = {
 export function llamaBaseUrl(raw = "http://127.0.0.1:8080") {
   let url;
   try { url = new URL(raw); } catch { throw new Error("invalid LLAMA_BASE_URL"); }
-  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password ||
+  if (!/^http:\/\/127\.0\.0\.1(?::[0-9]+)?(?:\/|$)/.test(raw) ||
+      url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password ||
       url.search || url.hash || !["/", "/v1", "/v1/"].includes(url.pathname)) {
     throw new Error("LLAMA_BASE_URL must be http://127.0.0.1[:port], optionally ending in /v1");
   }

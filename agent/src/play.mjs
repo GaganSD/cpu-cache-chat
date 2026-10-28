@@ -2,6 +2,12 @@
 import { stdin } from "node:process";
 import { makeTools, parseBoard, llamaBaseUrl, OPENCODE_GO_MODELS } from "./game.mjs";
 
+// Covers input, SDK startup, inference, and cleanup.
+const deadline = setTimeout(() => {
+  console.error("agent: timed out");
+  process.exit(124);
+}, 90_000);
+deadline.unref();
 try {
   let raw = "";
   for await (const chunk of stdin) {
@@ -10,12 +16,6 @@ try {
   }
   const state = parseBoard(raw);
   {
-    // A hard deadline covers SDK startup, inference, and abort cleanup.
-    const deadline = setTimeout(() => {
-      console.error("agent: timed out");
-      process.exit(124);
-    }, 90_000);
-    deadline.unref();
     // Provider selection. Default is a container-local llama.cpp server on
     // loopback. "opencode-go" uses the hosted OpenCode Go inference API with a
     // key supplied via the environment; the container then needs network
@@ -53,10 +53,24 @@ try {
     // Keep all SDK fetches on this exact provider origin, including redirects.
     const allowedOrigin = new URL(baseUrl).origin;
     const realFetch = globalThis.fetch;
-    globalThis.fetch = (input, init = {}) => {
+    let transcriptBytes = 0;
+    let transcriptExceeded = false;
+    const transcriptLimit = 1024 * 1024;
+    globalThis.fetch = async (input, init = {}) => {
       const target = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
       if (target.origin !== allowedOrigin) throw new Error("refusing off-provider model request");
-      return realFetch(input, { ...init, redirect: "error" });
+      const response = await realFetch(input, { ...init, redirect: "error" });
+      if (!response.body) return response;
+      const body = response.body.pipeThrough(new TransformStream({
+        transform(chunk, controller) {
+          transcriptBytes += chunk.byteLength;
+          if (transcriptBytes > transcriptLimit) {
+            transcriptExceeded = true;
+            controller.error(new Error("agent transcript quota exceeded; evidence incomplete"));
+          } else controller.enqueue(chunk);
+        },
+      }));
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
     };
     const { createAgentSession, createExtensionRuntime, ModelRuntime, SessionManager, SettingsManager } =
       await import("@earendil-works/pi-coding-agent");
@@ -88,28 +102,38 @@ try {
       const active = session.getActiveToolNames().sort();
       if (active.join(",") !== "get_board,submit_move") throw new Error("unexpected active tools");
       await session.prompt(`Board: ${state.board}. Turn: ${state.turn}. Legal: ${state.legal.join(",")}. Submit one move.`);
+      if (transcriptExceeded) throw new Error("agent transcript quota exceeded; evidence incomplete");
       if (game.square === null) {
         // One bounded corrective reprompt; a second silence is a visible failure.
         await session.prompt("No move was submitted. Call submit_move exactly once with one of the legal squares.");
       }
+      if (transcriptExceeded) throw new Error("agent transcript quota exceeded; evidence incomplete");
     } finally {
       if (process.env.CCC_AGENT_DEBUG) {
         try {
-          // One line per message, no truncation: evidence runs need the
-          // full thinking and the tool call of every session.
           const messages = session.messages ?? [];
+          let bytes = 0;
           for (let i = 0; i < messages.length; i++) {
-            console.error(`agent-debug message ${i}: ${JSON.stringify(messages[i])}`);
+            const line = `agent-debug message ${i}: ${JSON.stringify(messages[i])}`;
+            bytes += Buffer.byteLength(line) + 1;
+            if (bytes > transcriptLimit) {
+              transcriptExceeded = true;
+              console.error("agent transcript quota exceeded; evidence incomplete");
+              break;
+            }
+            console.error(line);
           }
         } catch (e) { console.error(`agent-debug failed: ${e?.message || e}`); }
       }
       session.dispose();
-      clearTimeout(deadline);
     }
+    if (transcriptExceeded) throw new Error("agent transcript quota exceeded; evidence incomplete");
     if (game.square === null) throw new Error("model did not submit a valid move");
     console.log(JSON.stringify({ square: game.square, source: "pi" }));
   }
 } catch (err) {
   console.error(`agent: ${err?.message || err}`);
   process.exitCode = 1;
+} finally {
+  clearTimeout(deadline);
 }

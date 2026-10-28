@@ -15,4 +15,6 @@ Provision Node.js 22.19 or later and install the dependencies with `npm install`
 
 In both cases the Pi SDK credential store needs a writable `HOME` (the agent image sets `HOME=/tmp`).
 
-`npm test --prefix agent` covers parsing, illegal moves, and a separate test-only fixture. `play.mjs` has no scripted fallback. With dependencies installed the suite also exercises the Pi SDK against a mock loopback server. No real model is needed.
+Provider response data and debug transcripts each have a 1 MiB quota; exceeding either fails the request and marks evidence incomplete. The fetch restriction is an application guard, not a network firewall. The hosted provider receives board prompts.
+
+Run `npm ci --prefix agent` and `npm test --prefix agent`; the Pi mock-server tests fail if dependencies are missing and explicitly select the local provider. `play.mjs` has no scripted fallback. No real model is needed.

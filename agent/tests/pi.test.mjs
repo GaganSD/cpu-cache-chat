@@ -4,10 +4,10 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-let hasPi = true;
-try { import.meta.resolve("@earendil-works/pi-coding-agent"); import.meta.resolve("typebox"); } catch { hasPi = false; }
+import.meta.resolve("@earendil-works/pi-coding-agent");
+import.meta.resolve("typebox");
 
-test("Pi sends only game tools and handles illegal then legal tool calls", { skip: !hasPi, timeout: 20000 }, async () => {
+test("Pi sends only game tools and handles illegal then legal tool calls", { timeout: 20000 }, async () => {
   const requests = [];
   const server = createServer(async (req, res) => {
     let body = "";
@@ -26,7 +26,7 @@ test("Pi sends only game tools and handles illegal then legal tool calls", { ski
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const child = spawn(process.execPath, [fileURLToPath(new URL("../src/play.mjs", import.meta.url))], {
-      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
+      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", CCC_AGENT_PROVIDER: "llama", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
@@ -43,7 +43,7 @@ test("Pi sends only game tools and handles illegal then legal tool calls", { ski
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test("Pi exits nonzero when the model answers without submitting", { skip: !hasPi, timeout: 20000 }, async () => {
+test("Pi exits nonzero when the model answers without submitting", { timeout: 20000 }, async () => {
   const server = createServer(async (req, res) => {
     for await (const _ of req) { /* drain request */ }
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -56,7 +56,7 @@ test("Pi exits nonzero when the model answers without submitting", { skip: !hasP
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const child = spawn(process.execPath, [fileURLToPath(new URL("../src/play.mjs", import.meta.url))], {
-      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
+      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", CCC_AGENT_PROVIDER: "llama", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
