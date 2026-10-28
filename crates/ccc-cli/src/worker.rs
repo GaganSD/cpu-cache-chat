@@ -285,7 +285,7 @@ pub fn start(
         let _ = output.send(Update::Snapshot(initial));
         let mut final_emitted = false;
         let mut successful = true;
-        let mut job: Option<ccc_app::agent::AgentJob> = None;
+        let mut job: Option<(ccc_app::agent::AgentJob, ccc_app::agent::AgentRequest)> = None;
         let mut request_id = 0u64;
         while !stop.load(Ordering::SeqCst) {
             for _ in 0..64 {
@@ -313,10 +313,22 @@ pub fn start(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            if let Some(active) = &job {
+            if let Some((active, _)) = &job {
                 match active.try_result() {
                     Ok(Some(result)) => {
-                        job = None;
+                        let (_, request) = job.take().expect("job is active");
+                        // A result is fresh only while the session still waits
+                        // on the exact request the job was spawned for. Failures
+                        // are checked too: a stale job must never end a valid
+                        // game, and a stale success must never commit.
+                        let fresh =
+                            session
+                                .agent_request(request.request_id)
+                                .is_some_and(|current| {
+                                    current.session == request.session
+                                        && current.generation == request.generation
+                                        && current.request_id == request.request_id
+                                });
                         match result {
                             Ok(result) => {
                                 if std::env::var_os("CCC_AGENT_DEBUG").is_some()
@@ -329,23 +341,18 @@ pub fn start(
                                         "agent transcript: {transcript}"
                                     )));
                                 }
-                                if let Some(current) = session.agent_request(request_id) {
-                                    if current.session == result.session
-                                        && current.generation == result.generation
-                                        && current.request_id == result.request_id
-                                    {
-                                        if let Err(e) = emit(
-                                            serde_json::json!({"type":"agent_choice","ply":current.generation,"square":result.square}),
-                                        ) {
-                                            let _ = output.send(Update::Fatal(e));
-                                            successful = false;
-                                            break;
-                                        }
-                                        if let Err(e) = session.queue_move(result.square) {
-                                            let _ = output.send(Update::Fatal(e));
-                                            successful = false;
-                                            break;
-                                        }
+                                if fresh {
+                                    if let Err(e) = emit(
+                                        serde_json::json!({"type":"agent_choice","ply":request.generation,"square":result.square}),
+                                    ) {
+                                        let _ = output.send(Update::Fatal(e));
+                                        successful = false;
+                                        break;
+                                    }
+                                    if let Err(e) = session.queue_move(result.square) {
+                                        let _ = output.send(Update::Fatal(e));
+                                        successful = false;
+                                        break;
                                     }
                                 }
                             }
@@ -353,6 +360,11 @@ pub fn start(
                                 if stop.load(Ordering::SeqCst) && output.successful() =>
                             {
                                 break
+                            }
+                            Err(e) if !fresh => {
+                                let _ = output.send(Update::Note(format!(
+                                    "ignored stale agent failure: {e}"
+                                )));
                             }
                             Err(e) => {
                                 let _ = output.send(Update::Fatal(e));
@@ -378,14 +390,14 @@ pub fn start(
                         .and_then(|command| {
                             ccc_app::agent::AgentJob::spawn(
                                 command,
-                                request,
+                                request.clone(),
                                 ccc_app::agent::Limits::default(),
                                 Some(stop.clone()),
                             )
                         });
                     match created {
                         Ok(active) => {
-                            job = Some(active);
+                            job = Some((active, request));
                             let _ = output.send(Update::Note("agent choosing a move".into()));
                         }
                         Err(e) => {

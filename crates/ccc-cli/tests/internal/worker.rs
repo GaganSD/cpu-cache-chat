@@ -161,3 +161,191 @@ fn wrapper_forwards_partial_receive_and_does_not_label_control_frames() {
     wire.send_blob(&heartbeat, Duration::from_secs(1)).unwrap();
     assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
 }
+
+// --- Complete worker path over a sim socket pair ---------------------------
+
+use std::os::unix::fs::DirBuilderExt;
+use std::time::Instant;
+
+use ccc_channel::SimSocket;
+use ccc_core::{AppKind, ChannelMode, Role, RuntimeConfig};
+use ccc_protocol::{AppMessage, GameCtrl, Link, LinkEvent};
+
+use super::{start, Command, Updates};
+
+struct SimDir(std::path::PathBuf);
+
+impl SimDir {
+    fn new(tag: &str) -> Self {
+        // Keep the path short: unix socket names are bounded by SUN_LEN.
+        let dir = std::env::temp_dir().join(format!("ccc-w{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn base(&self) -> String {
+        self.0.join("link").to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for SimDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Accept-all raw link peer; optionally aborts once the game start arrives.
+fn raw_peer(
+    base: String,
+    stop: Arc<AtomicBool>,
+    abort_on_start: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let cfg = RuntimeConfig::new(Role::B, ChannelMode::Sim, AppKind::Game);
+        let Ok(wire) = SimSocket::bind(Role::B, &base, stop.clone()) else {
+            return;
+        };
+        let mut link = Link::new(cfg, wire, 0);
+        if link.handshake().is_err() {
+            return;
+        }
+        let mut aborted = false;
+        while !stop.load(Ordering::SeqCst) {
+            let Ok(events) = link.drive(Duration::from_millis(5)) else {
+                return;
+            };
+            for event in events {
+                if abort_on_start
+                    && !aborted
+                    && matches!(event, LinkEvent::Recv(AppMessage::Ctrl(GameCtrl::Start)))
+                    && link.enqueue(AppMessage::Ctrl(GameCtrl::Abort)).is_ok()
+                {
+                    aborted = true;
+                }
+            }
+        }
+    })
+}
+
+fn agent_game_cfg(base: &str, agent_cmd: &str) -> RuntimeConfig {
+    let mut cfg = RuntimeConfig::new(Role::A, ChannelMode::Sim, AppKind::Game);
+    cfg.sim_path = Some(base.into());
+    cfg.agent = true;
+    cfg.agent_cmd = Some(agent_cmd.into());
+    cfg
+}
+
+#[derive(Default)]
+struct Collected {
+    notes: Vec<String>,
+    fatals: Vec<String>,
+    snapshots: Vec<ccc_app::Snapshot>,
+    accepted: Vec<u64>,
+}
+
+fn pump(updates: &Updates, out: &mut Collected) {
+    loop {
+        match updates.try_recv() {
+            Ok(Update::Note(note)) => out.notes.push(note),
+            Ok(Update::Fatal(e)) => out.fatals.push(e.to_string()),
+            Ok(Update::Snapshot(s)) => out.snapshots.push(s),
+            Ok(Update::Accepted(id)) => out.accepted.push(id),
+            Ok(Update::Rejected(id, why)) => out.notes.push(format!("rejected {id}: {why}")),
+            Ok(Update::Delivery(..)) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn wait_for(
+    updates: &Updates,
+    out: &mut Collected,
+    what: &str,
+    mut cond: impl FnMut(&Collected) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cond(out) {
+        pump(updates, out);
+        assert!(
+            out.fatals.is_empty(),
+            "fatal during {what}: {:?}",
+            out.fatals
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; notes: {:?}",
+            out.notes
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn stale_agent_failure_after_manual_move_does_not_end_session() {
+    let dir = SimDir::new("stale-failure");
+    let stop = Arc::new(AtomicBool::new(false));
+    let peer = raw_peer(dir.base(), stop.clone(), false);
+    let (commands, updates, worker) = start(
+        agent_game_cfg(&dir.base(), "sh -c 'sleep 1; exit 3'"),
+        stop.clone(),
+        None,
+    );
+    let mut out = Collected::default();
+    wait_for(&updates, &mut out, "agent spawn", |o| {
+        o.notes.iter().any(|n| n.contains("agent choosing a move"))
+    });
+    // The user makes a legal move manually while inference is still running.
+    commands
+        .send(Command {
+            id: 7,
+            line: "1".into(),
+        })
+        .unwrap();
+    wait_for(&updates, &mut out, "manual move commit", |o| {
+        o.snapshots.iter().any(|s| s.ply == Some(1))
+    });
+    // The obsolete job failure must be ignored with a visible note, not fatal.
+    wait_for(&updates, &mut out, "stale failure note", |o| {
+        o.notes.iter().any(|n| n.contains("stale agent failure"))
+    });
+    assert!(out.accepted.contains(&7));
+    assert!(out.fatals.is_empty());
+    // The session is still alive and the worker quits cleanly.
+    stop.store(true, Ordering::SeqCst);
+    assert!(worker.join().unwrap().is_ok());
+    peer.join().unwrap();
+}
+
+#[test]
+fn stale_agent_success_after_abort_never_commits() {
+    let dir = SimDir::new("stale-success");
+    let stop = Arc::new(AtomicBool::new(false));
+    let peer = raw_peer(dir.base(), stop.clone(), true);
+    let (_commands, updates, worker) = start(
+        agent_game_cfg(
+            &dir.base(),
+            "sh -c 'sleep 1; printf \"{\\\"source\\\":\\\"pi\\\",\\\"square\\\":5}\"'",
+        ),
+        stop.clone(),
+        None,
+    );
+    let mut out = Collected::default();
+    wait_for(&updates, &mut out, "agent spawn", |o| {
+        o.notes.iter().any(|n| n.contains("agent choosing a move"))
+    });
+    // The peer aborts during inference; the late success must not commit.
+    wait_for(&updates, &mut out, "peer abort", |o| {
+        o.snapshots.iter().any(|s| s.frozen)
+    });
+    // Give the slow fixture time to finish and be discarded as stale.
+    std::thread::sleep(Duration::from_millis(1500));
+    pump(&updates, &mut out);
+    assert!(out.fatals.is_empty(), "fatals: {:?}", out.fatals);
+    let last = out.snapshots.last().expect("snapshots observed");
+    assert!(last.frozen);
+    assert_eq!(last.ply, Some(0));
+    stop.store(true, Ordering::SeqCst);
+    assert!(worker.join().unwrap().is_ok());
+    peer.join().unwrap();
+}
