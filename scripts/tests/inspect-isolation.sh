@@ -13,7 +13,7 @@ remove_pair() {
 }
 cleanup() { remove_pair >/dev/null 2>&1 || true; rm -rf "$tmp"; }
 trap cleanup EXIT
-common=(--label "org.cpu-cache-chat.policy-test=$prefix" --ipc private --read-only --user 65532:65532 --cap-drop ALL
+common=(--label "org.cpu-cache-chat.policy-test=$prefix" --ipc private --cgroupns private --read-only --user 65532:65532 --cap-drop ALL
   --security-opt no-new-privileges --memory 128m --pids-limit 64 --cpuset-cpus "${CPUSET:-0}" --entrypoint /bin/true)
 make_pair() {
   remove_pair

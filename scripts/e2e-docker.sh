@@ -73,7 +73,7 @@ for name in "$a" "$b"; do
 done
 docker info >/dev/null
 docker image inspect "$IMAGE" >/dev/null
-common=(--init --network none --ipc private --read-only
+common=(--init --network none --ipc private --cgroupns private --read-only
   --tmpfs '/tmp:rw,nosuid,size=64m' --security-opt no-new-privileges
   --cap-drop ALL --user 65532:65532 --memory 256m --pids-limit 128 --cpuset-cpus "$CPUSET")
 if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi

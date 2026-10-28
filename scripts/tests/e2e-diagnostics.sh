@@ -8,7 +8,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/state" "$tmp/evidence" "$tmp/transient"
 python3 - "$tmp/inspect.json" <<'PY'
 import json, sys
-h = dict(Privileged=False, PidMode='', IpcMode='private', UTSMode='', UsernsMode='', ReadonlyRootfs=True, CapDrop=['ALL'], CapAdd=None, SecurityOpt=['no-new-privileges:true'], Devices=[], DeviceRequests=None, DeviceCgroupRules=None, PortBindings={}, PublishAllPorts=False, Binds=None, VolumesFrom=None, Memory=268435456, PidsLimit=128, CpusetCpus='0', NetworkMode='none')
+h = dict(Privileged=False, PidMode='', IpcMode='private', UTSMode='', UsernsMode='', CgroupnsMode='private', ReadonlyRootfs=True, CapDrop=['ALL'], CapAdd=None, SecurityOpt=['no-new-privileges:true'], Devices=[], DeviceRequests=None, DeviceCgroupRules=None, PortBindings={}, PublishAllPorts=False, Binds=None, VolumesFrom=None, Memory=268435456, PidsLimit=128, CpusetCpus='0', NetworkMode='none')
 c = dict(Name='/mock', HostConfig=h, Config=dict(User='65532:65532', ExposedPorts=None), NetworkSettings=dict(Networks={'none': {}}), Mounts=[])
 with open(sys.argv[1], 'w') as f: json.dump([c], f)
 PY

@@ -32,6 +32,7 @@ try:
         require(h['IpcMode'] == 'private', 'IPC namespace not private')
         require(h['UTSMode'] in ('', 'private'), 'UTS namespace not private')
         require(h['UsernsMode'] != 'host', 'host user namespace')
+        require(h['CgroupnsMode'] == 'private', 'cgroup namespace not explicitly private')
         require(h['ReadonlyRootfs'] is True, 'root filesystem writable')
         require(config['User'] == '65532:65532', 'unexpected user')
         require('ALL' in (h['CapDrop'] or []), 'capabilities not dropped')

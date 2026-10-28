@@ -13,7 +13,7 @@ case "$CHANNEL" in
 esac
 [[ "$TRIALS" == 1 ]] || { echo 'TRIALS must be 1 (one-shot probe)' >&2; exit 2; }
 docker info >/dev/null
-common=(--rm --init --network none --ipc private --read-only --tmpfs '/tmp:rw,nosuid,size=64m'
+common=(--rm --init --network none --ipc private --cgroupns private --read-only --tmpfs '/tmp:rw,nosuid,size=64m'
   --security-opt no-new-privileges --cap-drop ALL --user 65532:65532 --memory 512m)
 if [[ -n "${CPUSET:-}" ]]; then common+=(--cpuset-cpus "$CPUSET"); fi
 if [[ -n "${CCC_DEBUG:-}" ]]; then common+=(-e "CCC_DEBUG=$CCC_DEBUG"); fi

@@ -9,7 +9,7 @@ IMAGE="${IMAGE:-cpu-cache-chat:local}"
 [[ "$CHANNEL" == cache || "$CHANNEL" == cpu ]] || { echo 'CHANNEL must be cache or cpu' >&2; exit 1; }
 [[ "$MODE" == chat || "$MODE" == game ]] || { echo 'MODE must be chat or game' >&2; exit 1; }
 docker info >/dev/null
-common=(--init --network none --ipc private --read-only --tmpfs '/tmp:rw,nosuid,size=64m'
+common=(--init --network none --ipc private --cgroupns private --read-only --tmpfs '/tmp:rw,nosuid,size=64m'
   --security-opt no-new-privileges --cap-drop ALL --user 65532:65532 --memory 512m --pids-limit 128)
 if [[ -n "${CPUSET:-}" ]]; then common+=(--cpuset-cpus "$CPUSET"); fi
 # Refuse existing names instead of removing unrelated or active containers.

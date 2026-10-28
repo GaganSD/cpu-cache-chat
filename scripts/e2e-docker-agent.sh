@@ -98,7 +98,7 @@ repo_dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo y
 # no layer-2 or routed path between the two containers.
 docker network create "$net_a" >/dev/null; owned_net_a=1
 docker network create "$net_b" >/dev/null; owned_net_b=1
-common=(--init --ipc private --read-only
+common=(--init --ipc private --cgroupns private --read-only
   --tmpfs '/tmp:rw,nosuid,size=64m' --security-opt no-new-privileges
   --cap-drop ALL --user 65532:65532 --memory 768m --pids-limit 128 --cpuset-cpus "$CPUSET"
   --env CCC_AGENT_PROVIDER --env OPENCODE_GO_API_KEY)
