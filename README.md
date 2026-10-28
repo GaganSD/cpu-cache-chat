@@ -14,7 +14,7 @@ Two terminal clients are intended to exchange chat or tic-tac-toe moves through 
 
 Cache timing is the primary channel. CPU contention is the explicit alternative. There is no silent fallback and no DRAM-bandwidth mode.
 
-> **Hardware link: partially verified.** Headless simulation chat and game pass. Docker isolation (`--network none`) holds. Over the CPU-contention channel at 50 ms slots, two isolated containers completed a bidirectional acknowledged chat and a full tic-tac-toe game (`X wins` on both boards) — single runs, not reliability statistics. Cache mode has decoded a receiver-blind frame with a passing CRC and delivered one chat direction, but is not bidirectionally verified. The Pi agent path is untested. See [docs/measurements.md](docs/measurements.md).
+> **Hardware link: works, stochastically.** Over the CPU-contention channel at 50 ms slots, two isolated containers completed a bidirectional acknowledged chat, a full manual tic-tac-toe game (harness PASS), and a complete Pi-agent-versus-agent match (`X wins` on both boards, moves chosen via the hosted OpenCode Go API with per-peer inference-only networks). Cache mode decoded a receiver-blind frame with a passing CRC and delivered one chat direction, but is not bidirectionally verified. All physical results are single runs on a noisy shared host, not reliability statistics. See [docs/measurements.md](docs/measurements.md).
 
 ## What works now
 
@@ -35,7 +35,7 @@ cpu-cache-chat inspect-isolation
 
 Two-process software pair: `scripts/host-sim-pair.sh`.
 
-Headless sim: `MODE=chat ./scripts/e2e-headless-sim.sh`. Two-container launch: `scripts/run-pair.sh` or `scripts/e2e-docker.sh`; physical game: `scripts/e2e-docker-game.sh`. Isolation uses `--network none` and does not relay messages. Computer-use retest: [docs/codex-computer-use-test.md](docs/codex-computer-use-test.md).
+Headless sim: `MODE=chat ./scripts/e2e-headless-sim.sh`. Two-container launch: `scripts/run-pair.sh` or `scripts/e2e-docker.sh`; physical game: `scripts/e2e-docker-game.sh`; agent-versus-agent over the physical channel: `scripts/e2e-docker-agent.sh` (needs `OPENCODE_GO_API_KEY`; agents may also use a container-local llama.cpp instead). Agent sim game: `scripts/e2e-agent-sim.sh`. Isolation uses `--network none` for manual play and per-peer bridge networks for hosted inference; neither relays messages. Computer-use retest: [docs/codex-computer-use-test.md](docs/codex-computer-use-test.md).
 
 ## Isolation
 
@@ -43,7 +43,7 @@ Containers, not microVMs. Shared-kernel Docker on OrbStack (macOS) or Docker Eng
 
 ## Models
 
-Each container is supposed to run its own Pi + llama.cpp instance. The first candidate is quantized Qwen3-0.6B. That path is sketched in `agent/` and has not been evaluated for tool reliability or 8 GB two-instance memory.
+Two agent configurations exist. The verified one uses the hosted OpenCode Go inference API (`CCC_AGENT_PROVIDER=opencode-go`, key via `OPENCODE_GO_API_KEY`, model allowlist in `agent/src/game.mjs`) with per-peer bridge networks for inference egress only. The offline plan remains a container-local llama.cpp per player (first candidate: quantized Qwen3-0.6B), which is implemented in `agent/` but has not been evaluated for tool reliability or 8 GB two-instance memory.
 
 ## Honesty rules
 
