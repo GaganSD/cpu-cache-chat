@@ -5,7 +5,40 @@ use std::time::Duration;
 use ccc_core::{Delivery, Error};
 use ccc_protocol::{encode_frame, Frame, FrameType, Wire};
 
-use super::{ObservedWire, Update};
+use super::{update_channel, ObservedWire, Update};
+
+#[test]
+fn slow_ui_snapshots_coalesce_and_overflow_is_fatal() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (output, updates) = update_channel(stop.clone());
+    let cfg = ccc_core::RuntimeConfig::new(
+        ccc_core::Role::A,
+        ccc_core::ChannelMode::Sim,
+        ccc_core::AppKind::Chat,
+    );
+    let session = ccc_app::Session::wrap(
+        cfg,
+        TestWire {
+            fail_send: Arc::new(AtomicBool::new(false)),
+            receiving: Arc::new(AtomicBool::new(false)),
+        },
+        1,
+    );
+    for _ in 0..1000 {
+        output.send(Update::Snapshot(session.snapshot())).unwrap();
+    }
+    assert!(matches!(updates.try_recv(), Ok(Update::Snapshot(_))));
+    assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    for id in 0..128 {
+        output.send(Update::Accepted(id)).unwrap();
+    }
+    assert!(output.send(Update::Rejected(999, "no".into())).is_err());
+    assert!(stop.load(Ordering::SeqCst));
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(Update::Fatal(Error::Channel(_)))
+    ));
+}
 
 struct TestWire {
     fail_send: Arc<AtomicBool>,
@@ -36,7 +69,7 @@ impl Wire for TestWire {
 fn failed_data_attempt_is_not_reported_as_a_final_delivery_state() {
     let fail_send = Arc::new(AtomicBool::new(true));
     let receiving = Arc::new(AtomicBool::new(false));
-    let (output, updates) = mpsc::channel();
+    let (output, updates) = update_channel(Arc::new(AtomicBool::new(false)));
     let mut wire = ObservedWire {
         inner: Box::new(TestWire {
             fail_send: fail_send.clone(),
@@ -67,7 +100,7 @@ fn failed_data_attempt_is_not_reported_as_a_final_delivery_state() {
 #[test]
 fn wrapper_forwards_partial_receive_and_does_not_label_control_frames() {
     let receiving = Arc::new(AtomicBool::new(false));
-    let (output, updates) = mpsc::channel();
+    let (output, updates) = update_channel(Arc::new(AtomicBool::new(false)));
     let mut wire = ObservedWire {
         inner: Box::new(TestWire {
             fail_send: Arc::new(AtomicBool::new(false)),

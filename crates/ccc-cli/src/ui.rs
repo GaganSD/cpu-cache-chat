@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-use crate::worker::Update;
+use crate::worker::{Command, Update, Updates};
 use ccc_app::{escape_controls, Snapshot};
 use ccc_core::{AppKind, Error, RuntimeConfig};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -15,6 +15,18 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+
+#[cfg(test)]
+#[path = "../tests/internal/ui.rs"]
+mod tests;
+
+fn take_pending(pending: &mut VecDeque<(u64, String)>, id: u64) -> Option<String> {
+    pending
+        .iter()
+        .position(|(key, _)| *key == id)
+        .and_then(|pos| pending.remove(pos))
+        .map(|(_, line)| line)
+}
 
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -31,8 +43,8 @@ impl Drop for TerminalGuard {
 pub fn run(
     cfg: RuntimeConfig,
     stop: Arc<AtomicBool>,
-    commands: mpsc::SyncSender<String>,
-    updates: mpsc::Receiver<Update>,
+    commands: mpsc::SyncSender<Command>,
+    updates: Updates,
 ) -> Result<(), Error> {
     enable_raw_mode().map_err(|e| Error::Io(e.to_string()))?;
     let _guard = TerminalGuard;
@@ -41,7 +53,8 @@ pub fn run(
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout)).map_err(|e| Error::Io(e.to_string()))?;
     let mut input = String::new();
-    let mut pending: VecDeque<String> = VecDeque::new();
+    let mut pending: VecDeque<(u64, String)> = VecDeque::new();
+    let mut next_id = 0u64;
     let mut snapshot: Option<Snapshot> = None;
     let mut log = Vec::new();
     let mut failed = false;
@@ -75,13 +88,23 @@ pub fn run(
                     log.push(format!("seq {seq}: {state}"));
                 }
                 Update::Fatal(e) => return Err(e),
-                Update::Accepted => {
-                    pending.pop_front();
+                Update::Accepted(id) => {
+                    take_pending(&mut pending, id);
+                }
+                Update::Rejected(id, reason) => {
+                    if let Some(line) = take_pending(&mut pending, id) {
+                        if input.is_empty() {
+                            input = line;
+                        } else {
+                            log.push(format!("rejected input: {}", escape_controls(&line)));
+                        }
+                    }
+                    log.push(format!("rejected: {}", escape_controls(&reason)));
                 }
             }
         }
-        if log.len() > 100 {
-            log.drain(..log.len() - 100);
+        while log.len() > 100 || log.iter().map(String::len).sum::<usize>() > 16_384 {
+            log.remove(0);
         }
         terminal
             .draw(|f| {
@@ -108,7 +131,7 @@ pub fn run(
                             .join("\n"),
                     })
                     .unwrap_or_default();
-                for line in &pending {
+                for (_, line) in &pending {
                     body.push_str(&format!(
                         "\n{} [queued] {}",
                         cfg.role,
@@ -199,20 +222,37 @@ pub fn run(
                             break
                         }
                         KeyCode::Enter if !input.trim().is_empty() => {
-                            let line = std::mem::take(&mut input);
-                            if commands.try_send(line.clone()).is_ok() {
-                                pending.push_back(line);
+                            if pending.len() >= 32 {
+                                log.push("command queue full; retry later".into());
                             } else {
-                                log.push("session unavailable".into());
+                                let id = next_id;
+                                let line = input.clone();
+                                match commands.try_send(Command {
+                                    id,
+                                    line: line.clone(),
+                                }) {
+                                    Ok(()) => {
+                                        next_id = next_id.wrapping_add(1);
+                                        pending.push_back((id, line));
+                                        input.clear();
+                                    }
+                                    Err(mpsc::TrySendError::Full(_)) => {
+                                        log.push("command queue full; retry later".into())
+                                    }
+                                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                                        return Err(Error::Disconnected)
+                                    }
+                                }
                             }
                         }
                         KeyCode::Backspace => {
                             input.pop();
                         }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if input.len() + c.len_utf8() <= ccc_core::MAX_CHAT_BYTES {
-                                input.push(c);
-                            }
+                        KeyCode::Char(c)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && input.len() + c.len_utf8() <= ccc_core::MAX_CHAT_BYTES =>
+                        {
+                            input.push(c);
                         }
                         _ => {}
                     }

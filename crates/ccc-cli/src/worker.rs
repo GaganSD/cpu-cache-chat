@@ -1,22 +1,120 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use ccc_app::{Session, Snapshot};
 use ccc_core::{AppKind, Delivery, Error, RuntimeConfig};
 use ccc_protocol::{decode_frame, FrameType, Wire};
 
+pub struct Command {
+    pub id: u64,
+    pub line: String,
+}
+
 pub enum Update {
     Snapshot(Snapshot),
     Note(String),
-    Accepted,
+    Accepted(u64),
+    Rejected(u64, String),
     Delivery(u16, Delivery),
     Fatal(Error),
 }
 
+#[derive(Clone)]
+struct Output {
+    events: mpsc::SyncSender<Update>,
+    snapshot: Arc<Mutex<Option<Snapshot>>>,
+    fatal: mpsc::SyncSender<Error>,
+    stop: Arc<AtomicBool>,
+}
+
+pub struct Updates {
+    events: mpsc::Receiver<Update>,
+    snapshot: Arc<Mutex<Option<Snapshot>>>,
+    fatal: mpsc::Receiver<Error>,
+}
+
+impl Output {
+    fn send(&self, update: Update) -> Result<(), ()> {
+        fn bound(mut text: String) -> String {
+            if text.len() > 4096 {
+                let mut end = 4096;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+            text
+        }
+        let update = match update {
+            Update::Note(text) => Update::Note(bound(text)),
+            Update::Rejected(id, text) => Update::Rejected(id, bound(text)),
+            other => other,
+        };
+        match update {
+            Update::Snapshot(snapshot) => {
+                if let Ok(mut slot) = self.snapshot.try_lock() {
+                    *slot = Some(snapshot);
+                }
+            }
+            Update::Fatal(error) => {
+                let _ = self.fatal.try_send(error);
+                self.stop.store(true, Ordering::SeqCst);
+            }
+            event => {
+                if let Err(error) = self.events.try_send(event) {
+                    let _ = self.fatal.try_send(match error {
+                        mpsc::TrySendError::Full(_) => {
+                            Error::Channel("UI critical event queue overflow".into())
+                        }
+                        mpsc::TrySendError::Disconnected(_) => Error::Disconnected,
+                    });
+                    self.stop.store(true, Ordering::SeqCst);
+                    return Err(());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Updates {
+    pub fn try_recv(&self) -> Result<Update, mpsc::TryRecvError> {
+        if let Ok(error) = self.fatal.try_recv() {
+            return Ok(Update::Fatal(error));
+        }
+        match self.events.try_recv() {
+            Ok(event) => Ok(event),
+            Err(error) => match self.snapshot.lock().unwrap().take() {
+                Some(snapshot) => Ok(Update::Snapshot(snapshot)),
+                None => Err(error),
+            },
+        }
+    }
+}
+
+fn update_channel(stop: Arc<AtomicBool>) -> (Output, Updates) {
+    let (events, receiver) = mpsc::sync_channel(128);
+    let snapshot = Arc::new(Mutex::new(None));
+    let (fatal, fatal_receiver) = mpsc::sync_channel(1);
+    (
+        Output {
+            events,
+            snapshot: snapshot.clone(),
+            fatal,
+            stop,
+        },
+        Updates {
+            events: receiver,
+            snapshot,
+            fatal: fatal_receiver,
+        },
+    )
+}
+
 struct ObservedWire {
     inner: Box<dyn Wire>,
-    output: mpsc::Sender<Update>,
+    output: Output,
 }
 
 impl Wire for ObservedWire {
@@ -26,9 +124,11 @@ impl Wire for ObservedWire {
             .filter(|f| f.ftype == FrameType::Data)
             .map(|f| f.seq);
         if let Some(seq) = seq {
-            let _ = self
-                .output
-                .send(Update::Delivery(seq, Delivery::Transmitting));
+            self.output
+                .send(Update::Delivery(seq, Delivery::Transmitting))
+                .map_err(|_| {
+                    Error::Channel("UI critical event queue overflow or disconnected".into())
+                })?;
         }
         // A failed attempt is not a final delivery state: the link owns the
         // retry budget and reports Unknown only when it is exhausted.
@@ -54,24 +154,35 @@ pub fn start(
     stop: Arc<AtomicBool>,
     events_path: Option<String>,
 ) -> (
-    mpsc::SyncSender<String>,
-    mpsc::Receiver<Update>,
+    mpsc::SyncSender<Command>,
+    Updates,
     std::thread::JoinHandle<()>,
 ) {
-    let (commands, input) = mpsc::sync_channel::<String>(64);
-    let (output, updates) = mpsc::channel();
+    let (commands, input) = mpsc::sync_channel::<Command>(32);
+    let (output, updates) = update_channel(stop.clone());
     let handle = std::thread::spawn(move || {
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut evidence = match events_path {
-            Some(path) => match {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(path)
-            } {
-                Ok(file) => Some(file),
+            Some(path) => match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(file) => match file.metadata() {
+                    Ok(metadata) if metadata.is_file() => Some(file),
+                    Ok(_) => {
+                        let _ = output.send(Update::Fatal(Error::Io(
+                            "event evidence must be a regular file".into(),
+                        )));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = output.send(Update::Fatal(Error::Io(e.to_string())));
+                        return;
+                    }
+                },
                 Err(e) => {
                     let _ = output.send(Update::Fatal(Error::Io(e.to_string())));
                     return;
@@ -135,7 +246,12 @@ pub fn start(
         let mut request_id = 0u64;
         while !stop.load(Ordering::SeqCst) {
             for _ in 0..64 {
-                let Ok(line) = input.try_recv() else { break };
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(Command { id, line }) = input.try_recv() else {
+                    break;
+                };
                 let result = match cfg.kind {
                     AppKind::Chat => session.queue_chat(line).map(|_| ()),
                     AppKind::Game => line
@@ -145,12 +261,14 @@ pub fn start(
                         .and_then(|sq| session.queue_move(sq).map(|_| ())),
                 };
                 if let Err(e) = result {
-                    let _ = output.send(Update::Note(e.to_string()));
-                    let _ = output.send(Update::Accepted);
+                    let _ = output.send(Update::Rejected(id, e.to_string()));
                 } else {
-                    let _ = output.send(Update::Accepted);
+                    let _ = output.send(Update::Accepted(id));
                 }
                 let _ = output.send(Update::Snapshot(session.snapshot()));
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
             }
             if let Some(active) = &job {
                 match active.try_result() {

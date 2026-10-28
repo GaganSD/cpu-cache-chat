@@ -161,12 +161,7 @@ fn client(
     cfg.agent = agent;
     cfg.agent_cmd = agent_cmd;
     cfg.slot = Duration::from_millis(args.slot_ms);
-    if args.sim {
-        cfg.sim_path = Some(
-            args.sim_path
-                .unwrap_or_else(|| "/tmp/cpu-cache-chat.sim".into()),
-        );
-    }
+    cfg.sim_path = args.sim_path;
     cfg.validate()?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -184,15 +179,17 @@ fn client(
         ui::run(cfg, stop.clone(), commands, updates)
     };
     stop.store(true, Ordering::SeqCst);
-    let _ = worker.join();
+    if worker.join().is_err() {
+        return Err(Error::Io("worker panicked".into()));
+    }
     result
 }
 
 fn plain_loop(
     cfg: &RuntimeConfig,
     stop: Arc<AtomicBool>,
-    commands: std::sync::mpsc::SyncSender<String>,
-    updates: std::sync::mpsc::Receiver<worker::Update>,
+    commands: std::sync::mpsc::SyncSender<worker::Command>,
+    updates: worker::Updates,
 ) -> Result<(), Error> {
     println!(
         "cpu-cache-chat / {} / {} mode: {}",
@@ -216,6 +213,7 @@ fn plain_loop(
     std::thread::spawn(move || {
         let mut line = Vec::new();
         let mut overflow = false;
+        let mut next_id = 0u64;
         for byte in io::stdin().lock().bytes() {
             let Ok(byte) = byte else { break };
             if byte != b'\n' {
@@ -233,8 +231,13 @@ fn plain_loop(
                     input_stop.store(true, Ordering::SeqCst);
                     break;
                 }
-                match commands.try_send(text) {
-                    Ok(()) => {}
+                match commands.try_send(worker::Command {
+                    id: next_id,
+                    line: text,
+                }) {
+                    Ok(()) => {
+                        next_id = next_id.wrapping_add(1);
+                    }
                     Err(_) => eprintln!("command queue full or session unavailable"),
                 }
             }
@@ -243,8 +246,8 @@ fn plain_loop(
         }
     });
     let mut previous = String::new();
-    while !stop.load(Ordering::SeqCst) {
-        match updates.recv_timeout(Duration::from_millis(50)) {
+    loop {
+        match updates.try_recv() {
             Ok(worker::Update::Note(note)) => println!("{}", escape_controls(&note)),
             Ok(worker::Update::Snapshot(s)) => {
                 let view = format!(
@@ -261,11 +264,19 @@ fn plain_loop(
                     previous = view;
                 }
             }
-            Ok(worker::Update::Accepted) => {}
+            Ok(worker::Update::Accepted(_)) => {}
+            Ok(worker::Update::Rejected(_, reason)) => {
+                eprintln!("rejected: {}", escape_controls(&reason))
+            }
             Ok(worker::Update::Fatal(e)) => return Err(e),
             Ok(worker::Update::Delivery(seq, state)) => println!("seq {seq}: {state}"),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 return Err(Error::Io("worker disconnected".into()))
             }
         }
