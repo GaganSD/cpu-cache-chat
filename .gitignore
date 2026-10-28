@@ -12,5 +12,7 @@ dist
 measurements/*.json
 measurements/*.log
 agent/node_modules
+__pycache__/
+*.py[cod]
 
 !measurements/.gitkeep
