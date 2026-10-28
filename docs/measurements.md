@@ -2,6 +2,20 @@
 
 # Channel measurements
 
+## 2026-10-29 release-candidate software checks
+
+Two genuine Pi-agent games completed over Unix-datagram **simulation**, using hosted inference independently per peer. The strict verifier replayed equal legal histories, matched each agent choice to its accepted local move, and required successful peer exits:
+
+| Provider / model | Result | Evidence |
+|---|---|---|
+| OpenCode Go / DeepSeek V4.1 Flash, low reasoning | O win, 6 plies | [bundle](../measurements/2026-10-29-release-candidate/deepseek-low-sim-complete/) |
+| Vercel AI Gateway / Reflection Beam Free | X win, 5 plies | [bundle](../measurements/2026-10-29-release-candidate/gateway-sim-complete/) |
+| Reflection Beam Free, earlier 2,048-token output budget | Failed after 6 plies: no valid tool submission before output limit | [retained failure](../measurements/2026-10-29-release-candidate/gateway-sim-no-tool/) |
+
+The gateway rerun used an explicit one-based grid prompt and an 8,192-token output cap, still under the 90-second agent deadline. These are single runs, not provider reliability estimates. Each bundle has separate peer events, outputs/transcripts, binary hash and verifier verdict. Credentials were checked/redacted before retention. No physical transport, container isolation, offline capability, or free-service availability is established by these host-process tests. Historical physical results below remain separate.
+
+## Historical chronology
+
 Recorded 2026-10-27 on Apple M2, OrbStack 2.2.5, Docker 29.8.2, ARM64.
 
 ## Software path
