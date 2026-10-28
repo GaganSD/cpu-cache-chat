@@ -113,15 +113,25 @@ impl<W: Wire> Session<W> {
             return Err(Error::InvalidInput("not a chat session".into()));
         }
         let text = sanitize_user_text(&text)?;
+        if self.chat.len() >= 100 {
+            if let Some(index) = self
+                .chat
+                .iter()
+                .position(|line| matches!(line.delivery, Delivery::Delivered | Delivery::Failed))
+            {
+                self.chat.remove(index);
+            } else {
+                return Err(Error::InvalidInput(
+                    "chat history full of unresolved messages".into(),
+                ));
+            }
+        }
         let id = self.next_chat_id;
         self.next_chat_id = self.next_chat_id.saturating_add(1);
         let seq = self.link.enqueue(AppMessage::Chat {
             id,
             text: text.clone(),
         })?;
-        if self.chat.len() >= 100 {
-            self.chat.remove(0);
-        }
         self.chat.push(ChatLine {
             from: self.cfg.role,
             text,
@@ -176,7 +186,15 @@ impl<W: Wire> Session<W> {
                 AppMessage::Chat { text, .. } if cfg.kind == AppKind::Chat => {
                     let shown = escape_controls(text);
                     if chat.len() >= 100 {
-                        chat.remove(0);
+                        if let Some(index) = chat.iter().position(|line| {
+                            matches!(line.delivery, Delivery::Delivered | Delivery::Failed)
+                        }) {
+                            chat.remove(index);
+                        } else {
+                            return Err(Error::InvalidInput(
+                                "chat history full of unresolved messages".into(),
+                            ));
+                        }
                     }
                     chat.push(ChatLine {
                         from: cfg.role.peer(),
