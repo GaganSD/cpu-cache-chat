@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # Build natively on ARM64 (OrbStack or Linux), or natively on x86-64 Linux.
-# Tags remain mutable; release builds must override with verified digests.
-ARG RUST_IMAGE=rust:1.96.1-bookworm
-ARG RUNTIME_IMAGE=debian:bookworm-slim
+# Multi-platform index digests verified with buildx imagetools inspect.
+ARG RUST_IMAGE=rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663
+ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 FROM ${RUST_IMAGE} AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./

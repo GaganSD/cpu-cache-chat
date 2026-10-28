@@ -12,4 +12,4 @@ No script here configures host security settings or starts Docker. Containers sh
 
 See the [main quickstart](../README.md). `./docker/build.sh` builds the native base image; `./docker/build-agent.sh` additionally installs Node dependencies with `npm ci`. No model weights or secrets are included. Hosted agents need external inference access and credentials at runtime; bridge networking is not an inference-only firewall.
 
-The Dockerfile defaults use mutable tags. They are convenient for development, not release pins. For release provenance, supply verified platform-appropriate base image digests and source revision build arguments as described in [the release checklist](../docs/release.md). The default revision label is `unknown`, not proof of source identity.
+The Dockerfiles pin verified multi-platform base-image index digests. Reverify and update them under [the release checklist](../docs/release.md), and supply source-revision build arguments. The default revision label is `unknown`, not proof of source identity; neither digest resolution nor labels constitute a validated build.

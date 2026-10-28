@@ -5,10 +5,10 @@
 # https://opencode.ai and the key passed via OPENCODE_GO_API_KEY at run time;
 # game moves still travel only over the selected physical channel.
 ARG CCC_IMAGE=cpu-cache-chat:local
+# Multi-platform index digest verified with buildx imagetools inspect.
+ARG NODE_IMAGE=node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
 FROM ${CCC_IMAGE} AS ccc
 
-# Override with a verified digest for release builds.
-ARG NODE_IMAGE=node:22-bookworm-slim
 FROM ${NODE_IMAGE}
 ARG SOURCE_URL=https://github.com/GaganSD/cpu-cache-chat
 ARG VCS_REF=unknown
