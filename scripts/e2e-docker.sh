@@ -86,7 +86,7 @@ docker create --name "$b" "${common[@]}" "$IMAGE" probe --role b --channel "$CHA
 owned_b=1
 docker start -a "$b" >"$workdir/silent.out" 2>"$workdir/silent.err" || { echo 'FAIL: silent control process failed'; exit 1; }
 cat "$workdir/silent.out"
-if ! grep -Fq 'false decoded frame=false' "$workdir/silent.out" || ! grep -Fq 'result=Err(Timeout)' "$workdir/silent.out"; then
+if ! python3 "$ROOT/scripts/probe-report.py" silent "$workdir/silent.out"; then
   echo 'FAIL: silent sender control did not pass'; exit 1
 fi
 docker rm "$b" >/dev/null
@@ -107,9 +107,7 @@ wait "$probe_a" || status=1
 wait "$probe_b" || status=1
 cat "$workdir/probe-a.out" "$workdir/probe-b.out"
 [[ "$status" == 0 ]] || { echo 'FAIL: probe process failed'; exit 1; }
-sent=$(sed -n 's/^sender payload .*: \[\(.*\)\]$/\1/p' "$workdir/probe-a.out" | tr -d ', ')
-received=$(sed -n 's/.*received bytes (hex): \([0-9a-f]*\).*/\1/p' "$workdir/probe-b.out")
-if [[ -z "$sent" || "$sent" != "$received" ]]; then
+if ! python3 "$ROOT/scripts/probe-report.py" compare "$workdir/probe-a.out" "$workdir/probe-b.out"; then
   echo 'FAIL: receiver-blind probe did not decode all expected bits; BER unavailable if no frame decoded'; exit 1
 fi
 echo 'PASS: probe decoded expected bytes (0 bit errors in this frame) and silent control passed'

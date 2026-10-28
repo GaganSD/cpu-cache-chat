@@ -44,14 +44,14 @@ case "$cmd" in
     printf 'mock debug without newline' >&2
     if [[ "$args" == *' --silent '* ]]; then
       if [[ "${MOCK_SILENT_FAIL:-0}" == 1 ]]; then
-        echo 'false decoded frame=true; result=Ok(frame)'
+        echo '{"schema_version":1,"role":"B","mode":"Cpu","requested_trials":1,"attempted_trials":1,"completed_trials":1,"requested_bits":32,"trials":[{"outcome":"silent_frame","error":null}]}'
       else
-        echo 'false decoded frame=false; result=Err(Timeout)'
+        echo '{"schema_version":1,"role":"B","mode":"Cpu","requested_trials":1,"attempted_trials":1,"completed_trials":1,"requested_bits":32,"trials":[{"outcome":"silent_no_frame","error":null}]}'
       fi
     elif [[ "$args" == *' probe '* && "$args" == *' --role a '* ]]; then
-      echo 'sender payload (keep this off the receiver argv): [5a, 7f, a4, c9]'
+      echo '{"schema_version":1,"role":"A","mode":"Cpu","requested_bits":32,"sent_bytes":4,"payload_hex":"5a7fa4c9"}'
     elif [[ "$args" == *' probe '* ]]; then
-      echo 'received bytes (hex): 5a7fa4c9'
+      echo '{"schema_version":1,"role":"B","mode":"Cpu","requested_trials":1,"attempted_trials":1,"completed_trials":1,"requested_bits":32,"trials":[{"outcome":"decoded","error":null,"decoded_hex":"5a7fa4c9","decoded_bytes":4,"crc_valid":true}]}'
     elif [[ "${MOCK_CHAT_SUCCESS:-0}" == 1 ]]; then
       echo 'link: connected'
       if [[ "$args" == *' --role a '* ]]; then
@@ -84,7 +84,7 @@ if MOCK_SILENT_FAIL=1 EVIDENCE_DIR="$tmp/evidence" WAIT_SECONDS=1 \
 fi
 run1=$(find "$tmp/evidence" -mindepth 1 -maxdepth 1 -type d -print)
 [[ -n "$run1" && -f "$run1/silent.out" ]]
-grep -Fq 'false decoded frame=true' "$run1/silent.out"
+grep -Fq '"outcome":"silent_frame"' "$run1/silent.out"
 grep -Fxq 'mock debug without newline' "$run1/silent.err"
 grep -Fq 'mock debug without newline' "$tmp/silent-output"
 grep -Fxq 'exit_status=1' "$run1/run.txt"
