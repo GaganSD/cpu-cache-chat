@@ -1,6 +1,7 @@
 //! Deterministic tic-tac-toe. No AI.
 
 pub mod evidence;
+pub mod evidence_jsonl;
 
 use ccc_core::{Error, Mark};
 

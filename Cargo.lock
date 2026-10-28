@@ -123,6 +123,8 @@ name = "ccc-game"
 version = "0.1.0"
 dependencies = [
  "ccc-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

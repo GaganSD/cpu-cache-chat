@@ -1,0 +1,12 @@
+# Game evidence JSONL v1
+
+`ccc-verify-game [--require-agents] A.jsonl B.jsonl` reads each peer's file separately and prints one JSON verdict to stdout. Failure returns a nonzero exit status and `{ "ok": false, "error": "..." }`. Success includes `ok`, `session`, `board`, `ply`, `outcome`, `agents_verified`, `physical_channel_verified`, and `isolation_verified`. The last two are always false: replay cannot establish physical-channel attribution or isolation. Retain and review manual physical/isolation evidence independently.
+
+Each file is UTF-8 JSON Lines, one object per line, including a newline after the last object. Objects reject unknown, missing, and duplicate fields. Maximum file size is 16384 bytes, line size 1024 bytes excluding newline, and 21 events. No blank lines or additional sessions are allowed. The sequence is:
+
+1. Exactly one `{"type":"session","version":1,"session":42,"role":"A"}`. Session is a nonzero u32; role is `A` or `B`.
+2. Ordered moves, optionally interleaved with agent choices: `{"type":"move","ply":0,"square":1,"mark":"X","sequence":2,"acceptance":"local_ack"}` and `{"type":"agent_choice","ply":0,"square":1}`. Ply is zero-based; square is 1–9; mark is `X` or `O`; sequence is a nonzero u16. Acceptance is `local_ack` only after the sender receives application acceptance ACK, or `peer_accepted` when the receiver applies the move. Moves must match across peers with opposite acceptance. Each origin's sequence increases. Choices have distinct plies; `--require-agents` requires every local accepted move to match the recorded agent choices in order.
+3. Exactly one `{"type":"final","board":"XXXOO6789","ply":5,"outcome":"x_win"}`. Board is the nine-cell compact board (empty cells retain their 1-based square digits); outcome is `x_win`, `o_win`, or `draw`.
+4. Exactly one final record `{"type":"stopped","successful":true,"evidence_complete":true}`. This asserts successful process/worker completion and complete records; it does not substitute for the required session, moves, final record, and legal replay.
+
+The two files must have the same nonzero session, opposite roles, equal legal terminal histories and final states. Verification relies on the truthfulness of recorded events; it is not cryptographic provenance or proof that a physical channel was used.

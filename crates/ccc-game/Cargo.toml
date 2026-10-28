@@ -10,3 +10,5 @@ publish = false
 
 [dependencies]
 ccc-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
