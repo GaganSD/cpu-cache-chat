@@ -105,11 +105,6 @@ owned_b=1
 nets_a=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$a")
 nets_b=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$b")
 echo "container networks: A=[$nets_a] B=[$nets_b] (must be disjoint, no host, no none-shared)"
-{
-  echo "container networks: A=[$nets_a] B=[$nets_b]"
-  docker inspect "$a" "$b" --format '{{.Name}} networks={{json .NetworkSettings.Networks}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}'
-  docker network inspect "$net_a" "$net_b" --format '{{.Name}} internal={{.Internal}} containers={{json .Containers}}'
-} > "$workdir/docker-inspect.txt"
 [[ "${nets_a% }" == "$net_a" && "${nets_b% }" == "$net_b" ]] || {
   echo 'FAIL: unexpected container network membership' >&2; exit 1; }
 if docker inspect "$a" "$b" --format '{{.HostConfig.Privileged}} {{.HostConfig.NetworkMode}}' | grep -q true; then
@@ -117,6 +112,13 @@ if docker inspect "$a" "$b" --format '{{.HostConfig.Privileged}} {{.HostConfig.N
 fi
 docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>"$workdir/a.err" & A_PID=$!
 docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>"$workdir/b.err" & B_PID=$!
+sleep 2
+# Capture the RUNTIME network state after start, not just the configured one.
+{
+  echo "container networks (configured): A=[$nets_a] B=[$nets_b]"
+  docker inspect "$a" "$b" --format '{{.Name}} state={{.State.Status}} networks={{json .NetworkSettings.Networks}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}'
+  docker network inspect "$net_a" "$net_b" --format '{{.Name}} internal={{.Internal}} containers={{json .Containers}}'
+} > "$workdir/docker-inspect.txt"
 wait_for() {
   local file="$1" needle="$2" tries="${3:-$WAIT_SECONDS}"
   for _ in $(seq 1 "$tries"); do

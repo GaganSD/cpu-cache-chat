@@ -258,6 +258,11 @@ impl<W: Wire> Session<W> {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
+        // Successful agent stderr is normally discarded; CCC_AGENT_DEBUG
+        // forwards it so evidence runs can retain model transcripts.
+        if std::env::var_os("CCC_AGENT_DEBUG").is_some() && !out.stderr.is_empty() {
+            eprintln!("agent stderr: {}", String::from_utf8_lossy(&out.stderr));
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         let square = parse_square(&text)?;
         Ok(Some(square))

@@ -49,6 +49,9 @@ cleanup() {
       printf 'exit_status=%s\nchannel=%s\nmode=game\nslot_ms=%s\ncpuset=%s\nwait_seconds=%s\nimage=%s\n' \
         "$result" "$CHANNEL" "$SLOT_MS" "$CPUSET" "$WAIT_SECONDS" "$IMAGE"
       printf 'image_digest=%s\n' "$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo unknown)"
+      printf 'repo_head=%s\n' "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+      printf 'repo_dirty=%s\n' "$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo yes || echo no)"
+      printf 'ccc_debug=%s\n' "${CCC_DEBUG:-0}"
       printf 'host_uname=%s\n' "$(uname -srm)"
       printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$workdir/run.txt"
@@ -78,10 +81,11 @@ owned_a=1
 docker create -i --name "$b" "${common[@]}" "$IMAGE" game --role b --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
 owned_b=1
 "$ROOT/scripts/inspect-isolation.sh" "$a" "$b" | tee "$workdir/inspect-isolation.txt"
-# Retain the actual runtime configuration the verdict relies on.
-docker inspect "$a" "$b" --format '{{.Name}} network={{.HostConfig.NetworkMode}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}' > "$workdir/docker-inspect.txt"
 docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>"$workdir/a.err" & A_PID=$!
 docker start -a -i "$b" <"$workdir/b.in" >"$workdir/b.out" 2>"$workdir/b.err" & B_PID=$!
+sleep 2
+# Retain the actual runtime configuration the verdict relies on, after start.
+docker inspect "$a" "$b" --format '{{.Name}} state={{.State.Status}} network={{.HostConfig.NetworkMode}} privileged={{.HostConfig.Privileged}} cpuset={{.HostConfig.CpusetCpus}} ipc={{.HostConfig.IpcMode}} pid={{.HostConfig.PidMode}} readonly={{.HostConfig.ReadonlyRootfs}} mounts={{json .Mounts}}' > "$workdir/docker-inspect.txt"
 wait_for() {
   local file="$1" needle="$2" tries="${3:-$WAIT_TRIES}"
   for _ in $(seq 1 "$tries"); do
