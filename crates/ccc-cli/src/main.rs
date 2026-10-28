@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ccc_app::escape_controls;
-use ccc_channel::{open_phy, run_probe_receiver, run_probe_sender, run_silent_control};
+use ccc_channel::{
+    open_phy, probe_payload_len, random_probe_payload, run_probe_receiver, run_probe_sender,
+    run_silent_control,
+};
 use ccc_core::{
     AppKind, ChannelMode, Error, Role, RuntimeConfig, DEFAULT_PROBE_BITS, DEFAULT_PROBE_TRIALS,
 };
@@ -28,7 +31,7 @@ enum Cmd {
     Chat(ClientArgs),
     Game(GameArgs),
     Probe(ProbeArgs),
-    Bench(ProbeArgs),
+    Bench(BenchArgs),
     InspectIsolation,
 }
 
@@ -70,13 +73,23 @@ struct ProbeArgs {
     trials: u32,
     #[arg(long, default_value_t = DEFAULT_PROBE_BITS)]
     bits: u32,
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "50")]
     slot_ms: u64,
     /// Listen without a sender and report whether a frame was falsely decoded.
     #[arg(long)]
     silent: bool,
     #[arg(long, default_value = "5")]
     silent_seconds: u64,
+}
+
+#[derive(clap::Args, Debug)]
+struct BenchArgs {
+    #[arg(long, value_enum)]
+    role: RoleArg,
+    #[arg(long, value_enum)]
+    channel: ChannelArg,
+    #[arg(long, default_value = "50")]
+    slot_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -244,15 +257,28 @@ fn plain_loop(
     Ok(())
 }
 
+fn measurement_stop() -> Result<Arc<AtomicBool>, Error> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst))
+        .map_err(|e| Error::Io(format!("installing interrupt handler: {e}")))?;
+    Ok(stop)
+}
+
 fn probe(args: ProbeArgs) -> Result<(), Error> {
     let mode = args.channel.mode(false);
-    if !mode.is_physical() {
+    let slot = Duration::from_millis(args.slot_ms);
+    ccc_core::validate_slot(slot)?;
+    probe_payload_len(args.bits)?;
+    if args.trials != 1 {
         return Err(Error::InvalidInput(
-            "probe requires a physical channel".into(),
+            "probe supports exactly --trials 1".into(),
         ));
     }
-    let stop = Arc::new(AtomicBool::new(false));
-    let slot = Duration::from_millis(args.slot_ms);
+    if args.silent_seconds == 0 || args.silent_seconds > 3600 {
+        return Err(Error::InvalidInput("silent seconds must be 1..3600".into()));
+    }
+    let stop = measurement_stop()?;
     let role = Role::from(args.role);
     if args.silent {
         if role.is_initiator() || args.silent_seconds == 0 {
@@ -268,37 +294,43 @@ fn probe(args: ProbeArgs) -> Result<(), Error> {
             Duration::from_secs(args.silent_seconds),
         )?;
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return if report.has_failures() {
+            Err(Error::Calibration(
+                "silent control decoded a frame or failed".into(),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    if role.is_initiator() {
+        // Sender-only OS entropy. The receiver never receives expected bytes.
+        let payload = random_probe_payload(args.bits)?;
+        run_probe_sender(mode, args.bits, slot, stop, &payload)?;
+        let payload_hex: String = payload.iter().map(|byte| format!("{byte:02x}")).collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1, "role": "A", "mode": mode,
+                "requested_bits": args.bits, "sent_bytes": payload.len(), "payload_hex": payload_hex,
+            })
+        );
         return Ok(());
     }
-    // Receiver-blind payload: sender chooses bytes the receiver binary does not embed.
-    let payload = if role.is_initiator() {
-        let mut p = vec![0u8; (args.bits as usize).div_ceil(8).min(32)];
-        for (i, b) in p.iter_mut().enumerate() {
-            *b = ((i as u8).wrapping_mul(37)).wrapping_add(0x5A);
-        }
-        println!(
-            "sender payload (keep this off the receiver argv): {:02x?}",
-            p
-        );
-        run_probe_sender(mode, args.bits, slot, stop, &p)?;
-        println!(
-            "{{\"role\":\"A\",\"mode\":\"{}\",\"sent\":{}}}",
-            mode,
-            p.len()
-        );
-        return Ok(());
-    } else {
-        // Receiver does not know the sender bytes unless the operator pastes them later.
-        run_probe_receiver(mode, role, args.trials, args.bits, slot, stop, None)?
-    };
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    let report = run_probe_receiver(mode, role, args.trials, args.bits, slot, stop, None)?;
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    if report.has_failures() {
+        return Err(Error::Calibration(
+            "probe did not decode a valid frame; see JSON report".into(),
+        ));
+    }
     Ok(())
 }
 
-fn bench(args: ProbeArgs) -> Result<(), Error> {
+fn bench(args: BenchArgs) -> Result<(), Error> {
     let mode = args.channel.mode(false);
     let slot = Duration::from_millis(args.slot_ms);
-    let stop = Arc::new(AtomicBool::new(false));
+    ccc_core::validate_slot(slot)?;
+    let stop = measurement_stop()?;
     let mut phy = open_phy(mode, slot, stop)?;
     let send = Role::from(args.role).is_initiator();
     println!(
