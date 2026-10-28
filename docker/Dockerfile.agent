@@ -14,7 +14,7 @@ ARG SOURCE_URL=https://github.com/GaganSD/cpu-cache-chat
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source=${SOURCE_URL} \
       org.opencontainers.image.revision=${VCS_REF}
-COPY --from=ccc /usr/local/bin/cpu-cache-chat /usr/local/bin/cpu-cache-chat
+COPY --from=ccc /usr/local/bin/cpu-cache-chat /usr/local/bin/ccc-verify-game /usr/local/bin/
 COPY --from=ccc /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 WORKDIR /opt/ccc/agent
 COPY agent/package.json agent/package-lock.json ./

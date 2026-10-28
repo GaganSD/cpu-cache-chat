@@ -41,6 +41,7 @@ jobs:
         run: |
           for f in docker/*.sh scripts/*.sh scripts/tests/*.sh; do bash -n "$f"; done
           for f in scripts/tests/*.sh; do bash "$f"; done
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Simulation e2e
         shell: bash
         run: |
@@ -52,8 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      # Existing warnings remain tracked for cleanup; error severity is required.
-      - run: shellcheck --severity=error docker/*.sh scripts/*.sh scripts/tests/*.sh
+      - run: shellcheck docker/*.sh scripts/*.sh scripts/tests/*.sh
   image:
     strategy:
       matrix:
@@ -65,7 +65,8 @@ jobs:
       - name: Build and smoke test base image
         run: |
           docker build --build-arg VCS_REF="$GITHUB_SHA" -f docker/Dockerfile -t ccc:ci .
-          docker run --rm ccc:ci --help
+          docker run --rm --network none ccc:ci --help
+          docker run --rm --network none --entrypoint /bin/sh ccc:ci -c 'command -v ccc-verify-game'
       - name: Build and smoke test agent image
         run: |
           docker build --build-arg CCC_IMAGE=ccc:ci --build-arg VCS_REF="$GITHUB_SHA" -f docker/Dockerfile.agent -t ccc:agent-ci .

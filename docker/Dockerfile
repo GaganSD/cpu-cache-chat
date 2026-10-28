@@ -7,14 +7,17 @@ FROM ${RUST_IMAGE} AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
-RUN cargo build --locked --release -p cpu-cache-chat
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    CARGO_BUILD_JOBS=2 cargo build --locked --release -p cpu-cache-chat -p ccc-game \
+    && cp target/release/cpu-cache-chat target/release/ccc-verify-game /
 
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG SOURCE_URL=https://github.com/GaganSD/cpu-cache-chat
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source=${SOURCE_URL} \
       org.opencontainers.image.revision=${VCS_REF}
-COPY --from=build /src/target/release/cpu-cache-chat /usr/local/bin/cpu-cache-chat
+COPY --from=build /cpu-cache-chat /ccc-verify-game /usr/local/bin/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY agent/README.md agent/package.json /opt/ccc/agent/
 COPY agent/src /opt/ccc/agent/src

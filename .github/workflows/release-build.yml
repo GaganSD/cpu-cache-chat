@@ -22,13 +22,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.96.1 --profile minimal
-      - run: cargo build --locked --release -p cpu-cache-chat
+      - run: cargo build --locked --release -p cpu-cache-chat -p ccc-game
       - name: Stage binary and provenance
         shell: bash
         run: |
           mkdir -p dist
           cp target/release/cpu-cache-chat dist/cpu-cache-chat-${{ matrix.target }}
-          (cd dist && shasum -a 256 cpu-cache-chat-${{ matrix.target }} > SHA256SUMS)
+          cp target/release/ccc-verify-game dist/ccc-verify-game-${{ matrix.target }}
+          (cd dist && shasum -a 256 cpu-cache-chat-* ccc-verify-game-* > SHA256SUMS)
           { git rev-parse HEAD; rustc --version; cargo --version; uname -a; } > dist/provenance.txt
       - uses: actions/upload-artifact@v4
         with:
