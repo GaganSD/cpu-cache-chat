@@ -4,12 +4,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/release/cpu-cache-chat}"
 if [[ ! -x "$BIN" ]]; then
-  cargo build -p cpu-cache-chat --release
+  cargo build --locked -p cpu-cache-chat -p ccc-game --release
   BIN="$ROOT/target/release/cpu-cache-chat"
 fi
 MODE="${MODE:-chat}"
-WORKDIR="${TMPDIR:-/tmp}/ccc-e2e-$$"
-mkdir -p "$WORKDIR"
+WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/ccc-e2e.XXXXXX")
+EVENT_A=()
+EVENT_B=()
+if [[ "$MODE" == game ]]; then
+  EVENT_A=(--events-path "$WORKDIR/a.jsonl")
+  EVENT_B=(--events-path "$WORKDIR/b.jsonl")
+fi
 SIM="$WORKDIR/link.sim"
 A_IN="$WORKDIR/a.in"
 B_IN="$WORKDIR/b.in"
@@ -17,17 +22,17 @@ A_OUT="$WORKDIR/a.out"
 B_OUT="$WORKDIR/b.out"
 mkfifo "$A_IN" "$B_IN"
 cleanup() {
-  kill "$A_PID" "$B_PID" 2>/dev/null || true
-  wait "$A_PID" "$B_PID" 2>/dev/null || true
+  kill "${A_PID:-}" "${B_PID:-}" 2>/dev/null || true
+  wait "${A_PID:-}" "${B_PID:-}" 2>/dev/null || true
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 : >"$A_OUT"
 : >"$B_OUT"
-"$BIN" "$MODE" --role a --channel cache --sim --sim-path "$SIM" --plain <"$A_IN" >"$A_OUT" 2>&1 &
+"$BIN" "$MODE" --role a --channel cache --sim --sim-path "$SIM" --plain ${EVENT_A[@]+"${EVENT_A[@]}"} <"$A_IN" >"$A_OUT" 2>&1 &
 A_PID=$!
-"$BIN" "$MODE" --role b --channel cache --sim --sim-path "$SIM" --plain <"$B_IN" >"$B_OUT" 2>&1 &
+"$BIN" "$MODE" --role b --channel cache --sim --sim-path "$SIM" --plain ${EVENT_B[@]+"${EVENT_B[@]}"} <"$B_IN" >"$B_OUT" 2>&1 &
 B_PID=$!
 exec 3>"$A_IN"
 exec 4>"$B_IN"
@@ -66,8 +71,9 @@ if [[ "$MODE" == chat ]]; then
   fi
   echo "PASS chat simulation both directions; terminal control escaped"
 else
+  wait_for "$A_OUT" "seq 1: delivered" 80 # Start, not a move.
   printf '5\n' >&3
-  wait_for "$A_OUT" "seq 1: delivered" 80
+  wait_for "$A_OUT" "seq 2: delivered" 80
   wait_for "$B_OUT" " 4 | X | 6" 80
   printf '2\n' >&4
   wait_for "$B_OUT" "seq 1: delivered" 80
@@ -96,4 +102,8 @@ wait "$B_PID" || status=1
 if [[ "$status" != 0 ]]; then
   echo 'FAIL: a simulation process exited unsuccessfully' >&2
   exit 1
+fi
+if [[ "$MODE" == game ]]; then
+  VERIFY="${VERIFY:-$(dirname "$BIN")/ccc-verify-game}"
+  "$VERIFY" "$WORKDIR/a.jsonl" "$WORKDIR/b.jsonl"
 fi
