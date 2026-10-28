@@ -141,8 +141,21 @@ fn agent_command_accepts_arguments_and_json_output_and_move_is_validated() {
     let mut a = Session::wrap(cfg.clone(), pair.a, 43);
     cfg.role = Role::B;
     let mut b = Session::wrap(cfg, pair.b, 0);
-    let peer = thread::spawn(move || b.connect().unwrap());
+    let peer = thread::spawn(move || {
+        b.connect().unwrap();
+        for _ in 0..30 {
+            b.tick(Duration::from_millis(10)).unwrap();
+        }
+    });
     a.connect().unwrap();
+    assert!(!a.our_turn());
+    a.request_start().unwrap();
+    for _ in 0..30 {
+        a.tick(Duration::from_millis(10)).unwrap();
+        if a.our_turn() {
+            break;
+        }
+    }
     peer.join().unwrap();
     assert_eq!(a.try_agent_move().unwrap(), Some(1));
     a.queue_move(1).unwrap();

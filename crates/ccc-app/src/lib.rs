@@ -22,6 +22,11 @@ pub struct ChatLine {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub role: Role,
+    pub session: u32,
+    pub board_compact: Option<String>,
+    pub ply: Option<u8>,
+    pub started: bool,
+    pub frozen: bool,
     pub channel_label: String,
     pub simulated: bool,
     pub link: LinkState,
@@ -39,6 +44,7 @@ pub struct Session<W: Wire> {
     chat: Vec<ChatLine>,
     board: Board,
     started: bool,
+    pending_start: Option<u16>,
     status: String,
     next_chat_id: u16,
     pending_move: Option<(u16, u8, Mark, Board)>,
@@ -73,6 +79,7 @@ impl<W: Wire> Session<W> {
             chat: Vec::new(),
             board: Board::new(),
             started: false,
+            pending_start: None,
             status,
             next_chat_id: 1,
             pending_move: None,
@@ -91,6 +98,9 @@ impl<W: Wire> Session<W> {
     }
 
     pub fn queue_chat(&mut self, text: String) -> Result<u16, Error> {
+        if self.cfg.kind != AppKind::Chat {
+            return Err(Error::InvalidInput("not a chat session".into()));
+        }
         let text = sanitize_user_text(&text)?;
         let id = self.next_chat_id;
         self.next_chat_id = self.next_chat_id.saturating_add(1);
@@ -98,7 +108,7 @@ impl<W: Wire> Session<W> {
             id,
             text: text.clone(),
         })?;
-        if self.chat.len() > 100 {
+        if self.chat.len() >= 100 {
             self.chat.remove(0);
         }
         self.chat.push(ChatLine {
@@ -127,15 +137,92 @@ impl<W: Wire> Session<W> {
     }
 
     pub fn request_start(&mut self) -> Result<(), Error> {
-        self.link.enqueue(AppMessage::Ctrl(GameCtrl::Start))?;
-        self.started = true;
+        if self.cfg.kind != AppKind::Game
+            || !self.cfg.role.is_initiator()
+            || self.started
+            || self.pending_start.is_some()
+            || self.frozen
+        {
+            return Err(Error::InvalidInput("cannot start game".into()));
+        }
+        self.pending_start = Some(self.link.enqueue(AppMessage::Ctrl(GameCtrl::Start))?);
         self.status = "game start sent".into();
         Ok(())
     }
 
     pub fn tick(&mut self, wait: Duration) -> Result<Vec<String>, Error> {
-        let events = self.link.drive(wait)?;
-        Ok(self.apply(events))
+        let cfg = &self.cfg;
+        let board = &mut self.board;
+        let started = &mut self.started;
+        let frozen = &mut self.frozen;
+        let chat = &mut self.chat;
+        let status = &mut self.status;
+        let pending = &self.pending_move;
+        let mut notes = Vec::new();
+        let events = self.link.drive_with_accept(wait, |msg| {
+            let result = match msg {
+                AppMessage::Chat { text, .. } if cfg.kind == AppKind::Chat => {
+                    let shown = escape_controls(text);
+                    if chat.len() >= 100 {
+                        chat.remove(0);
+                    }
+                    chat.push(ChatLine {
+                        from: cfg.role.peer(),
+                        text: shown.clone(),
+                        delivery: Delivery::Delivered,
+                        seq: 0,
+                    });
+                    *status = format!("peer: {shown}");
+                    Ok(())
+                }
+                AppMessage::Ctrl(GameCtrl::Start)
+                    if cfg.kind == AppKind::Game
+                        && !cfg.role.is_initiator()
+                        && !*started
+                        && !*frozen =>
+                {
+                    *started = true;
+                    *status = "peer started a match".into();
+                    Ok(())
+                }
+                AppMessage::Ctrl(GameCtrl::Abort)
+                    if cfg.kind == AppKind::Game && *started && !*frozen =>
+                {
+                    *frozen = true;
+                    *status = "peer aborted".into();
+                    Ok(())
+                }
+                AppMessage::Move { ply, square, mark }
+                    if cfg.kind == AppKind::Game
+                        && *started
+                        && !*frozen
+                        && pending.is_none()
+                        && *ply == board.ply()
+                        && *mark == cfg.role.peer().mark() =>
+                {
+                    board.play(*square, *mark).map(|outcome| {
+                        *status = match outcome {
+                            Outcome::Win(m) => format!("{} wins", m.glyph()),
+                            Outcome::Draw => "draw".into(),
+                            _ => format!("peer move {square} (ply {ply})"),
+                        };
+                    })
+                }
+                _ => Err(Error::InvalidInput(
+                    "invalid message for session state".into(),
+                )),
+            };
+            if let Err(e) = &result {
+                if cfg.kind == AppKind::Game {
+                    *frozen = true;
+                }
+                *status = format!("rejected peer message: {e}");
+            }
+            notes.push(status.clone());
+            result
+        })?;
+        notes.extend(self.apply(events));
+        Ok(notes)
     }
 
     pub fn interrupt(&mut self) {
@@ -145,6 +232,11 @@ impl<W: Wire> Session<W> {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             role: self.cfg.role,
+            session: self.link.session(),
+            board_compact: (self.cfg.kind == AppKind::Game).then(|| self.board.compact()),
+            ply: (self.cfg.kind == AppKind::Game).then(|| self.board.ply()),
+            started: self.started,
+            frozen: self.frozen,
             channel_label: self.cfg.channel.label().to_string(),
             simulated: !self.cfg.channel.is_physical(),
             link: self.link.state(),
@@ -169,6 +261,7 @@ impl<W: Wire> Session<W> {
 
     pub fn our_turn(&self) -> bool {
         self.cfg.kind == AppKind::Game
+            && self.started
             && !self.frozen
             && self.pending_move.is_none()
             && self.board.outcome() == Outcome::InProgress
@@ -178,6 +271,17 @@ impl<W: Wire> Session<W> {
 
     pub fn board(&self) -> &Board {
         &self.board
+    }
+
+    pub fn agent_request(&self, request_id: u64) -> Option<agent::AgentRequest> {
+        (self.cfg.agent && self.our_turn()).then(|| agent::AgentRequest {
+            session: self.link.session(),
+            generation: u64::from(self.board.ply()),
+            request_id,
+            board: self.board.compact(),
+            turn: self.board.turn().glyph().to_string(),
+            legal: self.board.legal_squares(),
+        })
     }
 
     pub fn try_agent_move(&mut self) -> Result<Option<u8>, Error> {
@@ -218,6 +322,18 @@ impl<W: Wire> Session<W> {
                     notes.push(self.status.clone());
                 }
                 LinkEvent::Delivery { seq, state } => {
+                    if self.pending_start == Some(seq) {
+                        match state {
+                            Delivery::Delivered => {
+                                self.started = true;
+                                self.pending_start = None;
+                            }
+                            Delivery::Unknown | Delivery::Failed => {
+                                self.frozen = true;
+                            }
+                            _ => {}
+                        }
+                    }
                     if let Some(line) = self.chat.iter_mut().find(|c| c.seq == seq) {
                         line.delivery = state;
                     }
@@ -233,7 +349,6 @@ impl<W: Wire> Session<W> {
                                     self.frozen = true;
                                     self.status =
                                         format!("move {square} {state}; board not committed");
-                                    self.pending_move = None;
                                 }
                                 _ => {}
                             }
@@ -241,51 +356,7 @@ impl<W: Wire> Session<W> {
                     }
                     notes.push(format!("seq {seq}: {state}"));
                 }
-                LinkEvent::Recv(AppMessage::Chat { text, .. }) => {
-                    let shown = escape_controls(&text);
-                    self.chat.push(ChatLine {
-                        from: self.cfg.role.peer(),
-                        text: shown.clone(),
-                        delivery: Delivery::Delivered,
-                        seq: 0,
-                    });
-                    notes.push(format!("peer: {shown}"));
-                }
-                LinkEvent::Recv(AppMessage::Move { ply, square, mark }) => {
-                    if ply != self.board.ply() || mark != self.cfg.role.peer().mark() {
-                        self.frozen = true;
-                        self.status = format!(
-                            "rejected peer move: unexpected ply or mark ({ply}, {})",
-                            mark.glyph()
-                        );
-                        notes.push(self.status.clone());
-                        continue;
-                    }
-                    match self.board.play(square, mark) {
-                        Ok(outcome) => {
-                            self.status = format!("peer move {square} (ply {ply})");
-                            if let Outcome::Win(m) = outcome {
-                                self.status = format!("{} wins", m.glyph());
-                            } else if outcome == Outcome::Draw {
-                                self.status = "draw".into();
-                            }
-                        }
-                        Err(e) => {
-                            self.frozen = true;
-                            self.status = format!("rejected peer move: {e}");
-                        }
-                    }
-                    notes.push(self.status.clone());
-                }
-                LinkEvent::Recv(AppMessage::Ctrl(GameCtrl::Start)) => {
-                    self.started = true;
-                    self.status = "peer started a match".into();
-                    notes.push(self.status.clone());
-                }
-                LinkEvent::Recv(AppMessage::Ctrl(GameCtrl::Abort)) => {
-                    self.status = "peer aborted".into();
-                    notes.push(self.status.clone());
-                }
+                LinkEvent::Recv(_) => {} // Already applied by drive_with_accept.
                 LinkEvent::Info(s) | LinkEvent::Error(s) => {
                     self.status = s.clone();
                     notes.push(s);
