@@ -56,7 +56,8 @@ class LauncherTests(unittest.TestCase):
 
     def test_hosted_and_secret_absence(self):
         with patch.dict(os.environ, {'CCC_HOSTED_OPT_IN': '1', 'OPENCODE_GO_API_KEY': 'secret-value'}), \
-             patch.object(launch, 'docker', self.docker), patch.object(launch.subprocess, 'run'):
+             patch.object(launch, 'docker', self.docker), patch.object(launch.subprocess, 'run'), \
+             patch.object(launch, 'verify_peer_paths', return_value={'ipv6': 'disabled'}):
             launch.launch(self.args('agents', 'opencode-go'))
             text = next(launch.STATE.glob('*.json')).read_text()
             self.assertNotIn('secret-value', text + repr(self.calls))
@@ -66,7 +67,8 @@ class LauncherTests(unittest.TestCase):
     def test_gateway_alias_and_model(self):
         with patch.dict(os.environ, {'CCC_HOSTED_OPT_IN': '1', 'AI_GATEWAY_API_KEY': '',
                                      'VERCEL_AI_GATEWAY_API_KEY': 'gateway-secret'}), \
-             patch.object(launch, 'docker', self.docker), patch.object(launch.subprocess, 'run'):
+             patch.object(launch, 'docker', self.docker), patch.object(launch.subprocess, 'run'), \
+             patch.object(launch, 'verify_peer_paths', return_value={'ipv6': 'disabled'}):
             launch.launch(self.args('agents', 'vercel-ai-gateway'))
             text = next(launch.STATE.glob('*.json')).read_text()
             self.assertEqual(json.loads(text)['model'], 'reflection/beam-free')
@@ -111,8 +113,11 @@ class LauncherTests(unittest.TestCase):
                 self.returncode = 0
             def communicate(self, timeout):
                 if self.role == 'a':
-                    return ('sender payload test: [01, 02, 03, 04]', '')
-                return ('received bytes (hex): 01020304', '')
+                    return (json.dumps({'schema_version': 1, 'role': 'A', 'requested_bits': 32, 'payload_hex': '01020304'}), '')
+                return (json.dumps({'schema_version': 1, 'requested_bits': 32, 'requested_trials': 1,
+                                    'attempted_trials': 1, 'completed_trials': 1, 'usable': False,
+                                    'trials': [{'outcome': 'decoded', 'decoded_bytes': 4,
+                                                'crc_valid': True, 'decoded_hex': '01020304'}]}), '')
             def poll(self):
                 return 0
             def wait(self):
@@ -121,6 +126,57 @@ class LauncherTests(unittest.TestCase):
              patch.object(launch.time, 'sleep'), patch.object(launch, 'cleanup') as cleanup:
             launch.preflight('a' * 32, 'sha256:' + 'a' * 64, 'cache', 0)
             cleanup.assert_called_once_with('a' * 32)
+
+    def test_live_controls_and_cleanup(self):
+        def run_case(outcomes, expected_error=None, fail_create=False):
+            calls = []
+            responses = iter(outcomes)
+            def fake(*args, **kwargs):
+                calls.append(args)
+                if args[:2] == ('network', 'inspect'):
+                    return json.dumps([{'EnableIPv6': False}])
+                if args[0] == 'inspect':
+                    name = args[-1]
+                    net = 'net-a' if name.endswith('-a') else 'net-b'
+                    return json.dumps({net: {'IPAddress': '172.20.0.2'}})
+                if args[0] == 'create' and fail_create and 'control-positive-b' in ' '.join(args):
+                    raise RuntimeError('create failed')
+                if args[:2] == ('start', '-a'):
+                    return next(responses)
+                return 'ok'
+            with patch.object(launch, 'docker', fake), patch.object(launch.time, 'sleep'):
+                if expected_error:
+                    with self.assertRaisesRegex(RuntimeError, expected_error):
+                        launch.verify_peer_paths('a' * 32, 'image', 0, ['net-a', 'net-b'])
+                else:
+                    result = launch.verify_peer_paths('a' * 32, 'image', 0, ['net-a', 'net-b'])
+                    self.assertEqual(result['ipv6'], 'disabled')
+            creates = [c[c.index('--name') + 1] for c in calls if c[0] == 'create' and not (fail_create and 'control-positive-b' in ' '.join(c))]
+            removes = [c[-1] for c in calls if c[:2] == ('rm', '-f')]
+            self.assertEqual(removes, list(reversed(creates)))
+        run_case(['CONNECTED', 'CONNECTED', 'ENETUNREACH', 'ETIMEDOUT'])
+        run_case(['ECONNREFUSED'], 'positive')
+        run_case(['CONNECTED', 'CONNECTED', 'ECONNREFUSED', 'ETIMEDOUT'], 'not explicitly denied')
+        run_case(['CONNECTED'], 'create failed', True)
+
+    def test_ipv6_refused_and_cleanup_error(self):
+        with patch.object(launch, 'docker', return_value='[{"EnableIPv6": true}]'):
+            with self.assertRaisesRegex(RuntimeError, 'IPv6'):
+                launch.verify_peer_paths('a' * 32, 'image', 0, ['net-a', 'net-b'])
+        calls = []
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('network', 'inspect'):
+                return '[{"EnableIPv6": false}]'
+            if args[0] == 'inspect':
+                raise RuntimeError('inspect failure')
+            if args[0] == 'rm':
+                raise RuntimeError('remove failure')
+            return 'ok'
+        with patch.object(launch, 'docker', fake):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup incomplete'):
+                launch.verify_peer_paths('a' * 32, 'image', 0, ['net-a', 'net-b'])
+            self.assertTrue(any(c[0] == 'rm' for c in calls))
 
     def test_invalid_stop(self):
         with self.assertRaisesRegex(RuntimeError, 'invalid run ID'):

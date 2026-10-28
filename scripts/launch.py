@@ -87,6 +87,83 @@ def common(run, cpu):
             '--pids-limit', '128', '--cpuset-cpus', str(cpu)]
 
 
+def parse_probe_reports(sender, receiver):
+    """Validate versioned, receiver-blind probe reports after both processes exit."""
+    try:
+        a, b = json.loads(sender), json.loads(receiver)
+        if a['schema_version'] != 1 or b['schema_version'] != 1 or a['role'].upper() != 'A':
+            raise ValueError('unsupported report')
+        if a['requested_bits'] != 32 or b['requested_bits'] != 32:
+            raise ValueError('unexpected bit count')
+        if b['completed_trials'] != 1 or b['attempted_trials'] != 1 or b['requested_trials'] != 1:
+            raise ValueError('incomplete trials')
+        trial, = b['trials']
+        if trial['outcome'] != 'decoded' or trial['crc_valid'] is not True or trial['decoded_bytes'] != 4:
+            raise ValueError('invalid trial')
+        expected = bytes.fromhex(a['payload_hex'])
+        actual = bytes.fromhex(trial.get('decoded_bytes_hex', trial.get('decoded_hex', '')))
+        if len(expected) != 4 or expected != actual:
+            raise ValueError('payload mismatch')
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise RuntimeError('physical preflight report invalid or payload mismatch') from e
+
+
+LISTENER = "require('net').createServer(s=>s.end()).listen(43719,'0.0.0.0')"
+CONTROL = """const s=require('net').connect({host:process.argv[1],port:43719});
+let done=false; function finish(x){if(!done){done=true; console.log(x); s.destroy();}}
+s.setTimeout(4000,()=>finish('ETIMEDOUT')); s.on('connect',()=>finish('CONNECTED'));
+s.on('error',e=>finish(e.code||'ERROR'));"""
+
+
+def verify_peer_paths(run, image, cpu, nets):
+    """Test only disposable listeners; all controls are removed even on failure."""
+    created = []
+    try:
+        for net in nets:
+            raw = docker('network', 'inspect', net)
+            info = json.loads(raw)
+            if len(info) != 1 or info[0].get('EnableIPv6') is not False:
+                raise RuntimeError('IPv6 enabled or unknown; live verification refused')
+        addresses = []
+        for role, net in zip(('a', 'b'), nets):
+            name = f'ccc-{run}-listener-{role}'
+            docker('create', '--name', name, '--network', net, *common(run, cpu),
+                   '--entrypoint', 'node', image, '-e', LISTENER)
+            created.append(name)
+            docker('start', name)
+            raw = docker('inspect', '--format', '{{json .NetworkSettings.Networks}}', name)
+            address = json.loads(raw)[net]['IPAddress']
+            if not address:
+                raise RuntimeError('listener IP unavailable')
+            addresses.append(address)
+        def control(source, target, label):
+            name = f'ccc-{run}-control-{label}'
+            docker('create', '--name', name, '--network', nets[source], *common(run, cpu),
+                   '--entrypoint', 'node', image, '-e', CONTROL, addresses[target])
+            created.append(name)
+            return docker('start', '-a', name, timeout=15)
+        # Allow Node to bind; refusal remains an inconclusive failure.
+        time.sleep(1)
+        for i, role in enumerate(('a', 'b')):
+            result = control(i, i, 'positive-' + role)
+            if result != 'CONNECTED':
+                raise RuntimeError(f'positive {role} listener control inconclusive: {result}')
+        results = [control(0, 1, 'a-to-b'), control(1, 0, 'b-to-a')]
+        if any(result not in ('ENETUNREACH', 'EHOSTUNREACH', 'ETIMEDOUT') for result in results):
+            raise RuntimeError('cross-peer control not explicitly denied or timed out')
+        return {'version': 1, 'ipv6': 'disabled', 'positive': ['connected', 'connected'],
+                'a_to_b': results[0], 'b_to_a': results[1], 'scope': 'listener-ip-tcp'}
+    finally:
+        errors = []
+        for name in reversed(created):
+            try:
+                docker('rm', '-f', name)
+            except RuntimeError as e:
+                errors.append(str(e))
+        if errors:
+            raise RuntimeError('disposable control cleanup incomplete: ' + '; '.join(errors))
+
+
 def preflight(run, image, channel, cpu):
     # Receiver-blind comparison happens on the host only after both peers exit.
     base = ['docker', 'run', '--network', 'none', *common(run, cpu), image,
@@ -105,14 +182,7 @@ def preflight(run, image, channel, cpu):
             if p.returncode:
                 raise RuntimeError('physical preflight process failed')
             outputs.append(out)
-        sent = re.search(r'sender payload .*?: \[([0-9a-fA-F, ]*)\]', outputs[1])
-        recv = re.search(r'received bytes \(hex\): ([0-9a-fA-F]+)', outputs[0])
-        if not sent or not recv:
-            raise RuntimeError('physical preflight payload missing')
-        expected = bytes.fromhex(sent.group(1).replace(',', ' '))
-        actual = bytes.fromhex(recv.group(1))
-        if len(expected) != 4 or expected != actual:
-            raise RuntimeError('physical preflight payload length or content mismatch')
+        parse_probe_reports(outputs[1], outputs[0])
         print('Preflight: matching receiver-blind 32-bit probe; not a reliability guarantee.')
     except subprocess.TimeoutExpired as e:
         raise RuntimeError('physical preflight timed out after 300 seconds') from e
@@ -175,10 +245,15 @@ def launch(args):
         names = [f'ccc-{run}-{role}' for role in ('a', 'b')]
         nets = ['none', 'none']
         if hosted:
-            print('WARNING: separate egress bridges are not destination firewalls; live peer isolation UNVERIFIED.')
+            print('WARNING: separate egress bridges are not destination firewalls.')
             nets = [f'ccc-{run}-net-{role}' for role in ('a', 'b')]
             for net in nets:
                 docker('network', 'create', '--label', f'{LABEL}={run}', net)
+            manifest['peer_path_test'] = verify_peer_paths(run, image, args.cpu, nets)
+            with path.open('w', encoding='utf-8') as f:
+                json.dump(manifest, f)
+                f.write('\n')
+            print('Live controls: both same-network listeners reachable; A-to-B and B-to-A listener IP TCP paths denied or timed out; IPv6 disabled.')
         mode = 'game' if hosted else args.command
         for role, name, net in zip(('a', 'b'), names, nets):
             docker('create', '-it', '--name', name, '--network', net, *common(run, args.cpu),
@@ -204,6 +279,29 @@ def launch(args):
         raise
 
 
+def doctor():
+    info = json.loads(docker('info', '--format', '{{json .}}'))
+    arch = info.get('Architecture', 'unknown')
+    memory = info.get('MemTotal', 0)
+    cpus = info.get('NCPU', 0)
+    print(f'Docker guest: architecture={arch}, memory={memory} bytes, CPUs={cpus}')
+    if arch not in ('arm64', 'aarch64', 'x86_64', 'amd64'):
+        print('WARNING: unsupported or unknown guest architecture')
+    if not isinstance(memory, int) or memory < 2 * 768 * 1024 * 1024:
+        print('WARNING: guest memory is below the two-container limit (1.5 GiB); allow additional overhead')
+    for image, command in (('cpu-cache-chat:local', './docker/build.sh'),
+                           ('cpu-cache-chat:agent', './docker/build-agent.sh')):
+        if docker('image', 'inspect', image, check=False) is None:
+            print(f'Missing image {image}; build: {command}')
+        else:
+            print(f'Image available: {image}')
+    for provider, keys in (('opencode-go', ('OPENCODE_GO_API_KEY',)),
+                           ('vercel-ai-gateway', ('AI_GATEWAY_API_KEY', 'VERCEL_AI_GATEWAY_API_KEY'))):
+        print(f'Provider {provider}: credential ' + ('present' if any(os.environ.get(k) for k in keys) else 'missing (' + ' or '.join(keys) + ')'))
+    print('Hosted runs also require CCC_HOSTED_OPT_IN=1; credentials and provider reachability are not verified.')
+    print('Physical channel and live network policy are not tested by doctor.')
+
+
 def main():
     parser = argparse.ArgumentParser(description='Isolated physical-channel demo launcher')
     sub = parser.add_subparsers(dest='command', required=True)
@@ -220,9 +318,7 @@ def main():
             p.add_argument('--provider', choices=('opencode-go', 'vercel-ai-gateway'), required=True)
     args = parser.parse_args()
     if args.command == 'doctor':
-        docker('info')
-        print(f'Docker reachable; guest CPUs: {docker("info", "--format", "{{.NCPU}}")}; preset: {PRESET}')
-        print('Image availability, hosted credentials, and physical channel are checked at launch, not by doctor.')
+        doctor()
     elif args.command == 'stop':
         stop(args.run_id)
     else:
