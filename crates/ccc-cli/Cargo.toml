@@ -3,6 +3,8 @@ name = "cpu-cache-chat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 description = "Terminal clients for cpu-cache-chat"
 publish = false
 

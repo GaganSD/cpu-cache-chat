@@ -3,6 +3,8 @@ name = "ccc-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 description = "Framing and reliability for cpu-cache-chat"
 publish = false
 

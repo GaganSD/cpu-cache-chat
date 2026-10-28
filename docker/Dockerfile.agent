@@ -7,7 +7,13 @@
 ARG CCC_IMAGE=cpu-cache-chat:local
 FROM ${CCC_IMAGE} AS ccc
 
-FROM node:22-bookworm-slim
+# Override with a verified digest for release builds.
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE}
+ARG SOURCE_URL=https://github.com/GaganSD/cpu-cache-chat
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.source=${SOURCE_URL} \
+      org.opencontainers.image.revision=${VCS_REF}
 COPY --from=ccc /usr/local/bin/cpu-cache-chat /usr/local/bin/cpu-cache-chat
 COPY --from=ccc /usr/local/bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 WORKDIR /opt/ccc/agent

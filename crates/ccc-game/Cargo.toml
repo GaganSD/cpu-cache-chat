@@ -3,6 +3,8 @@ name = "ccc-game"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
 description = "Tic-tac-toe rules for cpu-cache-chat"
 publish = false
 
