@@ -1,7 +1,7 @@
 mod ui;
 mod worker;
 
-use std::io::{self, BufRead};
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,7 +131,10 @@ impl ChannelArg {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("cpu-cache-chat: {e}");
+        eprintln!(
+            "cpu-cache-chat: {}",
+            ccc_app::safe_diagnostic(&e.to_string())
+        );
         std::process::exit(1);
     }
 }
@@ -188,7 +191,7 @@ fn client(
 fn plain_loop(
     cfg: &RuntimeConfig,
     stop: Arc<AtomicBool>,
-    commands: std::sync::mpsc::Sender<String>,
+    commands: std::sync::mpsc::SyncSender<String>,
     updates: std::sync::mpsc::Receiver<worker::Update>,
 ) -> Result<(), Error> {
     println!(
@@ -211,20 +214,32 @@ fn plain_loop(
     );
     let input_stop = stop.clone();
     std::thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            match line {
-                Ok(line) if line.trim() == "/q" => {
+        let mut line = Vec::new();
+        let mut overflow = false;
+        for byte in io::stdin().lock().bytes() {
+            let Ok(byte) = byte else { break };
+            if byte != b'\n' {
+                if line.len() < ccc_core::MAX_CHAT_BYTES {
+                    line.push(byte);
+                } else {
+                    overflow = true;
+                }
+                continue;
+            }
+            if overflow {
+                eprintln!("input too large");
+            } else if let Ok(text) = String::from_utf8(std::mem::take(&mut line)) {
+                if text.trim() == "/q" {
                     input_stop.store(true, Ordering::SeqCst);
                     break;
                 }
-                Ok(line) => {
-                    println!("queued: {}", escape_controls(&line));
-                    if commands.send(line).is_err() {
-                        break;
-                    }
+                match commands.try_send(text) {
+                    Ok(()) => {}
+                    Err(_) => eprintln!("command queue full or session unavailable"),
                 }
-                Err(_) => break,
             }
+            line.clear();
+            overflow = false;
         }
     });
     let mut previous = String::new();

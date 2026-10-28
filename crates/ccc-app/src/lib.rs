@@ -425,6 +425,21 @@ pub fn escape_controls(text: &str) -> String {
     out
 }
 
+/// Escape terminal controls and remove configured secret environment values.
+pub fn safe_diagnostic(text: &str) -> String {
+    let mut value = text.to_owned();
+    for (name, secret) in std::env::vars_os() {
+        let name = name.to_string_lossy().to_ascii_uppercase();
+        let secret = secret.to_string_lossy();
+        if !secret.is_empty()
+            && (name.contains("KEY") || name.contains("TOKEN") || name.contains("SECRET"))
+        {
+            value = value.replace(secret.as_ref(), "[redacted]");
+        }
+    }
+    escape_controls(&value)
+}
+
 fn parse_square(text: &str) -> Result<u8, Error> {
     let t = text.trim();
     let v: serde_json::Value = serde_json::from_str(t)

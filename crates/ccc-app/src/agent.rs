@@ -322,7 +322,7 @@ fn run(
     if !status.success() {
         return Err(Error::Agent(format!(
             "agent exit {status}: {}",
-            crate::escape_controls(&String::from_utf8_lossy(&stderr))
+            crate::safe_diagnostic(&String::from_utf8_lossy(&stderr))
         )));
     }
     let square = super::parse_square(

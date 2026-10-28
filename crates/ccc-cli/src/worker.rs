@@ -54,16 +54,23 @@ pub fn start(
     stop: Arc<AtomicBool>,
     events_path: Option<String>,
 ) -> (
-    mpsc::Sender<String>,
+    mpsc::SyncSender<String>,
     mpsc::Receiver<Update>,
     std::thread::JoinHandle<()>,
 ) {
-    let (commands, input) = mpsc::channel::<String>();
+    let (commands, input) = mpsc::sync_channel::<String>(64);
     let (output, updates) = mpsc::channel();
     let handle = std::thread::spawn(move || {
         use std::io::Write;
         let mut evidence = match events_path {
-            Some(path) => match std::fs::File::create(path) {
+            Some(path) => match {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+            } {
                 Ok(file) => Some(file),
                 Err(e) => {
                     let _ = output.send(Update::Fatal(Error::Io(e.to_string())));
@@ -127,7 +134,8 @@ pub fn start(
         let mut job: Option<ccc_app::agent::AgentJob> = None;
         let mut request_id = 0u64;
         while !stop.load(Ordering::SeqCst) {
-            while let Ok(line) = input.try_recv() {
+            for _ in 0..64 {
+                let Ok(line) = input.try_recv() else { break };
                 let result = match cfg.kind {
                     AppKind::Chat => session.queue_chat(line).map(|_| ()),
                     AppKind::Game => line
@@ -153,21 +161,11 @@ pub fn start(
                                 if std::env::var_os("CCC_AGENT_DEBUG").is_some()
                                     && !result.stderr.is_empty()
                                 {
-                                    let mut transcript =
-                                        String::from_utf8_lossy(&result.stderr).into_owned();
-                                    for (name, value) in std::env::vars() {
-                                        let name = name.to_ascii_uppercase();
-                                        if !value.is_empty()
-                                            && (name.contains("KEY")
-                                                || name.contains("TOKEN")
-                                                || name.contains("SECRET"))
-                                        {
-                                            transcript = transcript.replace(&value, "[redacted]");
-                                        }
-                                    }
+                                    let transcript = ccc_app::safe_diagnostic(
+                                        &String::from_utf8_lossy(&result.stderr),
+                                    );
                                     let _ = output.send(Update::Note(format!(
-                                        "agent transcript: {}",
-                                        ccc_app::escape_controls(&transcript)
+                                        "agent transcript: {transcript}"
                                     )));
                                 }
                                 if let Some(current) = session.agent_request(request_id) {

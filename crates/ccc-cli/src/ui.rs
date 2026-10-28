@@ -31,7 +31,7 @@ impl Drop for TerminalGuard {
 pub fn run(
     cfg: RuntimeConfig,
     stop: Arc<AtomicBool>,
-    commands: mpsc::Sender<String>,
+    commands: mpsc::SyncSender<String>,
     updates: mpsc::Receiver<Update>,
 ) -> Result<(), Error> {
     enable_raw_mode().map_err(|e| Error::Io(e.to_string()))?;
@@ -116,15 +116,24 @@ pub fn run(
                     ));
                 }
                 f.render_widget(
-                    Paragraph::new(body).wrap(Wrap { trim: false }).block(
-                        Block::default()
-                            .title(if cfg.kind == AppKind::Game {
-                                " board "
-                            } else {
-                                " chat "
-                            })
-                            .borders(Borders::ALL),
-                    ),
+                    Paragraph::new(body.clone())
+                        .scroll((
+                            body.lines()
+                                .count()
+                                .saturating_sub(chunks[0].height.saturating_sub(2) as usize)
+                                .min(u16::MAX as usize) as u16,
+                            0,
+                        ))
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .title(if cfg.kind == AppKind::Game {
+                                    " board "
+                                } else {
+                                    " chat "
+                                })
+                                .borders(Borders::ALL),
+                        ),
                     chunks[0],
                 );
                 let link = if failed {
@@ -191,7 +200,7 @@ pub fn run(
                         }
                         KeyCode::Enter if !input.trim().is_empty() => {
                             let line = std::mem::take(&mut input);
-                            if commands.send(line.clone()).is_ok() {
+                            if commands.try_send(line.clone()).is_ok() {
                                 pending.push_back(line);
                             } else {
                                 log.push("session unavailable".into());
