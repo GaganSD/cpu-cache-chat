@@ -193,9 +193,9 @@ fn client(
         ui::run(cfg, stop.clone(), commands, updates)
     };
     stop.store(true, Ordering::SeqCst);
-    if worker.join().is_err() {
-        return Err(Error::Io("worker panicked".into()));
-    }
+    worker
+        .join()
+        .map_err(|_| Error::Io("worker panicked".into()))??;
     result
 }
 
@@ -291,7 +291,10 @@ fn plain_loop(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(Error::Io("worker disconnected".into()))
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                return Err(Error::Io("worker disconnected".into()));
             }
         }
     }

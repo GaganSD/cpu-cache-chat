@@ -64,7 +64,10 @@ pub fn run(
                 Ok(update) => update,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(Error::Io("worker disconnected".into()))
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    return Err(Error::Io("worker disconnected".into()));
                 }
             };
             match update {

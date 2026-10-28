@@ -5,7 +5,7 @@ use std::time::Duration;
 use ccc_core::{Delivery, Error};
 use ccc_protocol::{encode_frame, Frame, FrameType, Wire};
 
-use super::{update_channel, ObservedWire, Update};
+use super::{spawn_worker, stopped_event, update_channel, ObservedWire, Update};
 
 #[test]
 fn slow_ui_snapshots_coalesce_and_overflow_is_fatal() {
@@ -36,7 +36,53 @@ fn slow_ui_snapshots_coalesce_and_overflow_is_fatal() {
     assert!(stop.load(Ordering::SeqCst));
     assert!(matches!(
         updates.try_recv(),
-        Ok(Update::Fatal(Error::Channel(_)))
+        Ok(Update::Fatal(Error::Io(_)))
+    ));
+}
+
+#[test]
+fn fatal_outcome_survives_frontend_quit_and_overflow_marks_evidence_unsuccessful() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (output, updates) = update_channel(stop);
+    for id in 0..128 {
+        output.send(Update::Accepted(id)).unwrap();
+    }
+    assert!(output.send(Update::Accepted(128)).is_err());
+    drop(updates);
+    assert_eq!(
+        stopped_event(&output, true),
+        serde_json::json!({"type":"stopped","successful":false,"evidence_complete":false})
+    );
+    assert!(!output.successful());
+    assert!(matches!(output.take_failure(), Some(Error::Channel(_))));
+
+    let (output, updates) = update_channel(Arc::new(AtomicBool::new(false)));
+    drop(updates);
+    output
+        .send(Update::Fatal(Error::Corrupt("racing fatal")))
+        .unwrap();
+    assert!(!output.successful());
+    assert!(matches!(
+        output.take_failure(),
+        Some(Error::Corrupt("racing fatal"))
+    ));
+}
+
+#[test]
+fn worker_join_reports_fatal_after_frontend_quits() {
+    let (output, updates) = update_channel(Arc::new(AtomicBool::new(false)));
+    let (resume, wait) = mpsc::channel();
+    let worker = spawn_worker(output, move |output| {
+        wait.recv().unwrap();
+        output
+            .send(Update::Fatal(Error::Corrupt("racing fatal")))
+            .unwrap();
+    });
+    drop(updates);
+    resume.send(()).unwrap();
+    assert!(matches!(
+        worker.join().unwrap(),
+        Err(Error::Corrupt("racing fatal"))
     ));
 }
 

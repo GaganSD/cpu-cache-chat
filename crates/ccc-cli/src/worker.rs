@@ -25,6 +25,7 @@ struct Output {
     events: mpsc::SyncSender<Update>,
     snapshot: Arc<Mutex<Option<Snapshot>>>,
     fatal: mpsc::SyncSender<Error>,
+    failure: Arc<Mutex<Option<Error>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -35,6 +36,23 @@ pub struct Updates {
 }
 
 impl Output {
+    fn successful(&self) -> bool {
+        self.failure.lock().unwrap().is_none()
+    }
+
+    fn take_failure(&self) -> Option<Error> {
+        self.failure.lock().unwrap().take()
+    }
+
+    fn fail(&self, error: Error) {
+        let mut failure = self.failure.lock().unwrap();
+        if failure.is_none() {
+            let _ = self.fatal.try_send(Error::Io(error.to_string()));
+            *failure = Some(error);
+        }
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
     fn send(&self, update: Update) -> Result<(), ()> {
         fn bound(mut text: String) -> String {
             if text.len() > 4096 {
@@ -58,19 +76,22 @@ impl Output {
                 }
             }
             Update::Fatal(error) => {
-                let _ = self.fatal.try_send(error);
-                self.stop.store(true, Ordering::SeqCst);
+                self.fail(error);
             }
             event => {
                 if let Err(error) = self.events.try_send(event) {
-                    let _ = self.fatal.try_send(match error {
+                    match error {
                         mpsc::TrySendError::Full(_) => {
-                            Error::Channel("UI critical event queue overflow".into())
+                            self.fail(Error::Channel("UI critical event queue overflow".into()));
+                            return Err(());
                         }
-                        mpsc::TrySendError::Disconnected(_) => Error::Disconnected,
-                    });
-                    self.stop.store(true, Ordering::SeqCst);
-                    return Err(());
+                        mpsc::TrySendError::Disconnected(_) if self.stop.load(Ordering::SeqCst) => {
+                        }
+                        mpsc::TrySendError::Disconnected(_) => {
+                            self.fail(Error::Disconnected);
+                            return Err(());
+                        }
+                    }
                 }
             }
         }
@@ -102,6 +123,7 @@ fn update_channel(stop: Arc<AtomicBool>) -> (Output, Updates) {
             events,
             snapshot: snapshot.clone(),
             fatal,
+            failure: Arc::new(Mutex::new(None)),
             stop,
         },
         Updates {
@@ -110,6 +132,11 @@ fn update_channel(stop: Arc<AtomicBool>) -> (Output, Updates) {
             fatal: fatal_receiver,
         },
     )
+}
+
+fn stopped_event(output: &Output, successful: bool) -> serde_json::Value {
+    let successful = successful && output.successful();
+    serde_json::json!({"type":"stopped","successful":successful,"evidence_complete":successful})
 }
 
 struct ObservedWire {
@@ -149,6 +176,19 @@ impl Wire for ObservedWire {
 #[path = "../tests/internal/worker.rs"]
 mod tests;
 
+fn spawn_worker(
+    output: Output,
+    run: impl FnOnce(&Output) + Send + 'static,
+) -> std::thread::JoinHandle<Result<(), Error>> {
+    std::thread::spawn(move || {
+        run(&output);
+        match output.take_failure() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
+}
+
 pub fn start(
     cfg: RuntimeConfig,
     stop: Arc<AtomicBool>,
@@ -156,11 +196,11 @@ pub fn start(
 ) -> (
     mpsc::SyncSender<Command>,
     Updates,
-    std::thread::JoinHandle<()>,
+    std::thread::JoinHandle<Result<(), Error>>,
 ) {
     let (commands, input) = mpsc::sync_channel::<Command>(32);
     let (output, updates) = update_channel(stop.clone());
-    let handle = std::thread::spawn(move || {
+    let handle = spawn_worker(output, move |output| {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut evidence = match events_path {
@@ -198,6 +238,7 @@ pub fn start(
         };
         let wire = match ccc_channel::open_wire(&cfg, stop.clone()) {
             Ok(wire) => wire,
+            Err(Error::Interrupted) if stop.load(Ordering::SeqCst) && output.successful() => return,
             Err(e) => {
                 let _ = output.send(Update::Fatal(e));
                 return;
@@ -227,6 +268,7 @@ pub fn start(
                     }
                 }
             }
+            Err(Error::Interrupted) if stop.load(Ordering::SeqCst) && output.successful() => return,
             Err(e) => {
                 let _ = output.send(Update::Fatal(e));
                 return;
@@ -306,6 +348,11 @@ pub fn start(
                                     }
                                 }
                             }
+                            Err(Error::Interrupted)
+                                if stop.load(Ordering::SeqCst) && output.successful() =>
+                            {
+                                break
+                            }
                             Err(e) => {
                                 let _ = output.send(Update::Fatal(e));
                                 successful = false;
@@ -361,6 +408,9 @@ pub fn start(
                         break;
                     }
                 }
+                Err(Error::Interrupted) if stop.load(Ordering::SeqCst) && output.successful() => {
+                    break
+                }
                 Err(e) => {
                     let _ = output.send(Update::Fatal(e));
                     successful = false;
@@ -401,9 +451,7 @@ pub fn start(
             let _ = output.send(Update::Snapshot(snapshot));
         }
         session.interrupt();
-        if let Err(e) = emit(
-            serde_json::json!({"type":"stopped","successful":successful,"evidence_complete":successful}),
-        ) {
+        if let Err(e) = emit(stopped_event(output, successful)) {
             let _ = output.send(Update::Fatal(e));
         }
     });
