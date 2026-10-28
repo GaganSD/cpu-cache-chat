@@ -76,9 +76,9 @@ if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
 
 mkfifo "$workdir/a.in" "$workdir/b.in"
 exec 3<>"$workdir/a.in" 4<>"$workdir/b.in"
-docker create -i --name "$a" "${common[@]}" "$IMAGE" game --role a --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
+docker create -i --name "$a" "${common[@]}" "$IMAGE" game --role a --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" --events-stdout >/dev/null
 owned_a=1
-docker create -i --name "$b" "${common[@]}" "$IMAGE" game --role b --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" >/dev/null
+docker create -i --name "$b" "${common[@]}" "$IMAGE" game --role b --channel "$CHANNEL" --plain --slot-ms "$SLOT_MS" --events-stdout >/dev/null
 owned_b=1
 "$ROOT/scripts/inspect-isolation.sh" "$a" "$b" | tee "$workdir/inspect-isolation.txt"
 docker start -a -i "$a" <"$workdir/a.in" >"$workdir/a.out" 2>"$workdir/a.err" & A_PID=$!
@@ -170,6 +170,11 @@ for side in a b; do
   wait_for "$workdir/$side.out" ' X | O | 3'
   wait_for "$workdir/$side.out" ' 7 | O | X'
 done
-echo "PASS docker $CHANNEL game: legal moves both directions, illegal move rejected, X wins on both boards"
 printf '/q\n' >&3; printf '/q\n' >&4
 wait "$A_PID" "$B_PID"
+A_PID=''; B_PID=''
+# Authoritative verdict: strict per-peer canonical events, replayed legally.
+sed -n 's/^CCC_EVENT //p' "$workdir/a.out" > "$workdir/a.jsonl"
+sed -n 's/^CCC_EVENT //p' "$workdir/b.out" > "$workdir/b.jsonl"
+"$ROOT/target/release/ccc-verify-game" "$workdir/a.jsonl" "$workdir/b.jsonl" | tee "$workdir/verdict.json"
+echo "PASS docker $CHANNEL game: legal moves, illegal rejected locally, verified equal boards"
