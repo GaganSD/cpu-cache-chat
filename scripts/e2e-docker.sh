@@ -10,7 +10,9 @@ CPUSET="${CPUSET:-0}"
 WAIT_SECONDS="${WAIT_SECONDS:-60}"
 [[ "$CHANNEL" == cpu || "$CHANNEL" == cache ]] || { echo 'CHANNEL must be cpu or cache' >&2; exit 1; }
 [[ "$MODE" == chat ]] || { echo 'e2e-docker currently supports MODE=chat only' >&2; exit 1; }
-[[ "$SLOT_MS" =~ ^[0-9]{1,3}$ ]] && (( 10#$SLOT_MS >= 1 && 10#$SLOT_MS <= 500 )) || { echo 'SLOT_MS must be 1..500' >&2; exit 1; }
+if [[ ! "$SLOT_MS" =~ ^[0-9]{1,3}$ ]] || (( 10#$SLOT_MS < 1 || 10#$SLOT_MS > 500 )); then
+  echo 'SLOT_MS must be 1..500' >&2; exit 1
+fi
 SLOT_MS=$((10#$SLOT_MS))
 # Three complete empty protocol control frame windows, rounded up to seconds.
 SILENT_SECONDS=$(((3 * (156 + 13 * 19) * SLOT_MS + 999) / 1000))
@@ -72,7 +74,7 @@ done
 docker info >/dev/null
 docker image inspect "$IMAGE" >/dev/null
 common=(--init --network none --ipc private --read-only
-  --tmpfs /tmp:rw,nosuid,size=64m --security-opt no-new-privileges
+  --tmpfs '/tmp:rw,nosuid,size=64m' --security-opt no-new-privileges
   --cap-drop ALL --user 65532:65532 --memory 256m --pids-limit 128 --cpuset-cpus "$CPUSET")
 if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
 

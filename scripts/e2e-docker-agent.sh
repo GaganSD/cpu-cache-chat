@@ -42,6 +42,8 @@ a="$prefix-a"; b="$prefix-b"
 net_a="$prefix-net-a"; net_b="$prefix-net-b"
 owned_a=0; owned_b=0; owned_net_a=0; owned_net_b=0
 repo_head=unknown; repo_dirty=unknown
+# Invoked by the EXIT trap.
+# shellcheck disable=SC2329
 cleanup() {
   local result=$? pid
   exec 3>&- 4>&- || true
@@ -96,7 +98,7 @@ repo_dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -q . && echo y
 docker network create "$net_a" >/dev/null; owned_net_a=1
 docker network create "$net_b" >/dev/null; owned_net_b=1
 common=(--init --ipc private --read-only
-  --tmpfs /tmp:rw,nosuid,size=64m --security-opt no-new-privileges
+  --tmpfs '/tmp:rw,nosuid,size=64m' --security-opt no-new-privileges
   --cap-drop ALL --user 65532:65532 --memory 768m --pids-limit 128 --cpuset-cpus "$CPUSET"
   --env CCC_AGENT_PROVIDER --env OPENCODE_GO_API_KEY)
 if [[ -n "${CCC_AGENT_MODEL:-}" ]]; then common+=(--env CCC_AGENT_MODEL); fi

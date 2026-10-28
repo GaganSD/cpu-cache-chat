@@ -70,7 +70,7 @@ done
 docker info >/dev/null
 docker image inspect "$IMAGE" >/dev/null
 common=(--init --network none --ipc private --read-only
-  --tmpfs /tmp:rw,nosuid,size=64m --security-opt no-new-privileges
+  --tmpfs '/tmp:rw,nosuid,size=64m' --security-opt no-new-privileges
   --cap-drop ALL --user 65532:65532 --memory 256m --pids-limit 128 --cpuset-cpus "$CPUSET")
 if [[ "${CCC_DEBUG:-}" == 1 ]]; then common+=(--env CCC_DEBUG=1); fi
 
@@ -122,12 +122,11 @@ wait_for "$workdir/b.out" 'link: connected'
 # locally (link degraded at the moment of typing). A delivery-unknown or a
 # rejected peer move is never retried: that is a protocol outcome, not typing.
 play_move() {
-  local fd="$1" sender_out="$2" square="$3" seq="$4" attempt baseline
-  for attempt in 1 2 3 4 5 6; do
+  local fd="$1" sender_out="$2" square="$3" seq="$4" baseline
+  for _ in 1 2 3 4 5 6; do
     baseline=$(grep -cE 'not your turn|occupied|game is already over' "$sender_out" || true)
     printf '%s\n' "$square" >&"$fd"
-    local i
-    for i in $(seq 1 "$WAIT_TRIES"); do
+    for _ in $(seq 1 "$WAIT_TRIES"); do
       if grep -Fxq "seq $seq: delivered" "$sender_out"; then return 0; fi
       if grep -Fxq "seq $seq: delivery unknown" "$sender_out"; then
         echo "FAIL: seq $seq delivery unknown for square $square" >&2

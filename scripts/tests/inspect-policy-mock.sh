@@ -12,6 +12,8 @@ h = dict(Privileged=False, PidMode='', IpcMode='private', UTSMode='', UsernsMode
 c = dict(Name='/test', HostConfig=h, Config=dict(User='65532:65532', ExposedPorts=None), NetworkSettings=dict(Networks={'none': {}}), Mounts=[])
 for name in ('a','b'): (p/name).write_text(json.dumps([c]))
 PY
+# The variables are intentionally expanded by the generated mock, not here.
+# shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' '[[ "$1" == inspect ]] || exit 2' 'command cat "$FIXTURES/$2"' > "$tmp/bin/docker"
 chmod +x "$tmp/bin/docker"
 export PATH="$tmp/bin:$PATH" FIXTURES="$tmp"
