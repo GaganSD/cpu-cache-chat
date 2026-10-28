@@ -216,7 +216,10 @@ impl<W: Wire> Session<W> {
                     Ok(())
                 }
                 AppMessage::Ctrl(GameCtrl::Abort)
-                    if cfg.kind == AppKind::Game && *started && !*frozen =>
+                    if cfg.kind == AppKind::Game
+                        && *started
+                        && !*frozen
+                        && board.outcome() == Outcome::InProgress =>
                 {
                     *frozen = true;
                     *status = "peer aborted".into();
@@ -366,8 +369,16 @@ impl<W: Wire> Session<W> {
                     if self.pending_start == Some(seq) {
                         match state {
                             Delivery::Delivered => {
-                                self.started = true;
-                                self.pending_start = None;
+                                if self.frozen {
+                                    // A freeze is sticky: a late ack of a start
+                                    // queued before the freeze must not commit.
+                                    self.status =
+                                        "start delivered after freeze; game not started".into();
+                                    notes.push(self.status.clone());
+                                } else {
+                                    self.started = true;
+                                    self.pending_start = None;
+                                }
                             }
                             Delivery::Unknown | Delivery::Failed => {
                                 self.frozen = true;
@@ -382,16 +393,25 @@ impl<W: Wire> Session<W> {
                         if *pseq == seq {
                             match state {
                                 Delivery::Delivered => {
-                                    self.accepted_moves.push(AcceptedMove {
-                                        ply: self.board.ply(),
-                                        square: *square,
-                                        mark: *mark,
-                                        sequence: seq,
-                                        local_ack: true,
-                                    });
-                                    self.board = board.clone();
-                                    self.status = format!("move {square} delivered");
-                                    self.pending_move = None;
+                                    if self.frozen {
+                                        // Retain the unresolved move; the board
+                                        // must never advance after a freeze.
+                                        self.status = format!(
+                                            "move {square} delivered after freeze; board not committed"
+                                        );
+                                        notes.push(self.status.clone());
+                                    } else {
+                                        self.accepted_moves.push(AcceptedMove {
+                                            ply: self.board.ply(),
+                                            square: *square,
+                                            mark: *mark,
+                                            sequence: seq,
+                                            local_ack: true,
+                                        });
+                                        self.board = board.clone();
+                                        self.status = format!("move {square} delivered");
+                                        self.pending_move = None;
+                                    }
                                 }
                                 Delivery::Unknown | Delivery::Failed => {
                                     self.frozen = true;
