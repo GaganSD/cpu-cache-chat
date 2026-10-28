@@ -3,12 +3,17 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import.meta.resolve("@earendil-works/pi-coding-agent");
 import.meta.resolve("typebox");
 
 test("Pi sends only game tools and handles illegal then legal tool calls", { timeout: 20000 }, async () => {
   const requests = [];
+  const transcriptDir = mkdtempSync(join(tmpdir(), "ccc-pi-transcript-"));
+  const transcriptPath = join(transcriptDir, "agent.log");
   const server = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -26,7 +31,7 @@ test("Pi sends only game tools and handles illegal then legal tool calls", { tim
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const child = spawn(process.execPath, [fileURLToPath(new URL("../src/play.mjs", import.meta.url))], {
-      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", CCC_AGENT_PROVIDER: "llama", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
+      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", CCC_AGENT_PROVIDER: "llama", CCC_AGENT_DEBUG: "1", CCC_AGENT_TRANSCRIPT_PATH: transcriptPath, LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
@@ -35,12 +40,18 @@ test("Pi sends only game tools and handles illegal then legal tool calls", { tim
     child.stdin.end(JSON.stringify({ board: "X23456789", turn: "O", legal: [2, 3, 4, 5, 6, 7, 8, 9] }));
     const code = await new Promise((resolve) => child.on("close", resolve));
     assert.equal(code, 0, stderr);
+    assert.match(readFileSync(transcriptPath, "utf8"), /submit_move/);
+    assert.match(stderr, /transcript retained/);
+    assert.doesNotMatch(stderr, /agent-debug message/);
     assert.deepEqual(JSON.parse(stdout), { square: 3, source: "pi" });
     assert.equal(requests.length, 2);
     assert.equal(requests[0].path, "/v1/chat/completions");
     assert.deepEqual(requests[0].body.tools.map((t) => t.function.name).sort(), ["get_board", "submit_move"]);
     assert.match(JSON.stringify(requests[1].body.messages), /Illegal square 1/);
-  } finally { await new Promise((resolve) => server.close(resolve)); }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(transcriptDir, { recursive: true, force: true });
+  }
 });
 
 test("Pi exits nonzero when the model answers without submitting", { timeout: 20000 }, async () => {
@@ -56,7 +67,7 @@ test("Pi exits nonzero when the model answers without submitting", { timeout: 20
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const child = spawn(process.execPath, [fileURLToPath(new URL("../src/play.mjs", import.meta.url))], {
-      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", CCC_AGENT_PROVIDER: "llama", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
+      env: { ...process.env, CCC_ALLOW_FIRST_LEGAL: "0", CCC_AGENT_PROVIDER: "llama", CCC_AGENT_TRANSCRIPT_PATH: "", CCC_AGENT_DEBUG: "", LLAMA_BASE_URL: `http://127.0.0.1:${server.address().port}` },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";

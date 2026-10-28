@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { stdin } from "node:process";
+import { appendTranscript } from "./transcript.mjs";
 import { makeTools, parseBoard, llamaBaseUrl, OPENCODE_GO_MODELS } from "./game.mjs";
 
 function redact(text) {
@@ -131,21 +132,27 @@ try {
       }
       if (transcriptExceeded) throw new Error("agent transcript quota exceeded; evidence incomplete");
     } finally {
-      if (process.env.CCC_AGENT_DEBUG) {
+      if (process.env.CCC_AGENT_DEBUG || process.env.CCC_AGENT_TRANSCRIPT_PATH) {
         try {
           const messages = session.messages ?? [];
+          const lines = [];
           let bytes = 0;
           for (let i = 0; i < messages.length; i++) {
-            const line = `agent-debug message ${i}: ${JSON.stringify(messages[i])}`;
+            const line = redact(`agent-debug message ${i}: ${JSON.stringify(messages[i])}`);
             bytes += Buffer.byteLength(line) + 1;
-            if (bytes > transcriptLimit) {
-              transcriptExceeded = true;
-              console.error("agent transcript quota exceeded; evidence incomplete");
-              break;
-            }
-            console.error(redact(line));
+            if (bytes > transcriptLimit) throw new Error("agent transcript quota exceeded; evidence incomplete");
+            lines.push(line);
           }
-        } catch (e) { console.error(`agent-debug failed: ${redact(e?.message || String(e))}`); }
+          if (process.env.CCC_AGENT_TRANSCRIPT_PATH) {
+            appendTranscript(process.env.CCC_AGENT_TRANSCRIPT_PATH, `${lines.join("\n")}\n`);
+            console.error(`agent transcript retained (${bytes} bytes)`);
+          } else {
+            for (const line of lines) console.error(line);
+          }
+        } catch (e) {
+          transcriptExceeded = true;
+          console.error(`agent-debug failed; evidence incomplete: ${redact(e?.message || String(e))}`);
+        }
       }
       session.dispose();
     }

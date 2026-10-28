@@ -61,6 +61,7 @@ impl Output {
                     end -= 1;
                 }
                 text.truncate(end);
+                text.push_str(" [UI diagnostic truncated; use retained transcript file]");
             }
             text
         }

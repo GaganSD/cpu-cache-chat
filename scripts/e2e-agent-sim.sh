@@ -41,10 +41,10 @@ cleanup() {
 }
 trap cleanup EXIT
 mkfifo "$WORKDIR/a.in" "$WORKDIR/b.in"
-"$BIN" game --role a --channel cpu --sim --sim-path "$WORKDIR/link.sim" --plain \
+CCC_AGENT_TRANSCRIPT_PATH="$WORKDIR/a.transcript.log" "$BIN" game --role a --channel cpu --sim --sim-path "$WORKDIR/link.sim" --plain \
   --agent --events-path "$WORKDIR/a.jsonl" <"$WORKDIR/a.in" >"$WORKDIR/a.out" 2>"$WORKDIR/a.err" &
 A_PID=$!
-"$BIN" game --role b --channel cpu --sim --sim-path "$WORKDIR/link.sim" --plain \
+CCC_AGENT_TRANSCRIPT_PATH="$WORKDIR/b.transcript.log" "$BIN" game --role b --channel cpu --sim --sim-path "$WORKDIR/link.sim" --plain \
   --agent --events-path "$WORKDIR/b.jsonl" <"$WORKDIR/b.in" >"$WORKDIR/b.out" 2>"$WORKDIR/b.err" &
 B_PID=$!
 exec 3>"$WORKDIR/a.in" 4>"$WORKDIR/b.in"
