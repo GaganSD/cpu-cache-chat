@@ -237,7 +237,7 @@ fn initiator_ignores_stale_handshake_response() {
     let (incoming, in_rx) = mpsc::channel();
     for session in [99, 42] {
         incoming
-            .send(encode_frame(&Frame::control(FrameType::SyncAck, session, 0, 0)).unwrap())
+            .send(encode_frame(&Frame::control(FrameType::SyncAck, session, 1, 0)).unwrap())
             .unwrap();
     }
     let wire = MockWire {

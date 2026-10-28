@@ -48,7 +48,7 @@ fn oversized_payload() {
 #[test]
 fn rejects_invalid_frame_headers_and_lengths() {
     let bytes = encode_frame(&Frame::new(FrameType::Data, 1, 1, vec![42]).unwrap()).unwrap();
-    for (offset, value) in [(0, 0), (2, 2), (3, 99), (13, 2)] {
+    for (offset, value) in [(0, 0), (2, 1), (3, 99), (13, 2)] {
         let mut bad = bytes.clone();
         bad[offset] = value;
         assert!(decode_frame(&bad).is_err(), "offset {offset}");

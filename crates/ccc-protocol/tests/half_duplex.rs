@@ -40,7 +40,7 @@ fn connected(max_retries: u32) -> (Link<ReceivingWire>, Arc<AtomicBool>) {
     let busy = Arc::new(AtomicBool::new(false));
     let wire = ReceivingWire {
         incoming: VecDeque::from([
-            encode_frame(&Frame::control(FrameType::SyncAck, 42, 0, 0)).unwrap()
+            encode_frame(&Frame::control(FrameType::SyncAck, 42, 1, 0)).unwrap()
         ]),
         busy: busy.clone(),
         sends: Vec::new(),

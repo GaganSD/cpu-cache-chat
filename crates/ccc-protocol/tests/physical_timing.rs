@@ -38,7 +38,7 @@ fn failed_physical_send_waits_for_receiver_to_drain_before_retry() {
     let cfg = config(Role::A, 50);
     let wire = TimingWire {
         incoming: VecDeque::from([
-            encode_frame(&Frame::control(FrameType::SyncAck, 42, 0, 0)).unwrap()
+            encode_frame(&Frame::control(FrameType::SyncAck, 42, 1, 0)).unwrap()
         ]),
         fail_data: true,
         ..TimingWire::default()
@@ -84,7 +84,7 @@ fn initiator_waits_for_complete_sync_ack_and_budgets_actual_data_size() {
         let cfg = config(Role::A, millis);
         let wire = TimingWire {
             incoming: VecDeque::from([
-                encode_frame(&Frame::control(FrameType::SyncAck, 42, 0, 0)).unwrap()
+                encode_frame(&Frame::control(FrameType::SyncAck, 42, 1, 0)).unwrap()
             ]),
             ..TimingWire::default()
         };
@@ -122,7 +122,7 @@ fn responder_listens_long_enough_for_a_complete_sync() {
     let cfg = config(Role::B, 50);
     let wire = TimingWire {
         incoming: VecDeque::from([
-            encode_frame(&Frame::control(FrameType::Sync, 42, 0, 0)).unwrap()
+            encode_frame(&Frame::control(FrameType::Sync, 42, 1, 0)).unwrap()
         ]),
         ..TimingWire::default()
     };

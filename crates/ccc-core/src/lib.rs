@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const FRAME_MAGIC: [u8; 2] = [0xC3, 0xC4];
 pub const MAX_PAYLOAD: usize = 256;
 pub const MAX_CHAT_BYTES: usize = 200;

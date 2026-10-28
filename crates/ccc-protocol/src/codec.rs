@@ -10,6 +10,7 @@ pub fn encode_frame(frame: &Frame) -> Result<Vec<u8>, Error> {
     if frame.payload.len() > MAX_PAYLOAD {
         return Err(Error::TooLarge(frame.payload.len()));
     }
+    validate(frame)?;
     let mut buf = Vec::with_capacity(HEADER + frame.payload.len() + CRC);
     buf.extend_from_slice(&FRAME_MAGIC);
     buf.push(PROTOCOL_VERSION);
@@ -56,12 +57,38 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame, Error> {
     if got != expect {
         return Err(Error::Corrupt("checksum"));
     }
-    Ok(Frame {
+    let frame = Frame {
         ftype,
         flags,
         session,
         seq,
         ack_seq,
         payload,
-    })
+    };
+    validate(&frame)?;
+    Ok(frame)
+}
+
+fn validate(f: &Frame) -> Result<(), Error> {
+    let valid = f.flags == 0
+        && match f.ftype {
+            FrameType::Data => f.seq != 0 && f.ack_seq == 0 && !f.payload.is_empty(),
+            FrameType::Ack => {
+                f.payload.is_empty()
+                    && ((f.seq == 0 && f.ack_seq != 0) || (f.seq != 0 && f.ack_seq == 0))
+            }
+            FrameType::Nack => f.payload.is_empty() && f.seq == 0 && f.ack_seq != 0,
+            FrameType::Heartbeat => f.payload.is_empty() && f.seq != 0 && f.ack_seq == 0,
+            FrameType::Sync | FrameType::SyncAck => {
+                f.payload.is_empty() && (f.seq == 1 || f.seq == 2) && f.ack_seq == 0
+            }
+            FrameType::Resync | FrameType::Close => {
+                f.payload.is_empty() && f.seq == 0 && f.ack_seq == 0
+            }
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Corrupt("invalid frame fields"))
+    }
 }

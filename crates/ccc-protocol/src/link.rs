@@ -29,7 +29,8 @@ pub struct Link<W: Wire> {
     wire: W,
     state: LinkState,
     session: u32,
-    next_seq: u16,
+    next_seq: u32,
+    token_epoch: u16,
     last_rx_seq: Option<u16>,
     inflight: Option<Inflight>,
     queue: VecDeque<(u16, AppMessage)>,
@@ -37,14 +38,13 @@ pub struct Link<W: Wire> {
     have_token: bool,
     token_since: Instant,
     handoff: Option<TokenHandoff>,
-    degraded_since: Option<Instant>,
-    reoffer_backoff: Duration,
     tokenless_since: Option<Instant>,
 }
 
 struct TokenHandoff {
     sent_at: Instant,
     confirm_wait: Duration,
+    epoch: u16,
 }
 
 struct Inflight {
@@ -64,6 +64,7 @@ impl<W: Wire> Link<W> {
             state: LinkState::Idle,
             session,
             next_seq: 1,
+            token_epoch: 0,
             last_rx_seq: None,
             inflight: None,
             queue: VecDeque::new(),
@@ -71,8 +72,6 @@ impl<W: Wire> Link<W> {
             have_token,
             token_since: Instant::now(),
             handoff: None,
-            degraded_since: None,
-            reoffer_backoff: Duration::ZERO,
             tokenless_since: if have_token {
                 None
             } else {
@@ -97,9 +96,13 @@ impl<W: Wire> Link<W> {
         if matches!(self.state, LinkState::Failed | LinkState::Closed) {
             return Err(Error::InvalidInput("session is no longer usable".into()));
         }
-        let seq = self.next_seq;
+        if self.queue_len() >= 256 {
+            return Err(Error::InvalidInput("outbound queue full".into()));
+        }
+        let seq = u16::try_from(self.next_seq)
+            .map_err(|_| Error::InvalidInput("sequence exhausted; start a new session".into()))?;
         msg.encode()?;
-        self.next_seq = next_sequence(seq);
+        self.next_seq += 1;
         self.queue.push_back((seq, msg));
         Ok(seq)
     }
@@ -121,7 +124,7 @@ impl<W: Wire> Link<W> {
             let mut last = Error::Timeout;
             let mut ok = false;
             for _ in 0..=self.cfg.max_retries {
-                if let Err(e) = self.send_control(FrameType::Sync, 0) {
+                if let Err(e) = self.send_handshake(FrameType::Sync) {
                     if matches!(e, Error::Interrupted) {
                         return Err(e);
                     }
@@ -146,12 +149,17 @@ impl<W: Wire> Link<W> {
             let frame =
                 self.recv_typed(FrameType::Sync, self.cfg.sync_listen_budget(FRAME_OVERHEAD))?;
             self.accept_session(frame.session);
-            self.send_control(FrameType::SyncAck, 0)?;
+            self.send_handshake(FrameType::SyncAck)?;
         }
         self.peer_seen = true;
         self.have_token = self.cfg.role.is_initiator();
         self.token_since = Instant::now();
         self.handoff = None;
+        self.tokenless_since = if self.have_token {
+            None
+        } else {
+            Some(Instant::now())
+        };
         self.state = LinkState::Connected;
         events.push(LinkEvent::State(self.state));
         events.push(LinkEvent::Info(format!(
@@ -219,7 +227,14 @@ impl<W: Wire> Link<W> {
                 // not reclaim it if confirmation is lost.
                 self.have_token = false;
                 self.tokenless_since = Some(Instant::now());
-                let result = self.send_control(FrameType::Heartbeat, 0);
+                let Some(epoch) = self.token_epoch.checked_add(1) else {
+                    self.state = LinkState::Failed;
+                    events.push(LinkEvent::State(self.state));
+                    events.push(LinkEvent::Error("token offer identity exhausted".into()));
+                    return Ok(events);
+                };
+                self.token_epoch = epoch;
+                let result = self.send_offer(epoch);
                 let confirm_wait = if result.is_err() {
                     self.cfg
                         .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD)
@@ -229,6 +244,7 @@ impl<W: Wire> Link<W> {
                 self.handoff = Some(TokenHandoff {
                     sent_at: Instant::now(),
                     confirm_wait,
+                    epoch,
                 });
                 if matches!(result, Err(Error::Interrupted)) {
                     return Err(Error::Interrupted);
@@ -241,73 +257,42 @@ impl<W: Wire> Link<W> {
             }
         }
 
+        // Only retransmit the exact outstanding offer; never invent a new grant.
+        if self
+            .tokenless_since
+            .is_some_and(|since| since.elapsed() >= self.token_deadline())
+        {
+            self.state = LinkState::Failed;
+            events.push(LinkEvent::State(self.state));
+            events.push(LinkEvent::Error("token recovery deadline exceeded".into()));
+            return Ok(events);
+        }
         if !receiving
             && self
                 .handoff
                 .as_ref()
-                .is_some_and(|handoff| handoff.sent_at.elapsed() >= handoff.confirm_wait)
+                .is_some_and(|h| h.sent_at.elapsed() >= h.confirm_wait)
         {
-            self.handoff = None;
-            self.enter_degraded();
-            events.push(LinkEvent::State(self.state));
-            events.push(LinkEvent::Error(
-                "token handoff unconfirmed; peer may hold token".into(),
-            ));
-            return Ok(events);
-        }
-
-        // Token re-arbitration after an unconfirmed handoff. Only the
-        // initiator re-offers, and re-offering never claims the token: the
-        // peer acquires it only by receiving the heartbeat, so this path
-        // cannot create two owners. Without it, a lost handoff plus a lost
-        // confirmation leaves both sides tokenless forever. An initiator
-        // that never degraded can still end up tokenless while the peer
-        // waits degraded for a heartbeat it cannot re-offer itself, so a
-        // long tokenless silence also permits a re-offer.
-        let initiator_reoffer = self.cfg.role.is_initiator()
-            && self.inflight.is_none()
-            && self.handoff.is_none()
-            && ((self.state == LinkState::Degraded
-                && self
-                    .degraded_since
-                    .is_some_and(|since| since.elapsed() >= self.reoffer_backoff))
-                || (self.state == LinkState::Connected
-                    && !self.have_token
-                    && self
-                        .tokenless_since
-                        .is_some_and(|since| since.elapsed() >= self.connected_reoffer_idle())));
-        if !receiving && initiator_reoffer {
-            // Relinquish before offering. Holding the token here means no
-            // heartbeat from us was ever confirmed, so the peer cannot hold
-            // it; re-offering still never claims ownership.
-            self.have_token = false;
-            self.tokenless_since = Some(Instant::now());
-            let result = self.send_control(FrameType::Heartbeat, 0);
-            let confirm_wait = if result.is_err() {
+            let epoch = self.handoff.as_ref().unwrap().epoch;
+            if self.state != LinkState::Degraded {
+                self.state = LinkState::Degraded;
+                events.push(LinkEvent::State(self.state));
+            }
+            let result = self.send_offer(epoch);
+            let wait = if result.is_err() {
                 self.cfg
                     .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD)
             } else {
                 self.cfg.response_budget(FRAME_OVERHEAD)
             };
-            self.handoff = Some(TokenHandoff {
-                sent_at: Instant::now(),
-                confirm_wait,
-            });
-            self.degraded_since = Some(Instant::now());
-            let doubled = self.reoffer_backoff.saturating_mul(2);
-            self.reoffer_backoff = doubled
-                .max(self.cfg.response_budget(FRAME_OVERHEAD))
-                .min(Duration::from_secs(60));
+            let h = self.handoff.as_mut().unwrap();
+            h.sent_at = Instant::now();
+            h.confirm_wait = wait;
             if matches!(result, Err(Error::Interrupted)) {
                 return Err(Error::Interrupted);
             }
-            match result {
-                Ok(()) => events.push(LinkEvent::Info(
-                    "re-offering token after unconfirmed handoff".into(),
-                )),
-                Err(e) => events.push(LinkEvent::Error(format!(
-                    "token re-offer send failed: {e}; awaiting confirmation"
-                ))),
+            if let Err(e) = result {
+                events.push(LinkEvent::Error(format!("token retry failed: {e}")));
             }
         }
 
@@ -349,6 +334,9 @@ impl<W: Wire> Link<W> {
                 )
             })
         };
+        let wait = self.tokenless_since.map_or(wait, |since| {
+            wait.min(self.token_deadline().saturating_sub(since.elapsed()))
+        });
         match self.wire.recv_blob(wait) {
             Ok(bytes) => {
                 if let Some(more) = self.on_bytes(&bytes, &mut accept)? {
@@ -386,24 +374,19 @@ impl<W: Wire> Link<W> {
         match frame.ftype {
             FrameType::Ack => {
                 if frame.ack_seq == 0 {
-                    let confirmed = self.handoff.take().is_some();
-                    // A stale or duplicate token confirmation still evidences
-                    // that the peer acquired the token; recover a degraded
-                    // link without claiming ownership. If that belief is
-                    // wrong, the tokenless re-offer bounds the wait.
-                    let mut events = Vec::new();
-                    if confirmed {
-                        events.push(LinkEvent::Info("token handoff confirmed".into()));
-                    }
-                    if self.state == LinkState::Degraded {
-                        self.state = LinkState::Connected;
-                        self.degraded_since = None;
-                        events.push(LinkEvent::State(self.state));
-                    }
-                    if !events.is_empty() {
+                    if self.handoff.as_ref().is_some_and(|h| h.epoch == frame.seq) {
+                        self.handoff = None;
+                        self.tokenless_since = Some(Instant::now());
+                        let mut events = vec![LinkEvent::Info("token handoff confirmed".into())];
+                        if self.state == LinkState::Degraded {
+                            self.state = LinkState::Connected;
+                            events.push(LinkEvent::State(self.state));
+                        }
                         return Ok(Some(events));
                     }
-                    return Ok(Some(vec![LinkEvent::Info("ignored unmatched ack".into())]));
+                    return Ok(Some(vec![LinkEvent::Info(
+                        "ignored unmatched token confirmation".into(),
+                    )]));
                 }
                 if let Some(inf) = &self.inflight {
                     if frame.ack_seq == inf.seq {
@@ -436,7 +419,11 @@ impl<W: Wire> Link<W> {
             FrameType::Data => {
                 // A valid peer data frame also proves the peer acquired the
                 // token even if its handoff ACK was lost.
-                self.handoff = None;
+                if self.have_token {
+                    return Ok(Some(vec![LinkEvent::Error(
+                        "peer data while holding token".into(),
+                    )]));
+                }
                 if let Some(prev) = self.last_rx_seq {
                     if frame.seq == prev {
                         let result = self.send_control(FrameType::Ack, frame.seq);
@@ -453,10 +440,10 @@ impl<W: Wire> Link<W> {
                         return Ok(Some(events));
                     }
                 }
-                let expected = self.last_rx_seq.map_or(1, next_sequence);
-                if frame.seq != expected {
+                let expected = self.last_rx_seq.map_or(Some(1), |n| n.checked_add(1));
+                if Some(frame.seq) != expected {
                     return Ok(Some(vec![LinkEvent::Error(format!(
-                        "unexpected data seq {}; expected {expected}",
+                        "unexpected data seq {}; expected {expected:?}",
                         frame.seq
                     ))]));
                 }
@@ -469,6 +456,8 @@ impl<W: Wire> Link<W> {
                                 frame.seq
                             ))]));
                         }
+                        self.handoff = None;
+                        self.tokenless_since = Some(Instant::now());
                         self.last_rx_seq = Some(frame.seq);
                         // Valid in-sequence peer data proves the peer holds
                         // the token and the link works; recover from a
@@ -476,7 +465,6 @@ impl<W: Wire> Link<W> {
                         let mut events = Vec::new();
                         if self.state == LinkState::Degraded {
                             self.state = LinkState::Connected;
-                            self.degraded_since = None;
                             events.push(LinkEvent::State(self.state));
                         }
                         events.push(LinkEvent::Recv(msg));
@@ -495,36 +483,49 @@ impl<W: Wire> Link<W> {
                 }
             }
             FrameType::Heartbeat => {
-                let result = self.send_control(FrameType::Ack, 0);
+                if frame.seq == self.token_epoch && !self.have_token && self.handoff.is_some() {
+                    // This epoch was our outgoing offer, not a peer offer.
+                    return Ok(None);
+                }
+                if frame.seq == self.token_epoch && self.have_token {
+                    let result = self.send_token_confirmation(frame.seq);
+                    if matches!(result, Err(Error::Interrupted)) {
+                        return Err(Error::Interrupted);
+                    }
+                    return Ok(None);
+                }
+                if self.have_token || self.token_epoch.checked_add(1) != Some(frame.seq) {
+                    return Ok(Some(vec![LinkEvent::Info(
+                        "ignored stale or unexpected token offer".into(),
+                    )]));
+                }
+                self.token_epoch = frame.seq;
+                self.grant_token();
+                let result = self.send_token_confirmation(frame.seq);
                 if matches!(result, Err(Error::Interrupted)) {
                     return Err(Error::Interrupted);
                 }
-                self.grant_token();
-                // A valid offer resolves our ownership uncertainty too: the
-                // sender relinquished before offering, so accepting the token
-                // cannot create two owners, and the link demonstrably works.
                 let mut events = Vec::new();
                 if self.state == LinkState::Degraded {
                     self.state = LinkState::Connected;
-                    self.degraded_since = None;
                     events.push(LinkEvent::State(self.state));
                 }
                 if let Err(e) = result {
                     events.push(LinkEvent::Error(format!("token confirmation failed: {e}")));
                 }
-                if events.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(events))
-                }
+                Ok(Some(events))
             }
             FrameType::Close => {
                 self.state = LinkState::Closed;
                 Ok(Some(vec![LinkEvent::State(self.state)]))
             }
             FrameType::Sync => {
-                if !self.cfg.role.is_initiator() {
-                    let _ = self.send_control(FrameType::SyncAck, 0);
+                let kind = match self.cfg.kind {
+                    ccc_core::AppKind::Chat => 1,
+                    ccc_core::AppKind::Game => 2,
+                };
+                if !self.cfg.role.is_initiator() && frame.seq == kind {
+                    let _ = self.send_handshake(FrameType::SyncAck);
                 }
                 Ok(None)
             }
@@ -541,25 +542,39 @@ impl<W: Wire> Link<W> {
         self.tokenless_since = None;
     }
 
-    /// How long a connected, tokenless initiator waits for the peer's token
-    /// use before re-offering. Long enough that an inferring or transmitting
-    /// peer almost always finishes first; collisions degrade to ordinary
-    // bounded retries, never to dual ownership.
-    fn connected_reoffer_idle(&self) -> Duration {
-        let budget = self.cfg.response_budget(FRAME_OVERHEAD).saturating_mul(4);
-        if self.cfg.channel.is_physical() {
-            budget.max(Duration::from_secs(30))
-        } else {
-            budget
-        }
+    fn token_deadline(&self) -> Duration {
+        let budget = self.cfg.response_budget(FRAME_OVERHEAD).max(
+            self.cfg
+                .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD),
+        );
+        budget
+            .saturating_mul(self.cfg.max_retries.saturating_add(3))
+            .max(if self.cfg.channel.is_physical() {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_millis(500)
+            })
     }
 
-    fn enter_degraded(&mut self) {
-        self.state = LinkState::Degraded;
-        if self.degraded_since.is_none() {
-            self.degraded_since = Some(Instant::now());
-            self.reoffer_backoff = self.cfg.response_budget(FRAME_OVERHEAD);
-        }
+    fn send_handshake(&mut self, ftype: FrameType) -> Result<(), Error> {
+        let kind = match self.cfg.kind {
+            ccc_core::AppKind::Chat => 1,
+            ccc_core::AppKind::Game => 2,
+        };
+        self.transmit(&Frame::control(ftype, self.session, kind, 0))
+    }
+
+    fn send_offer(&mut self, epoch: u16) -> Result<(), Error> {
+        self.transmit(&Frame::control(
+            FrameType::Heartbeat,
+            self.session,
+            epoch,
+            0,
+        ))
+    }
+
+    fn send_token_confirmation(&mut self, epoch: u16) -> Result<(), Error> {
+        self.transmit(&Frame::control(FrameType::Ack, self.session, epoch, 0))
     }
 
     fn retransmit_inflight(&mut self, reason: &str) -> Result<Vec<LinkEvent>, Error> {
@@ -625,7 +640,12 @@ impl<W: Wire> Link<W> {
             match decode_frame(&bytes) {
                 Ok(frame)
                     if frame.ftype == want
-                        && (!self.cfg.role.is_initiator() || frame.session == self.session) =>
+                        && (!self.cfg.role.is_initiator() || frame.session == self.session)
+                        && frame.seq
+                            == match self.cfg.kind {
+                                ccc_core::AppKind::Chat => 1,
+                                ccc_core::AppKind::Game => 2,
+                            } =>
                 {
                     return Ok(frame)
                 }
@@ -650,30 +670,12 @@ impl<W: Wire> Link<W> {
 pub fn new_session_id() -> u32 {
     let mut b = [0u8; 4];
     fill_random(&mut b);
-    u32::from_le_bytes(b) | 1
+    u32::from_le_bytes(b)
 }
 
 fn fill_random(buf: &mut [u8]) {
-    let mut x = 0x9E37_79B9u64
-        .wrapping_mul(std::process::id() as u64)
-        .wrapping_add(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(1),
-        );
-    for slot in buf {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *slot = (x >> 24) as u8;
-    }
-}
-
-fn next_sequence(seq: u16) -> u16 {
-    if seq == u16::MAX {
-        1
-    } else {
-        seq + 1
-    }
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .expect("OS entropy unavailable");
 }

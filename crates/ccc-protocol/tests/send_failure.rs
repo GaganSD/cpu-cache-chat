@@ -105,7 +105,7 @@ fn connected(outcomes: &[SendOutcome], max_retries: u32) -> Link<TestWire> {
     cfg.max_retries = max_retries;
     let wire = TestWire {
         incoming: VecDeque::from([
-            encode_frame(&Frame::control(FrameType::SyncAck, 42, 0, 0)).unwrap()
+            encode_frame(&Frame::control(FrameType::SyncAck, 42, 1, 0)).unwrap()
         ]),
         outcomes: outcomes.iter().copied().collect(),
         sent: Vec::new(),
@@ -139,7 +139,7 @@ fn failed_ack_for_repeated_data_does_not_terminate_or_redeliver() {
     .unwrap();
     let wire = TestWire {
         incoming: VecDeque::from([
-            encode_frame(&Frame::control(FrameType::Sync, 42, 0, 0)).unwrap(),
+            encode_frame(&Frame::control(FrameType::Sync, 42, 1, 0)).unwrap(),
             encode_frame(&data).unwrap(),
             encode_frame(&data).unwrap(),
         ]),

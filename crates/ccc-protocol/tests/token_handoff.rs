@@ -32,10 +32,23 @@ impl Wire for HandoffWire {
     fn interrupt(&mut self) {}
 }
 fn push(inbox: &Inbox, kind: FrameType, ack: u16) {
-    inbox
-        .lock()
-        .unwrap()
-        .push_back(encode_frame(&Frame::control(kind, 42, 0, ack)).unwrap());
+    inbox.lock().unwrap().push_back(
+        encode_frame(&Frame::control(
+            kind,
+            42,
+            if matches!(
+                kind,
+                FrameType::Sync | FrameType::SyncAck | FrameType::Heartbeat
+            ) || (kind == FrameType::Ack && ack == 0)
+            {
+                1
+            } else {
+                0
+            },
+            ack,
+        ))
+        .unwrap(),
+    );
 }
 fn connected(role: Role, fail_offer: bool, fail_ack: bool) -> (Link<HandoffWire>, Inbox) {
     let inbox = Arc::new(Mutex::new(VecDeque::new()));
@@ -82,7 +95,10 @@ fn token_offer_is_confirmed_and_old_owner_waits_for_return() {
         .iter()
         .any(|e| matches!(e, LinkEvent::Info(s) if s == "token handoff confirmed")));
     link.drive(Duration::ZERO).unwrap();
-    push(&inbox, FrameType::Heartbeat, 0);
+    inbox
+        .lock()
+        .unwrap()
+        .push_back(encode_frame(&Frame::control(FrameType::Heartbeat, 42, 2, 0)).unwrap());
     link.drive(Duration::ZERO).unwrap();
     link.drive(Duration::ZERO).unwrap();
     let sent: Vec<_> = link
@@ -102,7 +118,7 @@ fn token_offer_is_confirmed_and_old_owner_waits_for_return() {
     );
 }
 #[test]
-fn ambiguous_or_lost_offer_fails_closed_without_retry_or_reclaim() {
+fn ambiguous_or_lost_offer_retries_same_identity_without_reclaim() {
     for fail_offer in [false, true] {
         let (mut link, _) = connected(Role::A, fail_offer, false);
         wait_for_offer();
@@ -117,11 +133,12 @@ fn ambiguous_or_lost_offer_fails_closed_without_retry_or_reclaim() {
         let events = link.drive(Duration::ZERO).unwrap();
         assert!(events
             .iter()
-            .any(|e| matches!(e, LinkEvent::Error(s) if s.contains("handoff unconfirmed"))));
+            .any(|e| matches!(e, LinkEvent::State(LinkState::Degraded))));
         assert_eq!(link.state(), LinkState::Degraded);
         link.drive(Duration::ZERO).unwrap();
-        let sent: Vec<_> = link.into_wire().sent.into_iter().map(|f| f.ftype).collect();
-        assert_eq!(sent, [FrameType::Sync, FrameType::Heartbeat]);
+        let sent = link.into_wire().sent;
+        assert_eq!(sent[1].ftype, FrameType::Heartbeat);
+        assert!(sent[1..].iter().all(|f| *f == sent[1]));
     }
 }
 #[test]
