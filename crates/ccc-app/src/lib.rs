@@ -223,7 +223,9 @@ impl<W: Wire> Session<W> {
                 .map_err(|e| Error::Agent(e.to_string()))?;
         }
         drop(child.stdin.take());
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        // Above play.mjs's own 90-second deadline so the player's error,
+        // not the kill, is what gets reported when inference is slow.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
         loop {
             if child
                 .try_wait()
@@ -244,7 +246,7 @@ impl<W: Wire> Session<W> {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Error::Agent("agent timed out after 60 seconds".into()));
+                return Err(Error::Agent("agent timed out after 120 seconds".into()));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
