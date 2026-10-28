@@ -15,7 +15,7 @@ See [measurements](docs/measurements.md). Containers share a Linux kernel; they 
 
 ## Prerequisites and quickstart
 
-Docker Engine on Linux or OrbStack on Apple silicon, Bash, and a native image are required for physical demos. The following launcher interface is **planned** and must be verified against the checkout before use; physical gates are not yet complete:
+Docker Engine on Linux or OrbStack on Apple silicon, Bash, Python 3, and a native image are required for physical demos. Building from source also needs Rust 1.96.1. The launcher is implemented and software-tested; the current wire format's physical release gates are not yet complete:
 
 ```sh
 ./docker/build.sh
@@ -25,7 +25,7 @@ Docker Engine on Linux or OrbStack on Apple silicon, Bash, and a native image ar
 ./scripts/demo.sh stop --run-id RUN_ID
 ```
 
-A pair should show its channel, connection and delivery state; no-lock and unknown delivery are possible. At 50 ms per slot, even an empty physical frame can take several seconds; handshakes, retries and games can take minutes or time out. Do not expect interactive-network latency. To try a manual game, use `./scripts/demo.sh game --channel cpu`. Hosted agents are opt-in with `./scripts/demo.sh agents --channel cpu --provider opencode-go`, require credentials and incur external inference costs. Never put keys in logs or images.
+The launcher prints two `docker attach` commands: run each in its own terminal, type a short personal message such as `hello world`, and reply from the other. Each terminal controls only its own peer. Detach with Ctrl-p Ctrl-q, or stop both using the printed run ID. The launcher runs a bounded receiver-blind probe first; a failed probe stops the launch without switching channels. A pair should show its channel, connection and delivery state; no-lock and unknown delivery are possible. At the explicit 50 ms reference preset, one protocol control frame nominally takes 20.15 seconds; `hello world` plus its ACK takes 49.4 seconds, before token wait, retries, startup, and scheduling delays. Handshakes and games can take minutes or time out. Do not expect interactive-network latency. To try a manual game, use `./scripts/demo.sh game --channel cpu`. Hosted agents additionally require `./docker/build-agent.sh`, `CCC_HOSTED_OPT_IN=1`, and provider credentials. Use `./scripts/demo.sh agents --channel cpu --provider opencode-go` (`OPENCODE_GO_API_KEY`) or `--provider vercel-ai-gateway` (`AI_GATEWAY_API_KEY`). The configured models are DeepSeek V4.1 Flash at low reasoning and Reflection Beam Free, respectively. Provider availability, pricing, and tool reliability are external dependencies. Both boards are disclosed to the provider; separate bridges permit general egress, not only inference. Never put keys in logs or images.
 
 For software-only checks, use `cargo test --workspace --locked` and `MODE=chat ./scripts/e2e-headless-sim.sh`. The latter is not a physical test. If Docker is unavailable, start the runtime; if connection fails, stop the run and inspect its diagnostics rather than assuming success or switching channels silently.
 
