@@ -45,7 +45,9 @@ fn drains_both_pipes_before_exit() {
 }
 #[test]
 fn malformed_and_oversized_output_fail() {
-    assert!(run("printf nonsense", limits())
+    // Consume stdin first: a child that exits without reading can race the
+    // request-body write and fail with EPIPE instead of the parse error.
+    assert!(run("cat >/dev/null; printf nonsense", limits())
         .unwrap_err()
         .to_string()
         .contains("parse"));
@@ -55,7 +57,11 @@ fn malformed_and_oversized_output_fail() {
         .unwrap_err()
         .to_string()
         .contains("quota exceeded"));
-    assert!(run("printf '{\"square\":1,\"source\":\"test\"}'", limits()).is_err());
+    assert!(run(
+        "cat >/dev/null; printf '{\"square\":1,\"source\":\"test\"}'",
+        limits()
+    )
+    .is_err());
 }
 #[test]
 fn timeout_and_cancel_are_bounded() {
@@ -93,7 +99,28 @@ fn kills_descendant_on_timeout() {
         .parse()
         .unwrap();
     std::fs::remove_file(path).unwrap();
-    // A killed orphan may temporarily remain as a zombie until its parent reaps it.
+    assert_descendant_dead(pid);
+}
+#[test]
+fn closed_stdin_fails_bounded_and_kills_descendants() {
+    let path = std::env::temp_dir().join(format!("ccc-agent-stdin-{}", std::process::id()));
+    // The child spawns a descendant and exits without reading stdin. Depending
+    // on the exit/write race the error is EPIPE on the request write or a parse
+    // failure; either way it must be bounded and the guard must kill the group.
+    let script = format!("sleep 30 & echo $! > {}; printf nonsense", path.display());
+    let start = Instant::now();
+    assert!(run(&script, limits()).is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let pid: i32 = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_descendant_dead(pid);
+}
+/// A killed orphan may temporarily remain as a zombie until its parent reaps it.
+fn assert_descendant_dead(pid: i32) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let exists = unsafe { libc::kill(pid, 0) } == 0;
