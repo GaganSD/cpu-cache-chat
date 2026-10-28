@@ -132,7 +132,12 @@ pub fn read_evidence(mut input: impl Read) -> Result<PeerEvidence, String> {
                 });
             }
             Event::AgentChoice { ply, square } if peer.is_some() && !final_seen => {
-                let choices = &mut peer.as_mut().unwrap().choices;
+                let p = peer.as_mut().unwrap();
+                let local_turn = (ply.is_multiple_of(2)) == (p.role == Role::A);
+                if usize::from(ply) != p.moves.len() || !local_turn || !(1..=9).contains(&square) {
+                    return Err("agent choice does not describe the current local turn".into());
+                }
+                let choices = &mut p.choices;
                 if choices.iter().any(|choice| choice.ply == ply) {
                     return Err("duplicate agent choice".into());
                 }

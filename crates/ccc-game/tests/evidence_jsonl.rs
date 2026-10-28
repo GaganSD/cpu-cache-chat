@@ -83,6 +83,20 @@ fn verifier_rejects_incomplete_or_conflicting_evidence() {
     assert!(!verify(&a, &bad, false));
 }
 #[test]
+fn stale_agent_choice_cannot_be_inserted_after_its_move() {
+    let a = events("A", &[1, 4, 2, 5, 3]);
+    let mut b = events("B", &[1, 4, 2, 5, 3]);
+    let index = b
+        .iter()
+        .rposition(|event| event["type"] == "agent_choice")
+        .unwrap();
+    let choice = b.remove(index);
+    let final_index = b.iter().position(|event| event["type"] == "final").unwrap();
+    b.insert(final_index, choice);
+    assert!(!verify(&a, &b, true));
+}
+
+#[test]
 fn parser_enforces_framing_limits_and_strict_fields() {
     let a = events("A", &[1, 4, 2, 5, 3]);
     let text = encode(&a);
