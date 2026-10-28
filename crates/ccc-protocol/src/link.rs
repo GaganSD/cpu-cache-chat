@@ -184,6 +184,18 @@ impl<W: Wire> Link<W> {
     where
         F: FnMut(&AppMessage) -> Result<(), Error>,
     {
+        self.drive_with_accept_seq(wait, |_, msg| accept(msg))
+    }
+
+    /// As `drive_with_accept`, with the actual incoming sequence for evidence.
+    pub fn drive_with_accept_seq<F>(
+        &mut self,
+        wait: Duration,
+        mut accept: F,
+    ) -> Result<Vec<LinkEvent>, Error>
+    where
+        F: FnMut(u16, &AppMessage) -> Result<(), Error>,
+    {
         if self.state != LinkState::Connected && self.state != LinkState::Degraded {
             return Ok(Vec::new());
         }
@@ -357,7 +369,7 @@ impl<W: Wire> Link<W> {
 
     fn on_bytes<F>(&mut self, bytes: &[u8], accept: &mut F) -> Result<Option<Vec<LinkEvent>>, Error>
     where
-        F: FnMut(&AppMessage) -> Result<(), Error>,
+        F: FnMut(u16, &AppMessage) -> Result<(), Error>,
     {
         let frame = match decode_frame(bytes) {
             Ok(f) => f,
@@ -449,7 +461,7 @@ impl<W: Wire> Link<W> {
                 }
                 match AppMessage::decode(&frame.payload) {
                     Ok(msg) => {
-                        if let Err(e) = accept(&msg) {
+                        if let Err(e) = accept(frame.seq, &msg) {
                             self.send_control(FrameType::Nack, frame.seq)?;
                             return Ok(Some(vec![LinkEvent::Error(format!(
                                 "application rejected seq {}: {e}",
