@@ -171,7 +171,7 @@ use ccc_channel::SimSocket;
 use ccc_core::{AppKind, ChannelMode, Role, RuntimeConfig};
 use ccc_protocol::{AppMessage, GameCtrl, Link, LinkEvent};
 
-use super::{start, Command, Updates};
+use super::{start, Command, Events, Updates};
 
 struct SimDir(std::path::PathBuf);
 
@@ -252,7 +252,7 @@ fn pump(updates: &Updates, out: &mut Collected) {
             Ok(Update::Snapshot(s)) => out.snapshots.push(s),
             Ok(Update::Accepted(id)) => out.accepted.push(id),
             Ok(Update::Rejected(id, why)) => out.notes.push(format!("rejected {id}: {why}")),
-            Ok(Update::Delivery(..)) => {}
+            Ok(Update::Delivery(..) | Update::EventJSON(_)) => {}
             Err(_) => break,
         }
     }
@@ -289,7 +289,7 @@ fn stale_agent_failure_after_manual_move_does_not_end_session() {
     let (commands, updates, worker) = start(
         agent_game_cfg(&dir.base(), "sh -c 'sleep 1; exit 3'"),
         stop.clone(),
-        None,
+        Events::default(),
     );
     let mut out = Collected::default();
     wait_for(&updates, &mut out, "agent spawn", |o| {
@@ -328,7 +328,7 @@ fn stale_agent_success_after_abort_never_commits() {
             "sh -c 'sleep 1; printf \"{\\\"source\\\":\\\"pi\\\",\\\"square\\\":5}\"'",
         ),
         stop.clone(),
-        None,
+        Events::default(),
     );
     let mut out = Collected::default();
     wait_for(&updates, &mut out, "agent spawn", |o| {
