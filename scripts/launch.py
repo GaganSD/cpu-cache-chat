@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,6 +23,20 @@ EVENTS_PATH = '/tmp/game.events.jsonl'
 TRANSCRIPT_PATH = '/tmp/agent-transcript.log'
 # The agent adapter bounds the raw transcript itself; reaching the bound means truncation.
 TRANSCRIPT_QUOTA = 16 * 1024 * 1024
+EVENT_PREFIX = 'CCC_EVENT '
+VERIFIER = '/usr/local/bin/ccc-verify-game'
+# Canonical event streams stay far below the packaged verifier's strict bounds.
+EVENTS_MAX_BYTES = 16 * 1024
+EVENTS_MAX_LINE = 1024
+EVENTS_MAX_COUNT = 21
+# SIGINT grace per owned peer on stop before forced removal (recorded, never hidden).
+WAIT_TIMEOUT = 5
+# Bounded post-run verifier replay in a disposable observer container.
+OBSERVER_TIMEOUT = 30
+# Diagnostic logs are byte-capped per stream; canonical events never depend on
+# them (the tmpfs events file is authoritative, the stdout mirror best-effort).
+LOG_STREAM_LIMIT = 8 * 1024 * 1024
+LOG_CAPTURE_TIMEOUT = 60
 RUN_QUOTA = 64 * 1024 * 1024
 MAX_RETAINED_RUNS = 8
 RETENTION_BUDGET = 8 * RUN_QUOTA
@@ -150,6 +166,7 @@ class RunStore:
         self.incomplete = []
 
     def write(self, rel, text):
+        """Text artifacts (logs, transcripts) carry the review-before-sharing header."""
         data = (ARTIFACT_HEADER + text).encode('utf-8', 'replace')
         budget = RUN_QUOTA - self.used
         if budget <= 0:
@@ -159,24 +176,88 @@ class RunStore:
         if not full:
             data = data[:budget]
             self.incomplete.append(f'{rel}: truncated to fit per-run {RUN_QUOTA}-byte quota')
+        self._write(rel, data)
+        return full
+
+    def write_jsonl(self, rel, data):
+        """Canonical machine JSONL: exact bytes, all-or-nothing, never a text header."""
+        if RUN_QUOTA - self.used < len(data):
+            self.incomplete.append(f'{rel}: per-run {RUN_QUOTA}-byte quota exhausted')
+            return False
+        self._write(rel, data)
+        return True
+
+    def _write(self, rel, data):
         path = self.dir / rel
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.write_bytes(data)
         os.chmod(path, 0o600)
         self.used += len(data)
-        return full
 
 
-def read_container_logs(ident):
-    """Split stdout/stderr; TTY containers merge both streams into stdout."""
+def read_container_logs(ident, limit=LOG_STREAM_LIMIT, timeout=LOG_CAPTURE_TIMEOUT):
+    """Stream split stdout/stderr into byte-capped buffers; never buffers unbounded.
+
+    The capture CLI is terminated only when a stream exceeds its cap or the
+    deadline passes, and it is always reaped. TTY containers merge both streams
+    into stdout. Returns (stdout_bytes, stderr_bytes, truncated).
+    """
     try:
-        p = subprocess.run(['docker', 'logs', ident], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
+        proc = subprocess.Popen(['docker', 'logs', ident], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    except OSError as e:
         raise RuntimeError(f'log capture failed: {type(e).__name__}') from e
-    if p.returncode:
+    buffers = {}
+    sel = selectors.DefaultSelector()
+    truncated = False
+    timed_out = False
+    try:
+        for stream in (proc.stdout, proc.stderr):
+            os.set_blocking(stream.fileno(), False)
+            buffers[stream.fileno()] = bytearray()
+            sel.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        while sel.get_map() and not truncated:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready = sel.select(remaining)
+            if not ready:
+                timed_out = True
+                break
+            for key, _ in ready:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except OSError:
+                    chunk = b''
+                if not chunk:
+                    try:
+                        sel.unregister(key.fileobj)
+                    except (KeyError, ValueError):
+                        pass
+                    continue
+                buf = buffers[key.fileobj.fileno()]
+                room = limit - len(buf)
+                if len(chunk) > room:
+                    buf += chunk[:room]
+                    truncated = True
+                else:
+                    buf += chunk
+    finally:
+        sel.close()
+        if truncated or timed_out:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    if timed_out:
+        raise RuntimeError('log capture timed out')
+    if proc.returncode and not truncated:
         raise RuntimeError('log capture failed')
-    return p.stdout.decode('utf-8', 'replace'), p.stderr.decode('utf-8', 'replace')
+    return (bytes(buffers[proc.stdout.fileno()]), bytes(buffers[proc.stderr.fileno()]), truncated)
 
 
 def read_remote_file(ident, remote):
@@ -189,26 +270,154 @@ def read_remote_file(ident, remote):
         return target.read_bytes()
 
 
-def capture(run, store, hosted):
-    """Capture split logs and session files from owned containers before removal."""
-    evidence = {}
-    for ident in owned('container', run):
-        safe = ident
+def docker_capture(*args, timeout=OBSERVER_TIMEOUT):
+    """Bounded Docker CLI call returning (exit code, stdout) even on failure."""
+    try:
+        p = subprocess.run(['docker', *args], text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f'Docker unavailable or timed out: {type(e).__name__}') from e
+    return p.returncode, p.stdout
+
+
+def parse_verdict(output):
+    """Last non-empty line as a JSON verdict dict; None when malformed."""
+    if not output:
+        return None
+    try:
+        lines = [line for line in output.strip().splitlines() if line.strip()]
+        verdict = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    return verdict if isinstance(verdict, dict) and isinstance(verdict.get('ok'), bool) else None
+
+
+def validate_events(data):
+    """Structural completeness gate for canonical event JSONL.
+
+    Requires a versioned session record, exactly one final record immediately
+    before a terminal successful stopped record; the packaged verifier remains
+    authoritative. Returns a problem string or None.
+    """
+    if not data or len(data) > EVENTS_MAX_BYTES:
+        return 'empty or over the byte limit'
+    if not data.endswith(b'\n'):
+        return 'missing terminating newline'
+    lines = data[:-1].split(b'\n')
+    if len(lines) > EVENTS_MAX_COUNT:
+        return 'event limit exceeded'
+    events = []
+    for index, line in enumerate(lines, 1):
+        if len(line) > EVENTS_MAX_LINE:
+            return f'line {index} over the line limit'
         try:
-            name = docker('inspect', '--format', '{{.Name}}', ident)
-            if name:
-                safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', name.lstrip('/'))
-            out, err = read_container_logs(ident)
-            store.write(f'logs/{safe}.stdout', redact(out))
-            store.write(f'logs/{safe}.stderr', redact(err))
-            record = {'logs': 'captured'}
-            events = read_remote_file(ident, EVENTS_PATH)
-            if events is None:
-                record['events'] = 'missing'
-            else:
-                store.write(f'events/{safe}.jsonl', redact(events.decode('utf-8', 'replace')))
-                record['events'] = 'captured'
-            if hosted:
+            event = json.loads(line)
+        except ValueError:
+            return f'line {index} is not valid JSON'
+        if not isinstance(event, dict) or not isinstance(event.get('type'), str):
+            return f'line {index} is not a typed event'
+        events.append(event)
+    if events[0].get('type') != 'session' or events[0].get('version') != 1:
+        return 'missing versioned session record'
+    finals = [i for i, event in enumerate(events) if event['type'] == 'final']
+    if finals != [len(events) - 2]:
+        return 'missing, duplicate, or misplaced final record'
+    stopped = events[-1]
+    if stopped.get('type') != 'stopped':
+        return 'missing stopped record'
+    if stopped.get('successful') is not True:
+        return 'stopped record reports unsuccessful exit'
+    if stopped.get('evidence_complete') is not True:
+        return 'stopped record reports incomplete evidence'
+    return None
+
+
+def extract_stdout_events(out):
+    """Losslessly mirror CCC_EVENT-prefixed canonical JSONL lines from raw stdout."""
+    if not out:
+        return None
+    prefix = EVENT_PREFIX.encode()
+    lines = [line[len(prefix):] for line in out.split(b'\n') if line.startswith(prefix)]
+    return b'\n'.join(lines) + b'\n' if lines else None
+
+
+def verify_game_events(run, image, canonical, hosted, cpu, parent=None):
+    """Replay both peers' canonical events with the image-packaged verifier.
+
+    Runs in a disposable network-less, read-only observer container mounting
+    only copied canonical files from a private host tempdir; never relays live
+    messages and never touches peer containers. Falls back to a host
+    ccc-verify-game binary only when the observer cannot run; never returns a
+    pass without verifier success. Returns (verdict, problem).
+    """
+    if parent is not None:
+        Path(parent).mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='ccc-verify-', dir=parent) as tmp:
+        os.chmod(tmp, 0o700)
+        paths = []
+        for index, name in enumerate(sorted(canonical)):
+            target = Path(tmp) / f'peer{index}.jsonl'
+            target.write_bytes(canonical[name])
+            os.chmod(target, 0o644)
+            paths.append(target)
+        extra = ['--require-agents'] if hosted else []
+        command = ['run', '--rm', '--network', 'none', '--entrypoint', VERIFIER,
+                   *common(run, cpu),
+                   '--mount', f'type=bind,source={paths[0]},target=/evidence/peer0.jsonl,readonly',
+                   '--mount', f'type=bind,source={paths[1]},target=/evidence/peer1.jsonl,readonly',
+                   image, *extra, '/evidence/peer0.jsonl', '/evidence/peer1.jsonl']
+        rc, output, via = 1, None, 'observer-container'
+        try:
+            rc, output = docker_capture(*command, timeout=OBSERVER_TIMEOUT)
+        except RuntimeError:
+            pass
+        verdict = parse_verdict(output)
+        if rc != 0 and verdict is None:
+            host = shutil.which('ccc-verify-game')
+            if host:
+                via = 'host-binary'
+                try:
+                    p = subprocess.run([host, *extra, *(str(p) for p in paths)], text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       timeout=OBSERVER_TIMEOUT)
+                    rc, output = p.returncode, p.stdout
+                except (OSError, subprocess.TimeoutExpired):
+                    rc, output = 1, None
+                verdict = parse_verdict(output)
+        if verdict is None:
+            return None, 'verifier produced no parseable verdict'
+        verdict['via'] = via
+        if rc == 0 and verdict.get('ok') is True:
+            return verdict, None
+        return verdict, f"verifier rejected evidence: {verdict.get('error', 'unknown error')}"
+
+
+def finalize(run, store, mode, image, cpu):
+    """Stop owned peers gracefully, then capture post-exit evidence and verify.
+
+    Order: transcript copy while peers run, SIGINT, bounded wait (forced
+    removal recorded, never hidden), post-exit log/events capture so the tmpfs
+    stopped record exists, then verifier replay. cleanup() removes containers
+    and networks afterwards. Returns (evidence, verdict, problems).
+    """
+    hosted = mode == 'agents'
+    game = mode in ('game', 'agents')
+    evidence = {}
+    canonical = {}
+    containers = owned('container', run)
+    names = {}
+    for ident in containers:
+        try:
+            raw = docker('inspect', '--format', '{{.Name}}', ident, check=False) or ident
+        except RuntimeError:
+            raw = ident
+        names[ident] = re.sub(r'[^A-Za-z0-9_.-]+', '_', raw.lstrip('/')) or ident
+    # The agent transcript is written while peers run; copy it before signaling.
+    if hosted:
+        for ident in containers:
+            safe = names[ident]
+            record = evidence.setdefault(safe, {})
+            try:
                 raw = read_remote_file(ident, TRANSCRIPT_PATH)
                 if raw is None:
                     record['transcript'] = 'missing'
@@ -216,22 +425,108 @@ def capture(run, store, hosted):
                     store.write(f'transcripts/{safe}.log', redact(raw.decode('utf-8', 'replace')))
                     record['transcript'] = ('truncated' if len(raw) >= TRANSCRIPT_QUOTA
                                             else 'captured')
-            evidence[safe] = record
-        except RuntimeError as e:
-            evidence[safe] = {'logs': f'capture-error: {e}'}
-    return evidence
+            except (RuntimeError, OSError) as e:
+                record['transcript'] = f'capture-error: {e}'
+    # Graceful stop: SIGINT owned peers, then a bounded wait; stragglers are
+    # forcibly removed and their evidence is missing, never invented.
+    for ident in containers:
+        docker('kill', '--signal', 'SIGINT', ident, check=False)
+    for ident in containers:
+        record = evidence.setdefault(names[ident], {})
+        try:
+            result = docker('wait', ident, timeout=WAIT_TIMEOUT)
+            record['exit'] = int(result) if result and re.fullmatch(r'-?\d+', result) else 'unknown'
+        except RuntimeError:
+            record['exit'] = 'forced'
+            docker('rm', '-f', ident, check=False)
+    # Logs and canonical events are collected only after exit, so the tmpfs
+    # events file includes the final stopped record.
+    for ident in containers:
+        safe = names[ident]
+        record = evidence.setdefault(safe, {})
+        out = None
+        try:
+            out, err, truncated = read_container_logs(ident)
+            store.write(f'logs/{safe}.stdout', redact(out.decode('utf-8', 'replace')))
+            store.write(f'logs/{safe}.stderr', redact(err.decode('utf-8', 'replace')))
+            record['logs'] = ('truncated at capture cap; diagnostic log bounded' if truncated
+                              else 'captured')
+        except (RuntimeError, OSError) as e:
+            record['logs'] = f'capture-error: {e}'
+        if not game:
+            continue
+        file_events = None
+        try:
+            raw = read_remote_file(ident, EVENTS_PATH)
+            if raw is None:
+                record['events'] = 'missing'
+            else:
+                problem = validate_events(raw)
+                if problem:
+                    record['events'] = f'incomplete: {problem}'
+                else:
+                    store.write_jsonl(f'events/{safe}.jsonl', raw)
+                    record['events'] = 'captured'
+                    file_events = raw
+        except (RuntimeError, OSError) as e:
+            record['events'] = f'capture-error: {e}'
+        mirror_events = None
+        mirror = extract_stdout_events(out)
+        if mirror is None:
+            record['events_stdout'] = 'unavailable' if out is None else 'missing'
+        else:
+            problem = validate_events(mirror)
+            if problem:
+                record['events_stdout'] = f'incomplete: {problem}'
+            else:
+                try:
+                    store.write_jsonl(f'events/{safe}.stdout.jsonl', mirror)
+                    record['events_stdout'] = 'captured'
+                    mirror_events = mirror
+                except OSError as e:
+                    record['events_stdout'] = f'capture-error: {e}'
+        if file_events is not None and mirror_events is not None and file_events != mirror_events:
+            record['events_disagreement'] = True
+        chosen = file_events if file_events is not None else mirror_events
+        if chosen is not None:
+            canonical[safe] = chosen
+    verdict = None
+    problems = []
+    if game:
+        if image and len(canonical) == 2:
+            try:
+                verdict, problem = verify_game_events(run, image, canonical, hosted, cpu,
+                                                      parent=store.dir)
+            except (RuntimeError, OSError) as e:
+                problem = f'verifier did not run: {e}'
+            if problem:
+                problems.append(f'game verification incomplete: {problem}')
+        else:
+            problems.append('game verification skipped: canonical events unavailable for both peers')
+    return evidence, verdict, problems
 
 
-def incomplete_reasons(store, evidence, hosted):
+def incomplete_reasons(store, evidence, mode):
+    hosted = mode == 'agents'
+    game = mode in ('game', 'agents')
     reasons = list(store.incomplete)
     for name, record in evidence.items():
-        for key, value in sorted(record.items()):
-            if str(value).startswith('capture-error'):
-                reasons.append(f'{name}: {value}')
-        if record.get('events') != 'captured':
-            reasons.append(f'{name}: events {record.get("events", "not captured")}')
+        if record.get('logs') != 'captured':
+            reasons.append(f'{name}: logs {record.get("logs") or "not captured"}')
+        if game:
+            if record.get('events') != 'captured':
+                reasons.append(f'{name}: events {record.get("events") or "not captured"}')
+            if record.get('events_disagreement'):
+                reasons.append(f'{name}: events stdout mirror disagrees with events file')
         if hosted and record.get('transcript') != 'captured':
-            reasons.append(f'{name}: transcript {record.get("transcript", "not captured")}')
+            reasons.append(f'{name}: transcript {record.get("transcript") or "not captured"}')
+        exit_status = record.get('exit')
+        if exit_status is None or exit_status == 'unknown':
+            reasons.append(f'{name}: peer exit not observed')
+        elif exit_status == 'forced':
+            reasons.append(f'{name}: peer did not exit within {WAIT_TIMEOUT}s of SIGINT; forcibly removed')
+        elif exit_status != 0:
+            reasons.append(f'{name}: peer exit {exit_status}')
     return reasons
 
 
@@ -243,21 +538,25 @@ def stop(run):
         raise RuntimeError('run manifest unavailable or invalid') from e
     if data.get('run_id') != run or data.get('label') != LABEL:
         raise RuntimeError('run manifest ownership mismatch')
-    hosted = data.get('mode') == 'agents'
+    mode = data.get('mode')
     remaining = owned('container', run) + owned('network', run)
     if not remaining and data.get('status') in ('stopped', 'failed'):
         print(f'Run {run} already {data["status"]}; artifacts retained under {STATE / run}')
         return
     store = RunStore(run)
-    evidence = capture(run, store, hosted)
+    evidence, verdict, problems = finalize(run, store, mode, data.get('image_id'),
+                                           data.get('cpu', 0))
     cleanup(run)
     merged = data.get('evidence') or {}
     merged.update(evidence)
     data['evidence'] = merged
+    if verdict is not None:
+        data['game_verdict'] = verdict
     if data.get('status') != 'failed':
         data['status'] = 'stopped'
     data['end'] = int(time.time())
-    reasons = incomplete_reasons(store, evidence, hosted)
+    data['artifact_warning'] = ARTIFACT_HEADER.strip()
+    reasons = incomplete_reasons(store, evidence, mode) + problems
     if reasons:
         data['incomplete'] = True
         data['incomplete_reasons'] = sorted(set(data.get('incomplete_reasons', []) + reasons))
@@ -270,7 +569,8 @@ def common(run, cpu):
     return ['--label', f'{LABEL}={run}', '--init', '--ipc', 'private', '--read-only',
             '--tmpfs', '/tmp:rw,nosuid,size=64m', '--security-opt', 'no-new-privileges',
             '--cap-drop', 'ALL', '--user', '65532:65532', '--memory', '768m',
-            '--pids-limit', '128', '--cpuset-cpus', str(cpu)]
+            '--pids-limit', '128', '--cpuset-cpus', str(cpu), '--cgroupns', 'private',
+            '--log-opt', 'max-size=4m', '--log-opt', 'max-file=2']
 
 
 def parse_probe_reports(sender, receiver):
@@ -448,10 +748,15 @@ def launch(args):
             print('Live controls: both same-network listeners reachable; A-to-B and B-to-A listener IP TCP paths denied or timed out; IPv6 disabled.')
         mode = 'game' if hosted else args.command
         for role, name, net in zip(('a', 'b'), names, nets):
+            # Game peers emit canonical events to the tmpfs file and mirror them
+            # to stdout with the CCC_EVENT prefix; chat is plain-only and has no
+            # game verifier.
+            extra = ['--plain']
+            if mode == 'game':
+                extra += ['--events-stdout', '--events-path', EVENTS_PATH]
             docker('create', '-it', '--name', name, '--network', net, *common(run, args.cpu),
                    *envargs, image, mode, '--role', role, '--channel', args.channel,
-                   '--slot-ms', str(SLOT), '--events-path', EVENTS_PATH,
-                   *(['--agent'] if hosted else []))
+                   '--slot-ms', str(SLOT), *extra, *(['--agent'] if hosted else []))
         check = [str(ROOT / 'scripts' / 'inspect-isolation.sh')]
         if hosted:
             check.append('--hosted')
@@ -465,19 +770,25 @@ def launch(args):
         print(f'Attach in separate terminals: docker attach {names[0]}   and   docker attach {names[1]}')
         print('Detach without stopping: Ctrl-p Ctrl-q')
         print(f'Stop: scripts/demo.sh stop --run-id {run}')
-        print(f'On stop, bounded evidence is retained under {STATE / run} (review before sharing; not guaranteed secret-free).')
+        if mode == 'game':
+            print('On stop, peers get SIGINT (bounded wait), canonical events are replayed by the image-packaged verifier in an isolated observer, and the verdict is recorded.')
+        print(f'Bounded evidence is retained under {STATE / run} (review before sharing; not guaranteed secret-free).')
         print('50 ms slots: a 19-byte control frame takes about 20 seconds; retries and games can take minutes. No delivery guarantee.')
     except BaseException as e:
         try:
             store = RunStore(run)
-            evidence = capture(run, store, hosted)
+            evidence, verdict, problems = finalize(run, store, args.command,
+                                                   manifest.get('image_id'), args.cpu)
             cleanup(run)
             if evidence:
                 manifest['evidence'] = evidence
+            if verdict is not None:
+                manifest['game_verdict'] = verdict
             manifest['status'] = 'failed'
             manifest['end'] = int(time.time())
             manifest['error'] = redact(str(e))[:500]
-            reasons = incomplete_reasons(store, evidence, hosted)
+            manifest['artifact_warning'] = ARTIFACT_HEADER.strip()
+            reasons = incomplete_reasons(store, evidence, args.command) + problems
             if reasons:
                 manifest['incomplete'] = True
                 manifest['incomplete_reasons'] = reasons

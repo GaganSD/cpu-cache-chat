@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -12,6 +14,17 @@ path = Path(__file__).resolve().parents[1] / 'launch.py'
 spec = importlib.util.spec_from_file_location('launch', path)
 launch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launch)
+
+EVENTS_A = (b'{"type":"session","version":1,"session":7,"role":"A"}\n'
+            b'{"type":"final","board":"XOXOXOXOX","ply":9,"outcome":"draw"}\n'
+            b'{"type":"stopped","successful":true,"evidence_complete":true}\n')
+EVENTS_B = EVENTS_A.replace(b'"role":"A"', b'"role":"B"')
+MOVE = b'{"type":"move","ply":0,"square":5,"mark":"X","sequence":1,"acceptance":"local_ack"}'
+
+
+def mirror(events, prefix=b''):
+    return prefix + b''.join(launch.EVENT_PREFIX.encode() + line + b'\n'
+                             for line in events.split(b'\n') if line)
 
 
 class LauncherTests(unittest.TestCase):
@@ -37,6 +50,13 @@ class LauncherTests(unittest.TestCase):
         return argparse.Namespace(command=command, provider=provider, channel='cpu', cpu=0,
                                   image=None, skip_preflight=True)
 
+    def write_manifest(self, run, mode):
+        path = launch.STATE / (run + '.json')
+        path.write_text(json.dumps({'run_id': run, 'label': launch.LABEL, 'mode': mode,
+                                    'status': 'running', 'image_id': 'sha256:' + 'a' * 64,
+                                    'cpu': 0}))
+        return path
+
     def test_manual_and_stop(self):
         with patch.object(launch, 'docker', self.docker), patch.object(launch.subprocess, 'run'):
             launch.launch(self.args())
@@ -49,21 +69,41 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(data['probe'], 'skipped')
             self.assertEqual(data['events_path'], '/tmp/game.events.jsonl')
             self.assertIn('binary_version', data)
-            self.assertEqual(len([c for c in self.calls if c[0] == 'create']), 2)
-            for c in [c for c in self.calls if c[0] == 'create']:
+            creates = [c for c in self.calls if c[0] == 'create']
+            self.assertEqual(len(creates), 2)
+            for c in creates:
                 self.assertIn('--read-only', c)
+                self.assertIn('--cgroupns', c)
+                self.assertIn('private', c)
+                self.assertIn('max-size=4m', c)
+                self.assertIn('max-file=2', c)
                 self.assertIn('sha256:' + 'a' * 64, c)
                 self.assertIn('none', c)
-                self.assertIn('--events-path', c)
-                self.assertIn('/tmp/game.events.jsonl', c)
+                self.assertIn('--plain', c)
+                # Chat is plain-only: no game events, no game verifier.
+                self.assertNotIn('--events-path', c)
+                self.assertNotIn('--events-stdout', c)
             launch.stop(data['run_id'])
             data = json.loads(files[0].read_text())
             self.assertEqual(data['status'], 'stopped')
             self.assertIsNotNone(data['end'])
+            self.assertNotIn('incomplete', data)
             self.assertTrue(any(f'{launch.LABEL}={data["run_id"]}' in x for c in self.calls for x in c))
             # Stopping again is idempotent and retains the manifest.
             launch.stop(data['run_id'])
             self.assertTrue(files[0].exists())
+
+    def test_game_launch_flags(self):
+        with patch.object(launch, 'docker', self.docker), patch.object(launch.subprocess, 'run'):
+            launch.launch(self.args('game'))
+            creates = [c for c in self.calls if c[0] == 'create']
+            self.assertEqual(len(creates), 2)
+            for c in creates:
+                self.assertIn('--plain', c)
+                self.assertIn('--events-stdout', c)
+                self.assertIn('--events-path', c)
+                self.assertIn('/tmp/game.events.jsonl', c)
+                self.assertNotIn('--agent', c)
 
     def test_hosted_and_secret_absence(self):
         with patch.dict(os.environ, {'CCC_HOSTED_OPT_IN': '1', 'OPENCODE_GO_API_KEY': 'secret-value'}), \
@@ -80,6 +120,8 @@ class LauncherTests(unittest.TestCase):
             for c in [c for c in self.calls if c[0] == 'create']:
                 self.assertIn('CCC_AGENT_TRANSCRIPT_PATH=/tmp/agent-transcript.log', c)
                 self.assertIn('CCC_AGENT_DEBUG=1', c)
+                self.assertIn('--events-stdout', c)
+                self.assertIn('--agent', c)
 
     def test_gateway_alias_and_model(self):
         with patch.dict(os.environ, {'CCC_HOSTED_OPT_IN': '1', 'AI_GATEWAY_API_KEY': '',
@@ -219,45 +261,71 @@ class LauncherTests(unittest.TestCase):
             launch.stop(run)
 
     def hosted_manifest(self, run):
-        path = launch.STATE / (run + '.json')
-        path.write_text(json.dumps({'run_id': run, 'label': launch.LABEL, 'mode': 'agents',
-                                    'status': 'running'}))
+        return self.write_manifest(run, 'agents')
 
-    def test_stop_captures_redacts_before_removal(self):
-        run = 'b' * 32
-        self.hosted_manifest(run)
+    def peer_docker(self, containers=('cid-a', 'cid-b'), networks=('net-1',), wait_result='0',
+                    events=(EVENTS_A, EVENTS_B), transcripts=(None, b'raw model transcript\n')):
         def fake(*args, **kwargs):
             self.calls.append(args)
             if args[:2] == ('ps', '-aq'):
-                return 'cid-a\ncid-b'
+                return '\n'.join(containers)
             if args[:2] == ('network', 'ls'):
-                return ''
+                return '\n'.join(networks)
+            if args[0] == 'wait':
+                if isinstance(wait_result, Exception):
+                    raise wait_result
+                return wait_result
             if args[0] == 'inspect':
                 return 'ccc-' + args[-1]
             if args[0] == 'cp':
-                if 'game.events.jsonl' in args[1]:
-                    Path(args[-1]).write_text('{"type":"move"}\n')
+                ident = args[1].split(':')[0]
+                index = containers.index(ident)
+                if 'game.events.jsonl' in args[1] and events[index] is not None:
+                    Path(args[-1]).write_bytes(events[index])
                     return ''
-                if 'agent-transcript.log' in args[1] and 'cid-b' in args[1]:
-                    Path(args[-1]).write_text('raw model transcript\n')
+                if 'agent-transcript.log' in args[1] and transcripts[index] is not None:
+                    Path(args[-1]).write_bytes(transcripts[index])
                     return ''
                 return None
             return 'ok'
-        logs = ('session Bearer tok-abcdef123 api_key=hunter2secret live-secret-value\n', 'debug err\n')
+        return fake
+
+    def test_stop_orders_capture_and_records_verdict(self):
+        run = 'b' * 32
+        self.hosted_manifest(run)
+        secret_log = b'session Bearer tok-abcdef123 api_key=hunter2secret live-secret-value\n'
+        logs = {'cid-a': (mirror(EVENTS_A, secret_log), b'debug err\n', False),
+                'cid-b': (mirror(EVENTS_B), b'', False)}
+        verdict = (0, '{"ok": true, "session": 7, "outcome": "draw", "agents_verified": true}')
         with patch.dict(os.environ, {'OPENCODE_GO_API_KEY': 'live-secret-value'}), \
-             patch.object(launch, 'docker', fake), \
-             patch.object(launch, 'read_container_logs', return_value=logs):
+             patch.object(launch, 'docker', self.peer_docker()), \
+             patch.object(launch, 'read_container_logs', side_effect=lambda ident, **kw: logs[ident]), \
+             patch.object(launch, 'docker_capture', return_value=verdict):
             launch.stop(run)
         data = json.loads((launch.STATE / (run + '.json')).read_text())
         self.assertEqual(data['status'], 'stopped')
-        self.assertEqual(data['evidence']['ccc-cid-a']['transcript'], 'missing')
+        self.assertEqual(data['game_verdict']['ok'], True)
+        self.assertEqual(data['game_verdict']['via'], 'observer-container')
+        rec_a = data['evidence']['ccc-cid-a']
+        self.assertEqual(rec_a['events'], 'captured')
+        self.assertEqual(rec_a['events_stdout'], 'captured')
+        self.assertEqual(rec_a['exit'], 0)
+        self.assertEqual(rec_a['logs'], 'captured')
+        self.assertEqual(rec_a['transcript'], 'missing')
         self.assertEqual(data['evidence']['ccc-cid-b']['transcript'], 'captured')
         self.assertTrue(data['incomplete'])
         self.assertTrue(any('transcript missing' in r for r in data['incomplete_reasons']))
-        # docker cp of every artifact precedes any removal of that container.
-        last_cp = max(i for i, c in enumerate(self.calls) if c[0] == 'cp')
-        first_rm = min(i for i, c in enumerate(self.calls) if c[:2] == ('rm', '-f'))
-        self.assertLess(last_cp, first_rm)
+        self.assertFalse(any('verification' in r for r in data['incomplete_reasons']))
+        # Canonical event files are byte-exact, headerless, strict JSONL.
+        for name, events in (('ccc-cid-a', EVENTS_A), ('ccc-cid-b', EVENTS_B)):
+            for suffix in ('.jsonl', '.stdout.jsonl'):
+                path = launch.STATE / run / 'events' / f'{name}{suffix}'
+                self.assertEqual(path.read_bytes(), events)
+                self.assertFalse(path.read_text().startswith('REVIEW BEFORE SHARING'))
+                for line in path.read_text().splitlines():
+                    json.loads(line)
+            self.assertNotIn('live-secret-value', path.read_text())
+        # Text artifacts keep the warning header and are redacted.
         out = (launch.STATE / run / 'logs' / 'ccc-cid-a.stdout').read_text()
         self.assertTrue(out.startswith('REVIEW BEFORE SHARING'))
         for secret in ('hunter2secret', 'live-secret-value', 'tok-abcdef123'):
@@ -266,7 +334,87 @@ class LauncherTests(unittest.TestCase):
         # Missing artifacts are recorded, never invented.
         self.assertFalse((launch.STATE / run / 'transcripts' / 'ccc-cid-a.log').exists())
         self.assertTrue((launch.STATE / run / 'transcripts' / 'ccc-cid-b.log').exists())
-        self.assertTrue((launch.STATE / run / 'events' / 'ccc-cid-a.jsonl').exists())
+        # Ordering: transcript copy while peers live, SIGINT, bounded wait,
+        # post-exit events copy, container removal, then network removal.
+        index = lambda pred: [i for i, c in enumerate(self.calls) if pred(c)]
+        tx_cp = index(lambda c: c[0] == 'cp' and 'agent-transcript.log' in c[1])
+        ev_cp = index(lambda c: c[0] == 'cp' and 'game.events.jsonl' in c[1])
+        kills = index(lambda c: c[:2] == ('kill', '--signal'))
+        waits = index(lambda c: c[0] == 'wait')
+        rms = index(lambda c: c[:2] == ('rm', '-f'))
+        netrms = index(lambda c: c[:2] == ('network', 'rm'))
+        self.assertTrue(all((tx_cp, ev_cp, kills, waits, rms, netrms)))
+        self.assertLess(max(tx_cp), min(kills))
+        self.assertLess(max(kills), min(waits))
+        self.assertLess(max(waits), min(ev_cp))
+        self.assertLess(max(ev_cp), min(rms))
+        self.assertLess(max(rms), min(netrms))
+        self.assertTrue(all(c[2] == 'SIGINT' for c in self.calls if c[:2] == ('kill', '--signal')))
+
+    def test_missing_final_or_stopped_marks_incomplete(self):
+        run = '1' * 32
+        path = self.write_manifest(run, 'game')
+        no_stopped = EVENTS_A.replace(
+            b'{"type":"stopped","successful":true,"evidence_complete":true}', MOVE)
+        bad_stop = EVENTS_A.replace(b'"successful":true', b'"successful":false')
+        with patch.object(launch, 'docker', self.peer_docker(events=(no_stopped, bad_stop),
+                                                             transcripts=(None, None))), \
+             patch.object(launch, 'read_container_logs', return_value=(b'', b'', False)), \
+             patch.object(launch, 'docker_capture') as capture_mock:
+            launch.stop(run)
+        data = json.loads(path.read_text())
+        self.assertEqual(data['evidence']['ccc-cid-a']['events'],
+                         'incomplete: missing stopped record')
+        self.assertEqual(data['evidence']['ccc-cid-b']['events'],
+                         'incomplete: stopped record reports unsuccessful exit')
+        self.assertTrue(data['incomplete'])
+        self.assertTrue(any('missing stopped record' in r for r in data['incomplete_reasons']))
+        self.assertTrue(any('unsuccessful exit' in r for r in data['incomplete_reasons']))
+        self.assertTrue(any('verification skipped' in r for r in data['incomplete_reasons']))
+        # No verdict is invented and malformed evidence is never stored as canonical.
+        self.assertNotIn('game_verdict', data)
+        capture_mock.assert_not_called()
+        self.assertFalse((launch.STATE / run / 'events' / 'ccc-cid-a.jsonl').exists())
+
+    def test_observed_exit_failure_marks_incomplete(self):
+        run = '2' * 32
+        path = self.write_manifest(run, 'game')
+        with patch.object(launch, 'docker', self.peer_docker(containers=('cid-a',),
+                                                             networks=(), wait_result='1',
+                                                             events=(EVENTS_A,),
+                                                             transcripts=(None,))), \
+             patch.object(launch, 'read_container_logs',
+                          return_value=(mirror(EVENTS_A), b'', False)), \
+             patch.object(launch, 'docker_capture') as capture_mock:
+            launch.stop(run)
+        data = json.loads(path.read_text())
+        record = data['evidence']['ccc-cid-a']
+        self.assertEqual(record['exit'], 1)
+        self.assertEqual(record['events'], 'captured')
+        self.assertTrue(any('peer exit 1' in r for r in data['incomplete_reasons']))
+        capture_mock.assert_not_called()
+
+    def test_unresponsive_peer_escalates_and_never_invents(self):
+        run = '3' * 32
+        path = self.write_manifest(run, 'game')
+        fake = self.peer_docker(containers=('cid-a',), networks=(),
+                                wait_result=RuntimeError('timed out'),
+                                events=(None,), transcripts=(None,))
+        with patch.object(launch, 'docker', fake), \
+             patch.object(launch, 'read_container_logs',
+                          side_effect=RuntimeError('log capture failed')):
+            launch.stop(run)
+        data = json.loads(path.read_text())
+        record = data['evidence']['ccc-cid-a']
+        self.assertEqual(record['exit'], 'forced')
+        self.assertEqual(record['events'], 'missing')
+        self.assertTrue(record['logs'].startswith('capture-error'))
+        reasons = data['incomplete_reasons']
+        self.assertTrue(any('forcibly removed' in r for r in reasons))
+        self.assertTrue(any('events missing' in r for r in reasons))
+        self.assertNotIn('game_verdict', data)
+        self.assertTrue(any(c[:2] == ('rm', '-f') and 'cid-a' in c for c in self.calls))
+        self.assertFalse((launch.STATE / run / 'events' / 'ccc-cid-a.jsonl').exists())
 
     def test_truncated_transcript_marks_incomplete(self):
         run = 'c' * 32
@@ -277,19 +425,150 @@ class LauncherTests(unittest.TestCase):
                 return 'cid-a'
             if args[:2] == ('network', 'ls'):
                 return ''
+            if args[0] == 'wait':
+                return '0'
             if args[0] == 'inspect':
                 return 'ccc-' + args[-1]
             if args[0] == 'cp':
-                Path(args[-1]).write_bytes(b'x' * launch.TRANSCRIPT_QUOTA)
-                return ''
+                if 'agent-transcript.log' in args[1]:
+                    Path(args[-1]).write_bytes(b'x' * launch.TRANSCRIPT_QUOTA)
+                    return ''
+                return None
             return 'ok'
         with patch.object(launch, 'docker', fake), \
-             patch.object(launch, 'read_container_logs', return_value=('', '')), \
+             patch.object(launch, 'read_container_logs', return_value=(b'', b'', False)), \
              patch.object(launch, 'TRANSCRIPT_QUOTA', 8):
             launch.stop(run)
         data = json.loads((launch.STATE / (run + '.json')).read_text())
         self.assertEqual(data['evidence']['ccc-cid-a']['transcript'], 'truncated')
         self.assertTrue(any('transcript truncated' in r for r in data['incomplete_reasons']))
+
+    def test_validate_events_gate(self):
+        self.assertIsNone(launch.validate_events(EVENTS_A))
+        self.assertIn('empty', launch.validate_events(b''))
+        self.assertIn('terminating newline', launch.validate_events(EVENTS_A.rstrip(b'\n')))
+        self.assertIn('not valid JSON', launch.validate_events(b'{oops}\n'))
+        self.assertIn('session', launch.validate_events(
+            EVENTS_A.replace(b'"type":"session"', b'"type":"move"', 1)))
+        no_final = EVENTS_A.replace(
+            b'{"type":"final","board":"XOXOXOXOX","ply":9,"outcome":"draw"}\n', b'')
+        self.assertIn('final', launch.validate_events(no_final))
+        no_stopped = EVENTS_A.replace(
+            b'{"type":"stopped","successful":true,"evidence_complete":true}', MOVE)
+        self.assertIn('stopped', launch.validate_events(no_stopped))
+        self.assertIn('unsuccessful', launch.validate_events(
+            EVENTS_A.replace(b'"successful":true', b'"successful":false')))
+        self.assertIn('incomplete evidence', launch.validate_events(
+            EVENTS_A.replace(b'"evidence_complete":true', b'"evidence_complete":false')))
+        after_stopped = EVENTS_A + MOVE + b'\n'
+        self.assertIn('final', launch.validate_events(after_stopped))
+        self.assertIn('byte limit', launch.validate_events(EVENTS_A + b' ' * launch.EVENTS_MAX_BYTES))
+
+    def test_extract_stdout_events_lossless(self):
+        out = b'noise\n' + mirror(EVENTS_A)
+        self.assertEqual(launch.extract_stdout_events(out), EVENTS_A)
+        trailing = out + b'CCC_EVENT not-json'
+        self.assertEqual(launch.extract_stdout_events(trailing), EVENTS_A + b'not-json\n')
+        self.assertIsNone(launch.extract_stdout_events(b'no prefixed lines\n'))
+        self.assertIsNone(launch.extract_stdout_events(b''))
+
+    def test_log_streaming_reads_split_streams(self):
+        script = ('import sys; sys.stdout.write("out"); sys.stdout.flush(); '
+                  'sys.stderr.write("err"); sys.stderr.flush()')
+        with patch.object(launch.subprocess, 'Popen', self.fake_popen(script)):
+            out, err, truncated = launch.read_container_logs('cid', limit=4096, timeout=30)
+        self.assertFalse(truncated)
+        self.assertEqual(out, b'out')
+        self.assertEqual(err, b'err')
+
+    def test_log_streaming_cap_terminates_capture_cli(self):
+        script = 'import sys; sys.stdout.write("x" * 1000000); sys.stdout.flush()'
+        with patch.object(launch.subprocess, 'Popen', self.fake_popen(script)):
+            out, _err, truncated = launch.read_container_logs('cid', limit=4096, timeout=30)
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(out), 4096)
+
+    def test_log_streaming_timeout_terminates_capture_cli(self):
+        script = 'import time; time.sleep(30)'
+        with patch.object(launch.subprocess, 'Popen', self.fake_popen(script)):
+            with self.assertRaisesRegex(RuntimeError, 'timed out'):
+                launch.read_container_logs('cid', timeout=0.5)
+
+    def fake_popen(self, script):
+        real_popen = subprocess.Popen
+        def fake(_cmd, **kwargs):
+            return real_popen([sys.executable, '-c', script], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        return fake
+
+    def test_observer_hardening_and_verdict(self):
+        calls = []
+        def fake_capture(*args, **kwargs):
+            calls.append(args)
+            return 0, '{"ok": true, "session": 7, "outcome": "draw", "agents_verified": true}'
+        with patch.object(launch, 'docker_capture', fake_capture):
+            verdict, problem = launch.verify_game_events(
+                'a' * 32, 'sha256:' + 'a' * 64, {'ccc-x-a': EVENTS_A, 'ccc-x-b': EVENTS_B}, True, 0)
+        self.assertIsNone(problem)
+        self.assertEqual(verdict['via'], 'observer-container')
+        args = calls[0]
+        self.assertEqual(args[0], 'run')
+        for flag in ('--rm', '--network', 'none', '--read-only', '--require-agents',
+                     '--cgroupns', '/usr/local/bin/ccc-verify-game', f'{launch.LABEL}=' + 'a' * 32):
+            self.assertIn(flag, args)
+        binds = [a for a in args if a.startswith('type=bind')]
+        self.assertEqual(len(binds), 2)
+        for bind in binds:
+            self.assertTrue(bind.endswith('readonly'))
+        with patch.object(launch, 'docker_capture', fake_capture):
+            launch.verify_game_events('a' * 32, 'img', {'a': EVENTS_A, 'b': EVENTS_B}, False, 0)
+        self.assertNotIn('--require-agents', calls[-1])
+
+    def test_verifier_rejection_records_failure(self):
+        def fake_capture(*args, **kwargs):
+            return 1, '{"ok": false, "error": "peer boards or move histories disagree"}'
+        with patch.object(launch, 'docker_capture', fake_capture):
+            verdict, problem = launch.verify_game_events(
+                'a' * 32, 'img', {'a': EVENTS_A, 'b': EVENTS_B}, False, 0)
+        self.assertEqual(verdict['ok'], False)
+        self.assertIn('peer boards', problem)
+
+    def test_host_binary_fallback_and_unverified_absence(self):
+        def fake_capture(*args, **kwargs):
+            return 1, ''
+        with patch.object(launch, 'docker_capture', fake_capture), \
+             patch.object(launch.shutil, 'which', return_value=None):
+            verdict, problem = launch.verify_game_events(
+                'a' * 32, 'img', {'a': EVENTS_A, 'b': EVENTS_B}, False, 0)
+        self.assertIsNone(verdict)
+        self.assertIn('no parseable verdict', problem)
+        result = subprocess.CompletedProcess(args=[], returncode=0,
+                                             stdout='{"ok": true, "outcome": "draw"}')
+        with patch.object(launch, 'docker_capture', fake_capture), \
+             patch.object(launch.shutil, 'which', return_value='/usr/local/bin/ccc-verify-game'), \
+             patch.object(launch.subprocess, 'run', return_value=result):
+            verdict, problem = launch.verify_game_events(
+                'a' * 32, 'img', {'a': EVENTS_A, 'b': EVENTS_B}, False, 0)
+        self.assertIsNone(problem)
+        self.assertEqual(verdict['via'], 'host-binary')
+
+    def test_redacted_artifacts_count_against_quota(self):
+        run = '4' * 32
+        path = self.write_manifest(run, 'chat')
+        fake = self.peer_docker(containers=('cid-a',), networks=(), events=(None,),
+                                transcripts=(None,))
+        with patch.object(launch, 'docker', fake), \
+             patch.object(launch, 'read_container_logs',
+                          return_value=(b'Bearer abcdef123456 secret\n', b'', False)), \
+             patch.object(launch, 'RUN_QUOTA', 64):
+            launch.stop(run)
+        data = json.loads(path.read_text())
+        self.assertTrue(data['incomplete'])
+        self.assertTrue(any('quota' in r for r in data['incomplete_reasons']))
+        total = sum(p.stat().st_size for p in (launch.STATE / run).rglob('*') if p.is_file())
+        self.assertLessEqual(total, 64)
+        out = (launch.STATE / run / 'logs' / 'ccc-cid-a.stdout').read_text()
+        self.assertNotIn('abcdef123456', out)
 
     def test_run_store_quota(self):
         with patch.object(launch, 'RUN_QUOTA', 256):
@@ -304,6 +583,19 @@ class LauncherTests(unittest.TestCase):
             self.assertFalse(store2.write('a', 'z' * 1024))
             total = sum(p.stat().st_size for p in store2.dir.rglob('*') if p.is_file())
             self.assertLessEqual(total, 256)
+
+    def test_run_store_jsonl_is_exact_headerless_all_or_nothing(self):
+        with patch.object(launch, 'RUN_QUOTA', 256):
+            store = launch.RunStore('6' * 32)
+            self.assertTrue(store.write_jsonl('events/peer.jsonl', EVENTS_A))
+            path = store.dir / 'events' / 'peer.jsonl'
+            self.assertEqual(path.read_bytes(), EVENTS_A)
+            self.assertFalse(path.read_text().startswith('REVIEW BEFORE SHARING'))
+            for line in path.read_text().splitlines():
+                json.loads(line)
+            self.assertFalse(store.write_jsonl('events/big.jsonl', b'x' * 300))
+            self.assertFalse((store.dir / 'events' / 'big.jsonl').exists())
+            self.assertTrue(store.incomplete)
 
     def test_retention_budget_refuses_launch(self):
         for i in range(launch.MAX_RETAINED_RUNS):
