@@ -96,6 +96,7 @@ dependencies = [
  "ccc-core",
  "ccc-game",
  "ccc-protocol",
+ "libc",
  "serde_json",
 ]
 

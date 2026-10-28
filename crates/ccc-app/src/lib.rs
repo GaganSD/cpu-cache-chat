@@ -1,7 +1,6 @@
 //! Session orchestration. No terminal drawing.
 
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +8,8 @@ use ccc_channel::open_wire;
 use ccc_core::{AppKind, Delivery, Error, LinkState, Mark, Role, RuntimeConfig};
 use ccc_game::{Board, Outcome};
 use ccc_protocol::{new_session_id, AppMessage, GameCtrl, Link, LinkEvent, Wire};
+
+pub mod agent;
 
 #[derive(Debug, Clone)]
 pub struct ChatLine {
@@ -183,91 +184,29 @@ impl<W: Wire> Session<W> {
         if !self.cfg.agent || !self.our_turn() {
             return Ok(None);
         }
-        let mut command = match self.cfg.agent_cmd.as_deref() {
-            Some(cmd) if cmd.trim().is_empty() => {
-                return Err(Error::Agent("empty agent command".into()))
-            }
-            Some(cmd) if cmd.chars().any(char::is_whitespace) => {
-                let mut command = Command::new("sh");
-                command.arg("-c").arg(format!("exec {cmd}"));
-                command
-            }
-            Some(binary) => {
-                let mut command = Command::new(binary);
-                command.arg("/opt/ccc/agent/src/play.mjs");
-                command
-            }
-            None => {
-                let mut command = Command::new("node");
-                command.arg("/opt/ccc/agent/src/play.mjs");
-                command
-            }
+        let command = agent::CommandSpec::legacy(self.cfg.agent_cmd.as_deref())?;
+        let request = agent::AgentRequest {
+            session: 0,
+            generation: u64::from(self.board.ply()),
+            request_id: 0,
+            board: self.board.compact(),
+            turn: self.board.turn().glyph().to_string(),
+            legal: self.board.legal_squares(),
         };
-        command.env_remove("CCC_ALLOW_FIRST_LEGAL");
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::Agent(e.to_string()))?;
-        use std::io::Write;
-        if let Some(stdin) = child.stdin.as_mut() {
-            let body = format!(
-                "{{\"board\":\"{}\",\"turn\":\"{}\",\"legal\":{:?}}}\n",
-                self.board.compact(),
-                self.board.turn().glyph(),
-                self.board.legal_squares()
+        let job = agent::AgentJob::spawn(
+            command,
+            request,
+            agent::Limits::default(),
+            self.stop.clone(),
+        )?;
+        let result = job.wait()?;
+        if std::env::var_os("CCC_AGENT_DEBUG").is_some() && !result.stderr.is_empty() {
+            eprintln!(
+                "agent stderr: {}",
+                escape_controls(&String::from_utf8_lossy(&result.stderr))
             );
-            stdin
-                .write_all(body.as_bytes())
-                .map_err(|e| Error::Agent(e.to_string()))?;
         }
-        drop(child.stdin.take());
-        // Above play.mjs's own 90-second deadline so the player's error,
-        // not the kill, is what gets reported when inference is slow.
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
-        loop {
-            if child
-                .try_wait()
-                .map_err(|e| Error::Agent(e.to_string()))?
-                .is_some()
-            {
-                break;
-            }
-            if self
-                .stop
-                .as_ref()
-                .is_some_and(|stop| stop.load(Ordering::SeqCst))
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::Interrupted);
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::Agent("agent timed out after 120 seconds".into()));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| Error::Agent(e.to_string()))?;
-        if !out.status.success() {
-            return Err(Error::Agent(format!(
-                "agent exit {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
-        // Successful agent stderr is normally discarded; CCC_AGENT_DEBUG
-        // forwards it so evidence runs can retain model transcripts.
-        if std::env::var_os("CCC_AGENT_DEBUG").is_some() && !out.stderr.is_empty() {
-            eprintln!("agent stderr: {}", String::from_utf8_lossy(&out.stderr));
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let square = parse_square(&text)?;
-        Ok(Some(square))
+        Ok(Some(result.square))
     }
 
     fn apply(&mut self, events: Vec<LinkEvent>) -> Vec<String> {
