@@ -36,7 +36,9 @@ try:
         require(config['User'] == '65532:65532', 'unexpected user')
         require('ALL' in (h['CapDrop'] or []), 'capabilities not dropped')
         require(not h['CapAdd'], 'added capabilities')
-        require(any(x in ('no-new-privileges', 'no-new-privileges:true') for x in (h['SecurityOpt'] or [])), 'no-new-privileges missing')
+        opts = h['SecurityOpt'] or []
+        require(any(x in ('no-new-privileges', 'no-new-privileges:true') for x in opts), 'no-new-privileges missing')
+        require(all(x in ('no-new-privileges', 'no-new-privileges:true') for x in opts), 'unexpected security option')
         require(not h['Devices'] and not h.get('DeviceRequests') and not h.get('DeviceCgroupRules'), 'devices exposed')
         require(not h['PortBindings'] and not config.get('ExposedPorts') and not h['PublishAllPorts'], 'ports exposed')
         require(not c['Mounts'] and not h.get('Binds') and not h.get('VolumesFrom'), 'host or volume mounts are not allowed')

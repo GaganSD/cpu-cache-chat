@@ -27,6 +27,13 @@ PY
   if "$root/scripts/inspect-isolation.sh" a b >/dev/null 2>&1; then echo "accepted $field" >&2; exit 1; fi
   mv "$tmp/saved" "$tmp/a"
 done
+cp "$tmp/a" "$tmp/saved"
+python3 - "$tmp/a" <<'PY'
+import json,sys
+p=sys.argv[1]; c=json.load(open(p)); c[0]['HostConfig']['SecurityOpt'].append('seccomp=unconfined'); open(p,'w').write(json.dumps(c))
+PY
+if "$root/scripts/inspect-isolation.sh" a b >/dev/null 2>&1; then echo 'accepted unconfined seccomp' >&2; exit 1; fi
+mv "$tmp/saved" "$tmp/a"
 python3 - "$tmp/a" <<'PY'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p)); c[0]['Mounts']=[dict(Type='bind',Source='/',Destination='/host',RW=False)]; open(p,'w').write(json.dumps(c))
