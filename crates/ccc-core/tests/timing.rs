@@ -1,5 +1,15 @@
 use std::time::Duration;
 
+#[test]
+fn default_simulation_uses_short_software_deadlines() {
+    let cfg = RuntimeConfig::new(Role::A, ChannelMode::Sim, AppKind::Chat);
+    assert_eq!(cfg.ack_timeout, Duration::from_millis(250));
+    assert_eq!(cfg.sync_timeout, Duration::from_secs(5));
+    assert_eq!(cfg.response_budget(19), Duration::from_millis(250));
+    let physical = RuntimeConfig::new(Role::A, ChannelMode::Cpu, AppKind::Chat);
+    assert_eq!(physical.ack_timeout, Duration::from_secs(45));
+}
+
 use ccc_core::{AppKind, ChannelMode, Role, RuntimeConfig};
 
 #[test]

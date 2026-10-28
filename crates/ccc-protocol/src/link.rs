@@ -682,7 +682,8 @@ impl<W: Wire> Link<W> {
 pub fn new_session_id() -> u32 {
     let mut b = [0u8; 4];
     fill_random(&mut b);
-    u32::from_le_bytes(b)
+    // Zero is reserved for a responder that has not established a session.
+    u32::from_le_bytes(b).max(1)
 }
 
 fn fill_random(buf: &mut [u8]) {

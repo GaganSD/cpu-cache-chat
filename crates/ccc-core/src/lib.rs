@@ -253,8 +253,16 @@ impl RuntimeConfig {
             agent: false,
             plain: false,
             slot: DEFAULT_SLOT,
-            ack_timeout: DEFAULT_ACK_TIMEOUT,
-            sync_timeout: DEFAULT_SYNC_TIMEOUT,
+            ack_timeout: if channel.is_physical() {
+                DEFAULT_ACK_TIMEOUT
+            } else {
+                Duration::from_millis(250)
+            },
+            sync_timeout: if channel.is_physical() {
+                DEFAULT_SYNC_TIMEOUT
+            } else {
+                Duration::from_secs(5)
+            },
             calibrate: DEFAULT_CALIBRATE,
             max_retries: MAX_RETRIES,
             sim_path: None,

@@ -7,7 +7,7 @@ Sync and SyncAck use `seq` 1 for chat and 2 for game. Other controls have no
 payload; reserved flags must be zero and each frame type's sequence and ACK
 fields are validated. Session IDs are drawn from OS entropy (`/dev/urandom` on
 Mac and Linux); failure to obtain entropy terminates rather than using a weak
-fallback. Session IDs are not authentication and can collide.
+fallback. Session IDs are nonzero, are not authentication, and can collide.
 
 Token handoffs use a session-wide monotonic 16-bit identity in Heartbeat's
 `seq`. The sender relinquishes before transmission, and retries only that exact
@@ -20,7 +20,7 @@ has an overall deadline based on the configured response/recovery budgets and
 retry count (at least 500 ms for simulation, 30 seconds for physical); an
 unresponsive peer eventually causes `Failed`. This deadline assumes timely
 calls to `drive` and bounded wire operations, and may require tuning for slow
-peers.
+peers. Default simulation uses 250 ms response waits and a 5 s connection budget, so tokenless absence expires in about 2 seconds with five retries. Physical defaults deliberately remain much longer: tokenless recovery can take several minutes at 50 ms slots. Those are bounds, not promises of delivery.
 
 A Data frame is retried with the same sequence and payload. If its ACK remains
 missing after the retry budget, the sender reports `Delivery::Unknown`, retains
