@@ -46,7 +46,14 @@ pub fn run(
     let mut log = Vec::new();
     let mut failed = false;
     loop {
-        while let Ok(update) = updates.try_recv() {
+        loop {
+            let update = match updates.try_recv() {
+                Ok(update) => update,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(Error::Io("worker disconnected".into()))
+                }
+            };
             match update {
                 Update::Snapshot(s) => snapshot = Some(s),
                 Update::Note(n) => {
@@ -67,10 +74,14 @@ pub fn run(
                     }
                     log.push(format!("seq {seq}: {state}"));
                 }
+                Update::Fatal(e) => return Err(e),
                 Update::Accepted => {
                     pending.pop_front();
                 }
             }
+        }
+        if log.len() > 100 {
+            log.drain(..log.len() - 100);
         }
         terminal
             .draw(|f| {
@@ -190,7 +201,9 @@ pub fn run(
                             input.pop();
                         }
                         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            input.push(c)
+                            if input.len() + c.len_utf8() <= ccc_core::MAX_CHAT_BYTES {
+                                input.push(c);
+                            }
                         }
                         _ => {}
                     }

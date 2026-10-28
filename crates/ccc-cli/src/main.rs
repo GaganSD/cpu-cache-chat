@@ -231,9 +231,12 @@ fn plain_loop(
                 }
             }
             Ok(worker::Update::Accepted) => {}
+            Ok(worker::Update::Fatal(e)) => return Err(e),
             Ok(worker::Update::Delivery(seq, state)) => println!("seq {seq}: {state}"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Io("worker disconnected".into()))
+            }
         }
     }
     stop.store(true, Ordering::SeqCst);

@@ -40,6 +40,15 @@ pub enum CommandSpec {
 impl CommandSpec {
     /// Compatibility with the existing expert command override.
     pub fn legacy(cmd: Option<&str>) -> Result<Self, Error> {
+        let path = std::env::var("CCC_AGENT_PATH").unwrap_or_else(|_| {
+            let local =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../agent/src/play.mjs");
+            if local.is_file() {
+                local.to_string_lossy().into_owned()
+            } else {
+                "/opt/ccc/agent/src/play.mjs".into()
+            }
+        });
         match cmd {
             Some(s) if s.trim().is_empty() => Err(Error::Agent("empty agent command".into())),
             Some(s) if s.chars().any(char::is_whitespace) => {
@@ -47,11 +56,11 @@ impl CommandSpec {
             }
             Some(s) => Ok(Self::Executable {
                 program: s.into(),
-                args: vec!["/opt/ccc/agent/src/play.mjs".into()],
+                args: vec![path],
             }),
             None => Ok(Self::Executable {
                 program: "node".into(),
-                args: vec!["/opt/ccc/agent/src/play.mjs".into()],
+                args: vec![path],
             }),
         }
     }

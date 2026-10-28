@@ -11,6 +11,7 @@ pub enum Update {
     Note(String),
     Accepted,
     Delivery(u16, Delivery),
+    Fatal(Error),
 }
 
 struct ObservedWire {
@@ -62,7 +63,7 @@ pub fn start(
         let wire = match ccc_channel::open_wire(&cfg, stop.clone()) {
             Ok(wire) => wire,
             Err(e) => {
-                let _ = output.send(Update::Note(format!("connect failed: {e}")));
+                let _ = output.send(Update::Fatal(e));
                 return;
             }
         };
@@ -91,13 +92,13 @@ pub fn start(
                 }
             }
             Err(e) => {
-                let _ = output.send(Update::Note(format!("connect failed: {e}")));
+                let _ = output.send(Update::Fatal(e));
                 return;
             }
         }
         let _ = output.send(Update::Snapshot(session.snapshot()));
-        let mut agent_paused = false;
-        let mut agent_failures = 0u32;
+        let mut job: Option<ccc_app::agent::AgentJob> = None;
+        let mut request_id = 0u64;
         while !stop.load(Ordering::SeqCst) {
             while let Ok(line) = input.try_recv() {
                 let result = match cfg.kind {
@@ -110,45 +111,103 @@ pub fn start(
                 };
                 if let Err(e) = result {
                     let _ = output.send(Update::Note(e.to_string()));
+                    let _ = output.send(Update::Accepted);
                 } else {
                     let _ = output.send(Update::Accepted);
                 }
                 let _ = output.send(Update::Snapshot(session.snapshot()));
             }
-            if cfg.agent && !agent_paused && session.our_turn() {
-                let _ = output.send(Update::Note("agent choosing a move".into()));
-                match session.try_agent_move().and_then(|sq| match sq {
-                    Some(sq) => session.queue_move(sq).map(|_| sq),
-                    None => Err(ccc_core::Error::Agent("no move".into())),
-                }) {
-                    Ok(sq) => {
-                        agent_failures = 0;
-                        let _ = output.send(Update::Note(format!("agent chose {sq}")));
+            if let Some(active) = &job {
+                match active.try_result() {
+                    Ok(Some(result)) => {
+                        job = None;
+                        match result {
+                            Ok(result) => {
+                                if std::env::var_os("CCC_AGENT_DEBUG").is_some()
+                                    && !result.stderr.is_empty()
+                                {
+                                    let mut transcript =
+                                        String::from_utf8_lossy(&result.stderr).into_owned();
+                                    for (name, value) in std::env::vars() {
+                                        let name = name.to_ascii_uppercase();
+                                        if !value.is_empty()
+                                            && (name.contains("KEY")
+                                                || name.contains("TOKEN")
+                                                || name.contains("SECRET"))
+                                        {
+                                            transcript = transcript.replace(&value, "[redacted]");
+                                        }
+                                    }
+                                    let _ = output.send(Update::Note(format!(
+                                        "agent transcript: {}",
+                                        ccc_app::escape_controls(&transcript)
+                                    )));
+                                }
+                                if let Some(current) = session.agent_request(request_id) {
+                                    if current.session == result.session
+                                        && current.generation == result.generation
+                                        && current.request_id == result.request_id
+                                    {
+                                        if let Err(e) = session.queue_move(result.square) {
+                                            let _ = output.send(Update::Fatal(e));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = output.send(Update::Fatal(e));
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        agent_failures += 1;
-                        if agent_failures >= 3 {
-                            agent_paused = true;
-                            let _ = output.send(Update::Note(format!(
-                                "agent paused after {agent_failures} failed attempts: {e}"
-                            )));
-                        } else {
-                            let _ = output.send(Update::Note(format!(
-                                "agent attempt failed ({agent_failures}/3): {e}"
-                            )));
+                    Ok(None) => {}
+                    Err(_) => {
+                        let _ = output.send(Update::Fatal(Error::Agent(
+                            "agent supervisor disconnected".into(),
+                        )));
+                        break;
+                    }
+                }
+            }
+            if job.is_none() {
+                request_id = request_id.wrapping_add(1);
+                if let Some(request) = session.agent_request(request_id) {
+                    let created = ccc_app::agent::CommandSpec::legacy(cfg.agent_cmd.as_deref())
+                        .and_then(|command| {
+                            ccc_app::agent::AgentJob::spawn(
+                                command,
+                                request,
+                                ccc_app::agent::Limits::default(),
+                                Some(stop.clone()),
+                            )
+                        });
+                    match created {
+                        Ok(active) => {
+                            job = Some(active);
+                            let _ = output.send(Update::Note("agent choosing a move".into()));
+                        }
+                        Err(e) => {
+                            let _ = output.send(Update::Fatal(e));
+                            break;
                         }
                     }
                 }
-                let _ = output.send(Update::Snapshot(session.snapshot()));
             }
             match session.tick(cfg.recv_poll()) {
                 Ok(notes) => {
                     for note in notes {
                         let _ = output.send(Update::Note(note));
                     }
+                    if session.snapshot().link == ccc_core::LinkState::Failed {
+                        let _ = output.send(Update::Fatal(Error::Io(
+                            "link failed; delivery unknown".into(),
+                        )));
+                        break;
+                    }
                 }
                 Err(e) => {
-                    let _ = output.send(Update::Note(format!("link failed: {e}")));
+                    let _ = output.send(Update::Fatal(e));
                     break;
                 }
             }
