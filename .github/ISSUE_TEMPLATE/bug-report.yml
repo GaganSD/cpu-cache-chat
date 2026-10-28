@@ -1,0 +1,13 @@
+name: Reproducible bug
+about: Report a software problem
+body:
+  - type: textarea
+    attributes:
+      label: Steps and expected versus actual behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Revision, OS, architecture, tool versions and redacted logs
+    validations:
+      required: true

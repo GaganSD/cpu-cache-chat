@@ -1,0 +1,37 @@
+name: manual-release-build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-14
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.96.1 --profile minimal
+      - run: cargo build --locked --release -p cpu-cache-chat
+      - name: Stage binary and provenance
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/cpu-cache-chat dist/cpu-cache-chat-${{ matrix.target }}
+          (cd dist && shasum -a 256 cpu-cache-chat-${{ matrix.target }} > SHA256SUMS)
+          { git rev-parse HEAD; rustc --version; cargo --version; uname -a; } > dist/provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpu-cache-chat-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error

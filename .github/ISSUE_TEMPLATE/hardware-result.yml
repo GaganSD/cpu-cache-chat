@@ -1,0 +1,18 @@
+name: Hardware result
+about: Record a reproducible physical experiment
+body:
+  - type: textarea
+    attributes:
+      label: Revision, image and binary hashes, hardware, OS and runtime
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Channel, slot, isolation policy, controls, commands and results (including failures)
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Redacted evidence and limitations
+    validations:
+      required: true

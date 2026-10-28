@@ -1,0 +1,72 @@
+name: software-ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  software:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt --component clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Node tests (no skips)
+        shell: bash
+        run: |
+          cd agent
+          npm ci
+          node --test --test-reporter=tap tests/*.test.mjs | tee test-output.txt
+          if grep -Eiq '#[[:space:]]*skip\b|^#[[:space:]]*skipped[[:space:]]+[1-9]' test-output.txt; then
+            echo 'Node tests skipped' >&2; exit 1
+          fi
+      - name: Shell syntax and fixtures
+        shell: bash
+        run: |
+          for f in docker/*.sh scripts/*.sh scripts/tests/*.sh; do bash -n "$f"; done
+          for f in scripts/tests/*.sh; do bash "$f"; done
+      - name: Simulation e2e
+        shell: bash
+        run: |
+          cargo build --locked --release -p cpu-cache-chat
+          MODE=chat ./scripts/e2e-headless-sim.sh
+          MODE=game ./scripts/e2e-headless-sim.sh
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # Existing warnings remain tracked for cleanup; error severity is required.
+      - run: shellcheck --severity=error docker/*.sh scripts/*.sh scripts/tests/*.sh
+  image:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and smoke test base image
+        run: |
+          docker build --build-arg VCS_REF="$GITHUB_SHA" -f docker/Dockerfile -t ccc:ci .
+          docker run --rm ccc:ci --help
+      - name: Build and smoke test agent image
+        run: |
+          docker build --build-arg CCC_IMAGE=ccc:ci --build-arg VCS_REF="$GITHUB_SHA" -f docker/Dockerfile.agent -t ccc:agent-ci .
+          docker run --rm ccc:agent-ci --help
