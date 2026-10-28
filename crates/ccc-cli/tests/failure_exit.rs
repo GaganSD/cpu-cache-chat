@@ -31,6 +31,35 @@ fn simulation_requires_shared_path_and_agent_command_requires_agent() {
             ],
             "--agent-cmd requires --agent",
         ),
+        (
+            vec![
+                "game",
+                "--role",
+                "a",
+                "--channel",
+                "cpu",
+                "--sim",
+                "--sim-path",
+                "/tmp/test",
+                "--events-stdout",
+            ],
+            "--events-stdout requires --plain",
+        ),
+        (
+            vec![
+                "chat",
+                "--role",
+                "a",
+                "--channel",
+                "cpu",
+                "--sim",
+                "--sim-path",
+                "/tmp/test",
+                "--plain",
+                "--events-stdout",
+            ],
+            "--events-stdout is only valid for game mode",
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_cpu-cache-chat"))
             .args(args)

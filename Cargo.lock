@@ -216,6 +216,7 @@ dependencies = [
  "ccc-app",
  "ccc-channel",
  "ccc-core",
+ "ccc-game",
  "ccc-protocol",
  "clap",
  "crossterm",

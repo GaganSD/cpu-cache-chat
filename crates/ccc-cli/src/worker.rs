@@ -14,10 +14,29 @@ pub struct Command {
 pub enum Update {
     Snapshot(Snapshot),
     Note(String),
+    /// One canonical evidence event as a single compact JSON line. Only the
+    /// plain frontend prints it, with the exact [`EVENT_STDOUT_PREFIX`];
+    /// the wire owner never writes to stdout itself.
+    EventJSON(String),
     Accepted(u64),
     Rejected(u64, String),
     Delivery(u16, Delivery),
     Fatal(Error),
+}
+
+/// Exact machine-stable prefix for mirrored evidence events on stdout.
+pub const EVENT_STDOUT_PREFIX: &str = "CCC_EVENT ";
+
+/// Evidence event sinks for a worker. Both are optional and may be combined;
+/// every canonical event is mirrored to each configured sink.
+#[derive(Debug, Default, Clone)]
+pub struct Events {
+    /// Exclusive JSONL evidence file, created as a regular file with mode
+    /// 0600 and owned by this process.
+    pub path: Option<String>,
+    /// Mirror events to the frontend for `CCC_EVENT <json>` stdout lines.
+    /// Valid only for `game --plain`.
+    pub stdout: bool,
 }
 
 #[derive(Clone)]
@@ -193,7 +212,7 @@ fn spawn_worker(
 pub fn start(
     cfg: RuntimeConfig,
     stop: Arc<AtomicBool>,
-    events_path: Option<String>,
+    events: Events,
 ) -> (
     mpsc::SyncSender<Command>,
     Updates,
@@ -204,7 +223,7 @@ pub fn start(
     let handle = spawn_worker(output, move |output| {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut evidence = match events_path {
+        let mut evidence = match events.path {
             Some(path) => match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -231,9 +250,18 @@ pub fn start(
             },
             None => None,
         };
+        let events_stdout = events.stdout;
         let mut emit = |event: serde_json::Value| -> Result<(), Error> {
+            let line = event.to_string();
             if let Some(file) = &mut evidence {
-                writeln!(file, "{event}").map_err(|e| Error::Io(format!("event evidence: {e}")))?;
+                writeln!(file, "{line}").map_err(|e| Error::Io(format!("event evidence: {e}")))?;
+            }
+            if events_stdout {
+                // Mirror through the bounded critical update queue; overflow
+                // is a typed fatal recorded against the run's evidence.
+                output.send(Update::EventJSON(line)).map_err(|_| {
+                    Error::Channel("UI critical event queue overflow or disconnected".into())
+                })?;
             }
             Ok(())
         };

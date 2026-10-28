@@ -91,6 +91,9 @@ pub fn run(
                     log.push(format!("seq {seq}: {state}"));
                 }
                 Update::Fatal(e) => return Err(e),
+                Update::EventJSON(_) => {
+                    // --events-stdout requires --plain; never mirrored here.
+                }
                 Update::Accepted(id) => {
                     take_pending(&mut pending, id);
                 }

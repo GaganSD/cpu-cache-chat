@@ -10,3 +10,7 @@ Each file is UTF-8 JSON Lines, one object per line, including a newline after th
 4. Exactly one final record `{"type":"stopped","successful":true,"evidence_complete":true}`. This asserts successful process/worker completion and complete records; it does not substitute for the required session, moves, final record, and legal replay.
 
 The two files must have the same nonzero session, opposite roles, equal legal terminal histories and final states. Verification relies on the truthfulness of recorded events; it is not cryptographic provenance or proof that a physical channel was used.
+
+## Stdout mirror
+
+`game --plain --events-stdout` mirrors the same canonical stream on stdout: each event is printed by the plain frontend as `CCC_EVENT <compact-json>` on its own line. The prefix `CCC_EVENT ` is a stable machine interface; extract lines by exact prefix, strip it, and the result is one role's complete JSONL log, byte-identical to the `--events-path` file when both sinks are configured. The worker never writes events to stdout directly; mirroring uses the bounded critical update queue, and overflow is a typed fatal error that marks the run unsuccessful. `--events-stdout` requires `--plain` and game mode. Because the stream survives container exit via collected logs, it is the retention-safe sink when `--events-path` lives on a tmpfs that disappears with the process.

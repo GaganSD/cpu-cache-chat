@@ -51,6 +51,10 @@ struct ClientArgs {
     /// Write versioned semantic game evidence as JSONL.
     #[arg(long)]
     events_path: Option<String>,
+    /// Mirror canonical game evidence events as `CCC_EVENT <json>` lines on
+    /// stdout. Requires --plain; game mode only.
+    #[arg(long)]
+    events_stdout: bool,
     /// Line-oriented input/output. EOF leaves the session running; enter /q to quit.
     #[arg(long)]
     plain: bool,
@@ -170,6 +174,16 @@ fn client(
     agent: bool,
     agent_cmd: Option<String>,
 ) -> Result<(), Error> {
+    if args.events_stdout && kind != AppKind::Game {
+        return Err(Error::InvalidInput(
+            "--events-stdout is only valid for game mode".into(),
+        ));
+    }
+    if args.events_stdout && !args.plain {
+        return Err(Error::InvalidInput(
+            "--events-stdout requires --plain".into(),
+        ));
+    }
     let mut cfg = RuntimeConfig::new(args.role.into(), args.channel.mode(args.sim), kind);
     cfg.plain = args.plain;
     cfg.agent = agent;
@@ -186,7 +200,14 @@ fn client(
         });
     }
 
-    let (commands, updates, worker) = worker::start(cfg.clone(), stop.clone(), args.events_path);
+    let (commands, updates, worker) = worker::start(
+        cfg.clone(),
+        stop.clone(),
+        worker::Events {
+            path: args.events_path,
+            stdout: args.events_stdout,
+        },
+    );
     let result = if cfg.plain {
         plain_loop(&cfg, stop.clone(), commands, updates)
     } else {
@@ -278,6 +299,9 @@ fn plain_loop(
                     previous = view;
                 }
             }
+            Ok(worker::Update::EventJSON(line)) => {
+                println!("{}{line}", worker::EVENT_STDOUT_PREFIX)
+            }
             Ok(worker::Update::Accepted(_)) => {}
             Ok(worker::Update::Rejected(_, reason)) => {
                 eprintln!("rejected: {}", escape_controls(&reason))
@@ -285,9 +309,8 @@ fn plain_loop(
             Ok(worker::Update::Fatal(e)) => return Err(e),
             Ok(worker::Update::Delivery(seq, state)) => println!("seq {seq}: {state}"),
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
+                // After stop, keep draining until the worker disconnects so
+                // trailing mirrored events (final, stopped) reach stdout.
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
