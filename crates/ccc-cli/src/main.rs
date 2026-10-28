@@ -19,6 +19,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "cpu-cache-chat",
+    version,
+    long_version = version_info(),
     about = "Two isolated clients over a CPU-cache or CPU-contention channel"
 )]
 struct Cli {
@@ -127,6 +129,18 @@ impl ChannelArg {
             }
         }
     }
+}
+
+fn version_info() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{}\nprotocol={}\nsource={}",
+            env!("CARGO_PKG_VERSION"),
+            ccc_core::PROTOCOL_VERSION,
+            option_env!("CCC_BUILD_REVISION").unwrap_or("unknown")
+        )
+    })
 }
 
 fn main() {

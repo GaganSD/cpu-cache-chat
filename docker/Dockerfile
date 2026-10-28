@@ -7,6 +7,8 @@ FROM ${RUST_IMAGE} AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
+ARG VCS_REF=unknown
+ENV CCC_BUILD_REVISION=${VCS_REF}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     CARGO_BUILD_JOBS=2 cargo build --locked --release -p cpu-cache-chat -p ccc-game \
