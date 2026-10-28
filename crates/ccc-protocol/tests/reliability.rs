@@ -37,6 +37,14 @@ type SentFrames = Arc<Mutex<Vec<Frame>>>;
 type MockPair = (Link<MockWire>, Link<MockWire>, SentFrames, SentFrames);
 
 fn pair(drop_a: Option<(FrameType, usize)>, drop_b: Option<(FrameType, usize)>) -> MockPair {
+    pair_with_timeout(drop_a, drop_b, Duration::from_millis(2))
+}
+
+fn pair_with_timeout(
+    drop_a: Option<(FrameType, usize)>,
+    drop_b: Option<(FrameType, usize)>,
+    timeout: Duration,
+) -> MockPair {
     let (at, br) = mpsc::channel();
     let (bt, ar) = mpsc::channel();
     let sa = Arc::new(Mutex::new(Vec::new()));
@@ -50,7 +58,7 @@ fn pair(drop_a: Option<(FrameType, usize)>, drop_b: Option<(FrameType, usize)>) 
     };
     let config = |role| {
         let mut c = RuntimeConfig::new(role, ChannelMode::Sim, AppKind::Chat);
-        c.ack_timeout = Duration::from_millis(2);
+        c.ack_timeout = timeout;
         c.sync_timeout = Duration::from_secs(1);
         c.max_retries = 3;
         c
@@ -151,6 +159,22 @@ fn exhausted_retries_are_unknown_and_stop_queued_sends() {
 }
 
 #[test]
+fn unknown_sequence_never_resumes_after_prolonged_driving() {
+    let (mut a, mut b, sent, _) =
+        pair_with_timeout(Some((FrameType::Data, 99)), None, Duration::from_millis(50));
+    a.enqueue(chat("one")).unwrap();
+    a.enqueue(chat("two")).unwrap();
+    let (events, _) = drive_pair(&mut a, &mut b, 400);
+    assert!(delivered(&events, Delivery::Unknown));
+    assert!(sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.ftype == FrameType::Data)
+        .all(|f| f.seq == 1));
+}
+
+#[test]
 fn stale_and_old_data_are_rejected_and_duplicate_is_acked() {
     let (mut a, mut b, _, sb) = pair(None, None);
     for text in ["one", "two"] {
@@ -185,6 +209,26 @@ fn stale_and_old_data_are_rejected_and_duplicate_is_acked() {
             .count(),
         2
     );
+}
+
+#[test]
+fn application_rejection_is_not_acknowledged_or_delivered() {
+    let (mut a, mut b, _, sent) = pair(None, None);
+    a.enqueue(chat("reject")).unwrap();
+    a.drive(Duration::from_millis(1)).unwrap();
+    let events = b
+        .drive_with_accept(Duration::from_millis(1), |_| {
+            Err(Error::InvalidInput("rejected".into()))
+        })
+        .unwrap();
+    assert_eq!(received(&events), 0);
+    let frames = sent.lock().unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| f.ftype == FrameType::Nack && f.ack_seq == 1));
+    assert!(!frames
+        .iter()
+        .any(|f| f.ftype == FrameType::Ack && f.ack_seq == 1));
 }
 
 #[test]

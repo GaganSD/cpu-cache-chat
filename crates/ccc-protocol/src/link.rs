@@ -94,6 +94,9 @@ impl<W: Wire> Link<W> {
     }
 
     pub fn enqueue(&mut self, msg: AppMessage) -> Result<u16, Error> {
+        if matches!(self.state, LinkState::Failed | LinkState::Closed) {
+            return Err(Error::InvalidInput("session is no longer usable".into()));
+        }
         let seq = self.next_seq;
         msg.encode()?;
         self.next_seq = next_sequence(seq);
@@ -159,6 +162,20 @@ impl<W: Wire> Link<W> {
     }
 
     pub fn drive(&mut self, wait: Duration) -> Result<Vec<LinkEvent>, Error> {
+        self.drive_with_accept(wait, |_| Ok(()))
+    }
+
+    /// Validate and apply a new message synchronously before acknowledging it.
+    /// The callback must not block on external I/O. It is not called for duplicates.
+    /// The legacy `drive` accepts all syntactically valid application messages.
+    pub fn drive_with_accept<F>(
+        &mut self,
+        wait: Duration,
+        mut accept: F,
+    ) -> Result<Vec<LinkEvent>, Error>
+    where
+        F: FnMut(&AppMessage) -> Result<(), Error>,
+    {
         if self.state != LinkState::Connected && self.state != LinkState::Degraded {
             return Ok(Vec::new());
         }
@@ -298,8 +315,8 @@ impl<W: Wire> Link<W> {
             if inf.sent_at.elapsed() >= inf.ack_wait {
                 let seq = inf.seq;
                 if inf.attempts > u64::from(self.cfg.max_retries) {
-                    self.inflight = None;
-                    self.enter_degraded();
+                    // Retain the unresolved frame and stop this session permanently.
+                    self.state = LinkState::Failed;
                     events.push(LinkEvent::Delivery {
                         seq,
                         state: Delivery::Unknown,
@@ -334,7 +351,7 @@ impl<W: Wire> Link<W> {
         };
         match self.wire.recv_blob(wait) {
             Ok(bytes) => {
-                if let Some(more) = self.on_bytes(&bytes)? {
+                if let Some(more) = self.on_bytes(&bytes, &mut accept)? {
                     events.extend(more);
                 }
             }
@@ -350,7 +367,10 @@ impl<W: Wire> Link<W> {
         Ok(events)
     }
 
-    fn on_bytes(&mut self, bytes: &[u8]) -> Result<Option<Vec<LinkEvent>>, Error> {
+    fn on_bytes<F>(&mut self, bytes: &[u8], accept: &mut F) -> Result<Option<Vec<LinkEvent>>, Error>
+    where
+        F: FnMut(&AppMessage) -> Result<(), Error>,
+    {
         let frame = match decode_frame(bytes) {
             Ok(f) => f,
             Err(e) => {
@@ -442,6 +462,13 @@ impl<W: Wire> Link<W> {
                 }
                 match AppMessage::decode(&frame.payload) {
                     Ok(msg) => {
+                        if let Err(e) = accept(&msg) {
+                            self.send_control(FrameType::Nack, frame.seq)?;
+                            return Ok(Some(vec![LinkEvent::Error(format!(
+                                "application rejected seq {}: {e}",
+                                frame.seq
+                            ))]));
+                        }
                         self.last_rx_seq = Some(frame.seq);
                         // Valid in-sequence peer data proves the peer holds
                         // the token and the link works; recover from a

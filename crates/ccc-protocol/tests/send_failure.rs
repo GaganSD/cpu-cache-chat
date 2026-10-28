@@ -236,8 +236,8 @@ fn repeated_send_failures_are_bounded_and_become_unknown() {
     std::thread::sleep(Duration::from_millis(4));
     let events = link.drive(Duration::from_millis(1)).unwrap();
     assert!(has(&events, Delivery::Unknown));
-    assert_eq!(link.state(), LinkState::Degraded);
-    assert_eq!(link.queue_len(), 1);
+    assert_eq!(link.state(), LinkState::Failed);
+    assert_eq!(link.queue_len(), 2);
     let wire = link.into_wire();
     let data: Vec<_> = wire
         .sent
