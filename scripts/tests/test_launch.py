@@ -104,6 +104,24 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unavailable'):
                 launch.launch(a)
 
+    def test_preflight_compares_receiver_blind_bytes(self):
+        class Process:
+            def __init__(self, cmd, **_kwargs):
+                self.role = cmd[-1]
+                self.returncode = 0
+            def communicate(self, timeout):
+                if self.role == 'a':
+                    return ('sender payload test: [01, 02, 03, 04]', '')
+                return ('received bytes (hex): 01020304', '')
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+        with patch.object(launch.subprocess, 'Popen', Process), \
+             patch.object(launch.time, 'sleep'), patch.object(launch, 'cleanup') as cleanup:
+            launch.preflight('a' * 32, 'sha256:' + 'a' * 64, 'cache', 0)
+            cleanup.assert_called_once_with('a' * 32)
+
     def test_invalid_stop(self):
         with self.assertRaisesRegex(RuntimeError, 'invalid run ID'):
             launch.stop('../bad')
