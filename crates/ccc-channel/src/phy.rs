@@ -17,6 +17,13 @@ const TRAINING_BITS: usize = CARRIER_ONES as usize + PREAMBLE_BITS;
 const _: () = assert!(ccc_core::MAX_PAYLOAD + 64 < 512);
 const FEC_BITS: usize = 13;
 const FEC_BLOCK_BYTES: usize = 8;
+// Per word, SECDED distance 4 guarantees recovery from up to three erasures
+// (2*errors + erasures < 4 with zero errors). A block holding more than
+// MAX_WORD_ERASURES erasures per word is beyond that envelope even before
+// allowing bit errors; discard such frames fail-closed. A frame may also
+// occupy at most FRAME_LIFETIME_MULTIPLIER times its expected airtime.
+const MAX_WORD_ERASURES: usize = 3;
+const FRAME_LIFETIME_MULTIPLIER: u32 = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PhyKind {
@@ -58,35 +65,62 @@ struct HuntState {
 }
 
 struct FrameReceiver {
-    samples: [[Duration; FEC_BITS]; FEC_BLOCK_BYTES],
+    samples: [[Option<Duration>; FEC_BITS]; FEC_BLOCK_BYTES],
     bits: usize,
     block_bytes: usize,
     length: Option<usize>,
     bytes: Vec<u8>,
     costs: Vec<Duration>,
+    // Cumulative counts for diagnostics, and the current block's erasure
+    // count for the frame erasure budget.
+    slots: usize,
+    erasures: usize,
+    block_erasures: usize,
+    // First sample time; a frame older than its lifetime bound is stale.
+    began: Option<Instant>,
 }
 
 impl Default for FrameReceiver {
     fn default() -> Self {
         Self {
-            samples: [[Duration::ZERO; FEC_BITS]; FEC_BLOCK_BYTES],
+            samples: [[None; FEC_BITS]; FEC_BLOCK_BYTES],
             bits: 0,
             block_bytes: 2,
             length: None,
             bytes: Vec::new(),
             costs: Vec::new(),
+            slots: 0,
+            erasures: 0,
+            block_erasures: 0,
+            began: None,
         }
     }
 }
 
 impl FrameReceiver {
-    /// Consume one physical frame bit. Incomplete fields remain in this
-    /// object, so a polling deadline never drops a partially received frame.
+    /// Consume one physical frame slot: either a measured slot cost or an
+    /// explicit erasure. The push sequence is the absolute slot grid, so an
+    /// erasure stays at its original position and later symbols never shift.
+    /// Incomplete fields remain in this object, so a polling deadline never
+    /// drops a partially received frame.
     fn push_sample(
         &mut self,
-        sample: Duration,
+        sample: Option<Duration>,
         decoder: Decoder,
+        slot: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
+        let began = self.began.get_or_insert_with(Instant::now);
+        if began.elapsed() > frame_lifetime(self.length, slot) {
+            return Err(Error::Corrupt("frame lifetime exceeded"));
+        }
+        self.slots += 1;
+        self.erasures += usize::from(sample.is_none());
+        self.block_erasures += usize::from(sample.is_none());
+        // A block holding more erasures than the interleaved distance-4
+        // guarantee envelope is beyond recovery policy; fail closed.
+        if self.block_erasures > MAX_WORD_ERASURES * self.block_bytes {
+            return Err(Error::Corrupt("too many erasures"));
+        }
         let word = self.bits % self.block_bytes;
         let position = self.bits / self.block_bytes;
         self.samples[word][position] = sample;
@@ -96,13 +130,14 @@ impl FrameReceiver {
         }
         let mut decoded = Vec::with_capacity(self.block_bytes);
         for samples in &self.samples[..self.block_bytes] {
-            let (byte, corrected) = soft_fec_decode(samples, decoder)?;
+            let (byte, corrected) = soft_fec_decode_erased(samples, decoder)?;
             if corrected && std::env::var_os("CCC_DEBUG").is_some() {
                 eprintln!("phy FEC selected a different codeword");
             }
             decoded.push(byte);
         }
         self.bits = 0;
+        self.block_erasures = 0;
         match self.length {
             None => {
                 let len = u16::from_be_bytes([decoded[0], decoded[1]]) as usize;
@@ -134,6 +169,14 @@ impl FrameReceiver {
             }
         }
     }
+}
+
+/// One frame-slot observation: whole slots skipped by scheduling (reported
+/// so they can be recorded as erasures in place) and the measured or erased
+/// sample for the current slot.
+struct SlotSample {
+    missed: u32,
+    sample: Option<Duration>,
 }
 
 struct CacheWork {
@@ -301,21 +344,38 @@ impl Phy {
     }
 
     fn read_trained_frame(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
+        let slot = self.slot;
         loop {
-            let (_, cost) = self.sample_slot(deadline)?;
+            let SlotSample { missed, sample } = self.sample_frame_slot(deadline)?;
             let decoder = self.decoder.ok_or(Error::Corrupt("untrained receiver"))?;
             let frame = self.frame.get_or_insert_with(FrameReceiver::default);
-            if std::env::var_os("CCC_DEBUG").is_some() {
-                frame.costs.push(cost);
+            // Missed slots are older than the measured one: record their
+            // erasures first so every symbol keeps its absolute position.
+            let mut result = Ok(None);
+            for _ in 0..missed {
+                result = frame.push_sample(None, decoder, slot);
+                if !matches!(result, Ok(None)) {
+                    break;
+                }
             }
-            let result = frame.push_sample(cost, decoder);
+            if matches!(result, Ok(None)) {
+                if std::env::var_os("CCC_DEBUG").is_some() {
+                    if let Some(cost) = sample {
+                        frame.costs.push(cost);
+                    }
+                }
+                result = frame.push_sample(sample, decoder, slot);
+            }
             if (frame.bits == 0 || result.is_err()) && !frame.costs.is_empty() {
                 eprintln!("phy decoded field costs={:?}", frame.costs);
                 frame.costs.clear();
             }
             if let Err(ref error) = result {
                 if std::env::var_os("CCC_DEBUG").is_some() {
-                    eprintln!("phy frame rejected: {error}");
+                    eprintln!(
+                        "phy frame rejected: {error} (erasures={} slots={})",
+                        frame.erasures, frame.slots
+                    );
                 }
             }
             if let Some(bytes) = result? {
@@ -492,10 +552,61 @@ impl Phy {
         }
     }
 
-    fn sample_slot(&mut self, deadline: Instant) -> Result<(bool, Duration), Error> {
-        let cost = self.sample_cost(deadline)?;
-        let decoder = self.decoder.ok_or(Error::Corrupt("untrained receiver"))?;
-        Ok((decoder.decode(cost), cost))
+    /// Sample the next frame slot on the absolute grid anchored at
+    /// `next_slot`. Whole slots lost to scheduling are reported as `missed`
+    /// so the caller can record erasures at their original positions; an
+    /// interval without a usable measurement is a `None` sample. The grid
+    /// itself never moves, so later symbols are never shifted.
+    fn sample_frame_slot(&mut self, deadline: Instant) -> Result<SlotSample, Error> {
+        self.check(deadline)?;
+        let mut integral = self.integral.take().unwrap_or_default();
+        let mut missed = 0u32;
+        let end = if let Some(end) = integral.end {
+            end
+        } else {
+            let start = self.next_slot.ok_or(Error::Corrupt("untrained receiver"))?;
+            if let Err(error) = self.finish_slot(start, deadline) {
+                self.integral = Some(integral);
+                return Err(error);
+            }
+            if self.slot.is_zero() {
+                return Err(Error::InvalidInput("slot must be nonzero".into()));
+            }
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(start).as_nanos();
+            missed = u32::try_from(elapsed / self.slot.as_nanos()).unwrap_or(u32::MAX);
+            let start = start
+                .checked_add(self.slot.saturating_mul(missed))
+                .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+            let end = start
+                .checked_add(self.slot)
+                .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+            self.next_slot = Some(end);
+            integral.end = Some(end);
+            end
+        };
+        match self.integrate_resumable(end, deadline, &mut integral) {
+            Ok(sample) => {
+                // A measurement that overran its slot end by a whole slot
+                // straddled a boundary and cannot represent this interval.
+                let sample = if Instant::now().saturating_duration_since(end) >= self.slot {
+                    None
+                } else {
+                    Some(sample)
+                };
+                Ok(SlotSample { missed, sample })
+            }
+            Err(Error::Corrupt("empty probe interval")) => Ok(SlotSample {
+                missed,
+                sample: None,
+            }),
+            Err(error) => {
+                if matches!(error, Error::Timeout) {
+                    self.integral = Some(integral);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn sample_cost(&mut self, deadline: Instant) -> Result<Duration, Error> {
@@ -738,10 +849,30 @@ fn fec_decode(mut word: u16) -> Result<(u8, bool), Error> {
     Ok((byte, corrected))
 }
 
+/// Wall-clock bound for one frame: a multiple of its expected on-air slot
+/// count (26 length slots plus 13 per byte of payload and CRC). A partial
+/// frame older than this is stale and must be discarded.
+fn frame_lifetime(length: Option<usize>, slot: Duration) -> Duration {
+    let slots = length.map_or(FEC_BITS * 2, |len| FEC_BITS * (len + 6));
+    slot.saturating_mul(FRAME_LIFETIME_MULTIPLIER.saturating_mul(slots as u32))
+}
+
 // Decode from measured slot costs, without using expected payload bytes. A
 // capped absolute distance limits the effect of extreme scheduling outliers.
 // CRC remains mandatory: a unique nearest codeword is not proof of correctness.
+#[cfg(test)]
 fn soft_fec_decode(samples: &[Duration; FEC_BITS], decoder: Decoder) -> Result<(u8, bool), Error> {
+    soft_fec_decode_erased(&samples.map(Some), decoder)
+}
+
+/// Soft decode with explicit erasures. An erased slot costs the same for
+/// either bit value, so it never prefers one codeword over another; with
+/// SECDED distance 4 a word still decodes while 2*errors + erasures < 4,
+/// and genuinely ambiguous words are rejected instead of guessed.
+fn soft_fec_decode_erased(
+    samples: &[Option<Duration>; FEC_BITS],
+    decoder: Decoder,
+) -> Result<(u8, bool), Error> {
     let spread = decoder.active.abs_diff(decoder.idle).as_nanos();
     if spread == 0 {
         return Err(Error::Corrupt("untrained receiver"));
@@ -749,6 +880,10 @@ fn soft_fec_decode(samples: &[Duration; FEC_BITS], decoder: Decoder) -> Result<(
     let mut hard_word = 0u16;
     let mut all_strong = true;
     for (position, &sample) in samples.iter().enumerate() {
+        let Some(sample) = sample else {
+            all_strong = false;
+            continue;
+        };
         let active = decoder.decode(sample);
         if active {
             hard_word |= 1 << position;
@@ -761,6 +896,8 @@ fn soft_fec_decode(samples: &[Duration; FEC_BITS], decoder: Decoder) -> Result<(
     if all_strong && fec_decode(hard_word).is_err() {
         return Err(Error::Corrupt("uncorrectable FEC"));
     }
+    // Equal cost for either bit value: an erasure is neutral evidence.
+    let erasure = spread / 2;
     let mut best = u128::MAX;
     let mut best_byte = 0u8;
     let mut tied = false;
@@ -770,6 +907,9 @@ fn soft_fec_decode(samples: &[Duration; FEC_BITS], decoder: Decoder) -> Result<(
             .iter()
             .enumerate()
             .map(|(position, &sample)| {
+                let Some(sample) = sample else {
+                    return erasure;
+                };
                 let reference = if (word >> position) & 1 != 0 {
                     decoder.active
                 } else {
@@ -789,7 +929,11 @@ fn soft_fec_decode(samples: &[Duration; FEC_BITS], decoder: Decoder) -> Result<(
     if tied {
         return Err(Error::Corrupt("ambiguous FEC"));
     }
-    Ok((best_byte, fec_encode(best_byte) != hard_word))
+    let best_word = fec_encode(best_byte);
+    let corrected = samples.iter().enumerate().any(|(position, &sample)| {
+        sample.is_none_or(|sample| decoder.decode(sample) != ((best_word >> position) & 1 != 0))
+    });
+    Ok((best_byte, corrected))
 }
 
 pub fn crc32_of(bytes: &[u8]) -> u32 {

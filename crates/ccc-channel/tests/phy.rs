@@ -238,6 +238,41 @@ fn acquisition_preserves_phase_across_explicit_erasures() {
 }
 
 #[test]
+fn acquisition_tolerates_scheduler_gap_bursts() {
+    // Scheduler descheduling loses consecutive quarter-slot measurements,
+    // not scattered ones. Bursts inside the carrier and preamble must still
+    // train; a burst that erases the idle-gap edges must not.
+    for inverted in [false, true] {
+        let bits = std::iter::repeat_n(true, 32)
+            .chain(std::iter::repeat_n(false, 8))
+            .chain(bits_msb(0xaaaa_aaaa, 32));
+        let mut samples: Vec<_> = bits
+            .map(|active| {
+                Some(Duration::from_micros(if active ^ inverted {
+                    20
+                } else {
+                    10
+                }))
+            })
+            .collect();
+        for start in [4, 20, 48, 60] {
+            for sample in &mut samples[start..start + 4] {
+                *sample = None;
+            }
+        }
+        let decoder = train_lock_erased(&samples).expect("burst erasures still train");
+        assert!(decoder.decode(Duration::from_micros(if inverted { 10 } else { 20 })));
+        assert!(!decoder.decode(Duration::from_micros(if inverted { 20 } else { 10 })));
+        samples[32] = None;
+        samples[33] = None;
+        assert!(
+            train_lock_erased(&samples).is_none(),
+            "a burst across the gap edge must not lock"
+        );
+    }
+}
+
+#[test]
 fn physical_sender_rejects_frames_beyond_receiver_bound() {
     let mut phy = Phy::new(
         PhyKind::Cpu,

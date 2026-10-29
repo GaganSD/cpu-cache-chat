@@ -98,25 +98,38 @@ fn encoded_frame(payload: &[u8], crc: u32) -> Vec<bool> {
     bits
 }
 
-fn decode_frame_bits(bits: &[bool], chunk_size: usize) -> Result<Option<Vec<u8>>, Error> {
-    let mut receiver = FrameReceiver::default();
-    let decoder = Decoder {
+const TEST_SLOT: Duration = Duration::from_millis(10);
+
+fn test_decoder() -> Decoder {
+    Decoder {
         threshold: Duration::from_micros(15),
         active_high: true,
         active: Duration::from_micros(20),
         idle: Duration::from_micros(10),
-    };
+    }
+}
+
+// Drive a frame receiver with explicit per-slot samples: Some(bit) is a clean
+// measurement, None is an erasure at that absolute slot position.
+fn decode_frame_slots(slots: &[Option<bool>], chunk_size: usize) -> Result<Option<Vec<u8>>, Error> {
+    let mut receiver = FrameReceiver::default();
+    let decoder = test_decoder();
     let mut decoded = None;
-    for chunk in bits.chunks(chunk_size) {
-        for &bit in chunk {
-            let sample = if bit { decoder.active } else { decoder.idle };
-            let result = receiver.push_sample(sample, decoder)?;
+    for chunk in slots.chunks(chunk_size) {
+        for &slot in chunk {
+            let sample = slot.map(|bit| if bit { decoder.active } else { decoder.idle });
+            let result = receiver.push_sample(sample, decoder, TEST_SLOT)?;
             if result.is_some() {
                 decoded = result;
             }
         }
     }
     Ok(decoded)
+}
+
+fn decode_frame_bits(bits: &[bool], chunk_size: usize) -> Result<Option<Vec<u8>>, Error> {
+    let slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    decode_frame_slots(&slots, chunk_size)
 }
 
 #[test]
@@ -215,7 +228,7 @@ fn soft_decoding_recovers_observed_weak_ack_length() {
     let mut receiver = FrameReceiver::default();
     for cost in costs {
         assert!(receiver
-            .push_sample(Duration::from_nanos(cost), decoder)
+            .push_sample(Some(Duration::from_nanos(cost)), decoder, TEST_SLOT)
             .unwrap()
             .is_none());
     }
@@ -311,4 +324,210 @@ fn receive_guard_excludes_idle_and_stale_acquisition() {
     assert!(phy.receive_in_progress());
     phy.next_slot = Some(Instant::now() - Duration::from_secs(1));
     assert!(!phy.receive_in_progress());
+}
+
+#[test]
+fn frame_recovers_burst_and_scattered_erasures_without_shifting() {
+    let payload: Vec<_> = (0..20).map(|i| i as u8 * 7 + 3).collect();
+    let bits = encoded_frame(&payload, crc32_of(&payload));
+    // A burst of erased slots inside one full block hits every interleaved
+    // word equally: 8, 16 or 24 consecutive gaps erase 1, 2 or 3 positions
+    // per word, all inside the SECDED distance-4 recovery guarantee.
+    for burst in [8, 16, 24] {
+        let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+        for slot in &mut slots[26..26 + burst] {
+            *slot = None;
+        }
+        assert_eq!(
+            decode_frame_slots(&slots, 5).unwrap(),
+            Some(payload.clone()),
+            "burst of {burst} erasures must decode without shifting"
+        );
+    }
+    // Six consecutive gaps in the two-word length block give each word three
+    // erased positions, the guaranteed limit; the field must not shift.
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    for slot in &mut slots[4..10] {
+        *slot = None;
+    }
+    assert_eq!(
+        decode_frame_slots(&slots, 7).unwrap(),
+        Some(payload.clone())
+    );
+    // Scattered gaps spread across words and stay under the frame budget.
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    for i in (0..slots.len()).step_by(17) {
+        slots[i] = None;
+    }
+    assert_eq!(decode_frame_slots(&slots, 3).unwrap(), Some(payload));
+}
+
+#[test]
+fn absolute_slot_positions_preserved_under_gaps() {
+    let payload: Vec<_> = (0..9).map(|i| 0xA0u8 + i as u8).collect();
+    let bits = encoded_frame(&payload, crc32_of(&payload));
+    let decoder = test_decoder();
+    let mut receiver = FrameReceiver::default();
+    // One erasure in each length word; positions must not shift the field.
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    slots[6] = None; // position 3, word 0
+    slots[15] = None; // position 7, word 1
+    for &slot in &slots[..26] {
+        let sample = slot.map(|bit| if bit { decoder.active } else { decoder.idle });
+        assert!(receiver
+            .push_sample(sample, decoder, TEST_SLOT)
+            .unwrap()
+            .is_none());
+    }
+    assert_eq!(receiver.length, Some(payload.len()));
+    assert_eq!(receiver.slots, 26);
+    assert_eq!(receiver.erasures, 2);
+    // Any compression of the two gaps would misalign every later symbol and
+    // fail the CRC; exact delivery proves absolute indexing.
+    let mut decoded = None;
+    for &slot in &slots[26..] {
+        let sample = slot.map(|bit| if bit { decoder.active } else { decoder.idle });
+        if let Some(bytes) = receiver.push_sample(sample, decoder, TEST_SLOT).unwrap() {
+            decoded = Some(bytes);
+        }
+    }
+    assert_eq!(decoded, Some(payload));
+}
+
+#[test]
+fn erasure_and_error_within_fec_distance_recover() {
+    // SECDED distance 4: one hard error plus one erasure (2*1 + 1 < 4).
+    let payload: Vec<_> = (0..12).map(|i| i as u8 * 11 + 1).collect();
+    let bits = encoded_frame(&payload, crc32_of(&payload));
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    // Word 0 of the first body block: flip position 0 strongly, erase
+    // position 3. Slots are interleaved as position * words + word.
+    slots[26] = slots[26].map(|bit| !bit);
+    slots[26 + 3 * FEC_BLOCK_BYTES] = None;
+    assert_eq!(decode_frame_slots(&slots, 5).unwrap(), Some(payload));
+}
+
+#[test]
+fn erasures_beyond_budget_discard_frame() {
+    let payload = b"budget".to_vec();
+    let bits = encoded_frame(&payload, crc32_of(&payload));
+    // Alternating measured and erased slots exceeds one erasure in four.
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    for i in (0..slots.len()).step_by(2) {
+        slots[i] = None;
+    }
+    assert!(matches!(
+        decode_frame_slots(&slots, 1),
+        Err(Error::Corrupt("too many erasures"))
+    ));
+    // Exactly one in four stays within budget; the frame then stands or
+    // falls on FEC and CRC alone, never on budget accounting.
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    for i in (3..slots.len()).step_by(4) {
+        slots[i] = None;
+    }
+    assert!(!matches!(
+        decode_frame_slots(&slots, 1),
+        Err(Error::Corrupt("too many erasures"))
+    ));
+}
+
+#[test]
+fn ambiguous_erasure_decode_never_delivers() {
+    let decoder = test_decoder();
+    // Two codewords at distance 4 with all four differing positions erased
+    // are exactly tied: the decoder must refuse to guess.
+    let byte = 0x5Au8;
+    let word = fec_encode(byte);
+    let other = (0..=u8::MAX)
+        .find(|&b| (fec_encode(b) ^ word).count_ones() == 4)
+        .expect("distance-4 codeword exists");
+    let differing = fec_encode(other) ^ word;
+    let mut samples = std::array::from_fn(|position| {
+        Some(if (word >> position) & 1 != 0 {
+            decoder.active
+        } else {
+            decoder.idle
+        })
+    });
+    for (position, sample) in samples.iter_mut().enumerate() {
+        if (differing >> position) & 1 != 0 {
+            *sample = None;
+        }
+    }
+    assert!(matches!(
+        soft_fec_decode_erased(&samples, decoder),
+        Err(Error::Corrupt("ambiguous FEC"))
+    ));
+    // The same ambiguity inside a frame rejects it without delivering: the
+    // xor of two codewords is a codeword, so erasing its support in an
+    // all-zero word ties the all-zero byte against a real alternative.
+    let payload: Vec<_> = (0..16).map(|i| i as u8).collect();
+    let bits = encoded_frame(&payload, crc32_of(&payload));
+    let mut slots: Vec<_> = bits.iter().map(|&bit| Some(bit)).collect();
+    for position in 0..FEC_BITS {
+        if (differing >> position) & 1 != 0 {
+            slots[26 + position * FEC_BLOCK_BYTES] = None;
+        }
+    }
+    assert!(matches!(
+        decode_frame_slots(&slots, 1),
+        Err(Error::Corrupt("ambiguous FEC"))
+    ));
+}
+
+#[test]
+fn frame_lifetime_bound_discards_stale_frames() {
+    let decoder = test_decoder();
+    let mut receiver = FrameReceiver::default();
+    assert!(receiver
+        .push_sample(Some(decoder.idle), decoder, TEST_SLOT)
+        .unwrap()
+        .is_none());
+    // A partial frame older than four times its expected airtime is stale.
+    receiver.began = Some(Instant::now() - Duration::from_secs(60));
+    assert!(matches!(
+        receiver.push_sample(Some(decoder.idle), decoder, TEST_SLOT),
+        Err(Error::Corrupt("frame lifetime exceeded"))
+    ));
+}
+
+#[test]
+fn sample_frame_slot_counts_missed_slots_on_the_absolute_grid() {
+    // Anchors are only ever in the past, so the test never waits and a
+    // scheduler pause needs to exceed half a slot to disturb the counts.
+    let slot = Duration::from_millis(20);
+    let mut phy = Phy::new(PhyKind::Cpu, slot, Arc::new(AtomicBool::new(false)));
+    phy.decoder = Some(test_decoder());
+    // Three and a half slots elapsed since the grid anchor: three erasures
+    // in place, and the current partial slot is still measured, never
+    // skipped or shifted.
+    phy.next_slot = Some(Instant::now() - slot * 3 - slot / 2);
+    let observed = phy
+        .sample_frame_slot(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(observed.missed, 3);
+    assert!(observed.sample.is_some());
+    assert!(phy.next_slot.unwrap() > Instant::now() - slot);
+    // An anchor inside the current slot misses nothing.
+    phy.next_slot = Some(Instant::now() - slot / 2);
+    let observed = phy
+        .sample_frame_slot(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(observed.missed, 0);
+    assert!(observed.sample.is_some());
+    // A resumed integral whose interval already ended is an erasure, not an
+    // error; the grid advances to the next slot untouched.
+    let past = Instant::now() - slot;
+    phy.integral = Some(Integral {
+        end: Some(past),
+        total: Duration::ZERO,
+        count: 0,
+        paused_at: Some(past),
+    });
+    let observed = phy
+        .sample_frame_slot(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(observed.missed, 0);
+    assert!(observed.sample.is_none());
 }
