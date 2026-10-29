@@ -117,6 +117,11 @@ if grep -Fq 'SIMULATION' "$workdir/a.out" || grep -Fq 'SIMULATION' "$workdir/b.o
 fi
 wait_for "$workdir/a.out" 'link: connected'
 wait_for "$workdir/b.out" 'link: connected'
+# A auto-starts the match on connect (start control = seq 1). Until that
+# control is delivered, A's local session has not started and every move is
+# honestly rejected as 'not your turn'; wait for the delivery instead of
+# spinning on rejections.
+wait_for "$workdir/a.out" 'seq 1: delivered'
 
 # Send an operator move, retrying only when the client rejected the input
 # locally (link degraded at the moment of typing). Local rejections are
