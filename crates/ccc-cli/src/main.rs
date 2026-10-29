@@ -302,7 +302,9 @@ fn plain_loop(
             Ok(worker::Update::EventJSON(line)) => {
                 println!("{}{line}", worker::EVENT_STDOUT_PREFIX)
             }
-            Ok(worker::Update::Accepted(_)) => {}
+            Ok(worker::Update::Accepted(_, text)) => {
+                println!("queued: {}", escape_controls(&text))
+            }
             Ok(worker::Update::Rejected(_, reason)) => {
                 eprintln!("rejected: {}", escape_controls(&reason))
             }

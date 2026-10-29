@@ -18,7 +18,8 @@ pub enum Update {
     /// plain frontend prints it, with the exact [`EVENT_STDOUT_PREFIX`];
     /// the wire owner never writes to stdout itself.
     EventJSON(String),
-    Accepted(u64),
+    /// Input accepted and queued; carries the submitted line for local echo.
+    Accepted(u64, String),
     Rejected(u64, String),
     Delivery(u16, Delivery),
     Fatal(Error),
@@ -324,7 +325,7 @@ pub fn start(
                     break;
                 };
                 let result = match cfg.kind {
-                    AppKind::Chat => session.queue_chat(line).map(|_| ()),
+                    AppKind::Chat => session.queue_chat(line.clone()).map(|_| ()),
                     AppKind::Game => line
                         .trim()
                         .parse::<u8>()
@@ -334,7 +335,7 @@ pub fn start(
                 if let Err(e) = result {
                     let _ = output.send(Update::Rejected(id, e.to_string()));
                 } else {
-                    let _ = output.send(Update::Accepted(id));
+                    let _ = output.send(Update::Accepted(id, line));
                 }
                 let _ = output.send(Update::Snapshot(session.snapshot()));
             }

@@ -30,7 +30,7 @@ fn slow_ui_snapshots_coalesce_and_overflow_is_fatal() {
     assert!(matches!(updates.try_recv(), Ok(Update::Snapshot(_))));
     assert!(matches!(updates.try_recv(), Err(mpsc::TryRecvError::Empty)));
     for id in 0..128 {
-        output.send(Update::Accepted(id)).unwrap();
+        output.send(Update::Accepted(id, String::new())).unwrap();
     }
     assert!(output.send(Update::Rejected(999, "no".into())).is_err());
     assert!(stop.load(Ordering::SeqCst));
@@ -45,9 +45,9 @@ fn fatal_outcome_survives_frontend_quit_and_overflow_marks_evidence_unsuccessful
     let stop = Arc::new(AtomicBool::new(false));
     let (output, updates) = update_channel(stop);
     for id in 0..128 {
-        output.send(Update::Accepted(id)).unwrap();
+        output.send(Update::Accepted(id, String::new())).unwrap();
     }
-    assert!(output.send(Update::Accepted(128)).is_err());
+    assert!(output.send(Update::Accepted(128, String::new())).is_err());
     drop(updates);
     assert_eq!(
         stopped_event(&output, true),
@@ -250,7 +250,7 @@ fn pump(updates: &Updates, out: &mut Collected) {
             Ok(Update::Note(note)) => out.notes.push(note),
             Ok(Update::Fatal(e)) => out.fatals.push(e.to_string()),
             Ok(Update::Snapshot(s)) => out.snapshots.push(s),
-            Ok(Update::Accepted(id)) => out.accepted.push(id),
+            Ok(Update::Accepted(id, _)) => out.accepted.push(id),
             Ok(Update::Rejected(id, why)) => out.notes.push(format!("rejected {id}: {why}")),
             Ok(Update::Delivery(..) | Update::EventJSON(_)) => {}
             Err(_) => break,

@@ -94,7 +94,7 @@ pub fn run(
                 Update::EventJSON(_) => {
                     // --events-stdout requires --plain; never mirrored here.
                 }
-                Update::Accepted(id) => {
+                Update::Accepted(id, _) => {
                     take_pending(&mut pending, id);
                 }
                 Update::Rejected(id, reason) => {
