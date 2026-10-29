@@ -68,6 +68,39 @@ pub struct Phy {
     frame: Option<FrameReceiver>,
     integral: Option<Integral>,
     tx_slots: Option<u64>,
+    tx_skip: Option<TxSkip>,
+    #[cfg(test)]
+    tx_skip_inject: Option<(u64, u32)>,
+    #[cfg(test)]
+    tx_capture: Option<Vec<bool>>,
+}
+
+/// Data-region TX overrun tolerance. A transmitter descheduled through a
+/// slot emits nothing during it, so the receiver measures an idle slot: at
+/// most one hard bit error in the interleaved word that slot maps to, which
+/// SECDED distance 4 corrects (2*errors + erasures < 4 with erasures = 0).
+/// Skipping is wire-compatible only on the absolute grid: `next_slot`
+/// always advances by whole slots from its anchor, never re-anchored to
+/// `now`, so every later symbol keeps its position.
+#[derive(Default)]
+struct TxSkip {
+    /// True only over the FEC-protected region (length and body blocks).
+    /// The carrier, gaps, preamble and trailing idle stay strict: the
+    /// acquisition anchors make any overrun there fatal.
+    data: bool,
+    /// Bytes in the current FEC block: 2 for the length block, up to
+    /// FEC_BLOCK_BYTES for body blocks.
+    block_bytes: usize,
+    /// Skips accounted in the current block.
+    block_skips: usize,
+    /// Words of the current block already hit by a skip.
+    word_hits: u8,
+    /// Skipped slots whose symbols still must be dropped. An overrun can
+    /// span several slots and cross a block boundary; each pending symbol
+    /// is budget-checked against the block that owns it as it is consumed.
+    drop_pending: usize,
+    /// Total skipped slots this frame, reported once under CCC_DEBUG.
+    skipped: u32,
 }
 
 #[derive(Default)]
@@ -236,6 +269,11 @@ impl Phy {
             frame: None,
             integral: None,
             tx_slots: None,
+            tx_skip: None,
+            #[cfg(test)]
+            tx_skip_inject: None,
+            #[cfg(test)]
+            tx_capture: None,
         }
     }
 
@@ -316,15 +354,22 @@ impl Phy {
             eprintln!("phy send {} bytes", bytes.len());
         }
         self.tx_slots = Some(0);
+        self.tx_skip = Some(TxSkip::default());
         let began = Instant::now();
         let result = (|| {
-            // Inter-frame gap.
+            // Inter-frame gap, carrier, gap and preamble stay strict: the
+            // acquisition anchors require them.
             self.idle_slots(4, deadline)?;
             for _ in 0..LOCK_ONES {
                 self.slot_activity(deadline)?;
             }
             self.idle_slots(8, deadline)?;
             self.send_u32(PREAMBLE, deadline)?;
+            // FEC-protected region: a descheduled transmitter may skip
+            // slots on the absolute grid within the fail-closed budget.
+            if let Some(tx) = &mut self.tx_skip {
+                tx.data = true;
+            }
             self.send_fec_block(&len.to_be_bytes(), deadline)?;
             let mut encoded = Vec::with_capacity(bytes.len() + 4);
             encoded.extend_from_slice(bytes);
@@ -332,8 +377,17 @@ impl Phy {
             for block in encoded.chunks(FEC_BLOCK_BYTES) {
                 self.send_fec_block(block, deadline)?;
             }
+            if let Some(tx) = &mut self.tx_skip {
+                tx.data = false;
+                // Slots skipped past the last body symbol fall in the
+                // trailing idle region: they map to no codeword, so the
+                // unconsumed remainder needs no budget accounting.
+                tx.drop_pending = 0;
+            }
+            // Trailing idle stays strict, as before.
             self.idle_slots(2, deadline)
         })();
+        let skipped = self.tx_skip.take().map_or(0, |tx| tx.skipped);
         if let Err(ref error) = result {
             if std::env::var_os("CCC_DEBUG").is_some() {
                 eprintln!(
@@ -342,6 +396,12 @@ impl Phy {
                     self.tx_slots
                 );
             }
+        }
+        if skipped > 0 && std::env::var_os("CCC_DEBUG").is_some() {
+            eprintln!(
+                "phy send skipped {skipped} slot(s) after {:?}",
+                began.elapsed()
+            );
         }
         self.tx_slots = None;
         result
@@ -567,21 +627,118 @@ impl Phy {
     }
 
     fn send_fec_block(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), Error> {
+        let block_bytes = bytes.len();
         let words: Vec<_> = bytes.iter().map(|&byte| fec_encode(byte)).collect();
-        for position in 0..FEC_BITS {
-            for &word in &words {
-                self.send_bit((word >> position) & 1 != 0, deadline)?;
+        self.tx_begin_block(block_bytes);
+        let total = FEC_BITS * block_bytes;
+        let mut i = 0;
+        while i < total {
+            // A slot the schedule has already passed emits nothing: account
+            // the skip against the fail-closed budget instead of shifting
+            // the symbol to a later slot.
+            let skipped = if self.tx_drop_pending() {
+                self.tx_consume_drop();
+                true
+            } else {
+                let bit = (words[i % block_bytes] >> (i / block_bytes)) & 1 != 0;
+                let skipped = self.send_bit(bit, deadline)?;
+                #[cfg(test)]
+                if !skipped {
+                    if let Some(capture) = &mut self.tx_capture {
+                        capture.push(bit);
+                    }
+                }
+                skipped
+            };
+            if skipped {
+                self.tx_account_skip(i)?;
+                #[cfg(test)]
+                if let Some(capture) = &mut self.tx_capture {
+                    capture.push(false);
+                }
             }
+            i += 1;
         }
         Ok(())
     }
 
-    fn send_bit(&mut self, one: bool, deadline: Instant) -> Result<(), Error> {
-        if one {
-            self.slot_activity(deadline)
-        } else {
-            self.idle_slots(1, deadline)
+    /// Begin a block's skip accounting. A skip spilling past the previous
+    /// block keeps its pending drops; they are budget-checked against this
+    /// block as they are consumed.
+    fn tx_begin_block(&mut self, block_bytes: usize) {
+        if let Some(tx) = &mut self.tx_skip {
+            tx.block_bytes = block_bytes.max(1);
+            tx.block_skips = 0;
+            tx.word_hits = 0;
         }
+    }
+
+    fn tx_drop_pending(&self) -> bool {
+        self.tx_skip
+            .as_ref()
+            .is_some_and(|tx| tx.data && tx.drop_pending > 0)
+    }
+
+    fn tx_consume_drop(&mut self) {
+        if let Some(tx) = &mut self.tx_skip {
+            tx.drop_pending = tx.drop_pending.saturating_sub(1);
+        }
+    }
+
+    /// Budget-check one skipped data symbol (block-relative slot index
+    /// `symbol`, mapping to word `symbol % block_bytes`, position
+    /// `symbol / block_bytes`) and count it. A skipped slot transmits
+    /// nothing, so the receiver measures an idle slot: at most one hard bit
+    /// error in the word the symbol maps to. SECDED distance 4 corrects
+    /// exactly one error per word (2*1 + 0 < 4), so a second skip in the
+    /// same word is beyond the guarantee. The per-block budget mirrors the
+    /// receiver's erasure allowance of MAX_WORD_ERASURES * block_bytes
+    /// erasures over FEC_BITS * block_bytes slots:
+    /// floor(3 * block_bytes / 13) skips. For block_bytes <= 8 that is zero
+    /// skips (blocks of four bytes or fewer, including the two-byte length
+    /// block) or one skip, so the per-word rule can never fire on its own;
+    /// both are enforced anyway, fail-closed. Beyond budget the frame
+    /// aborts exactly as an untreated overrun did.
+    fn tx_account_skip(&mut self, symbol: usize) -> Result<(), Error> {
+        let abort = || Error::Corrupt("missed physical slot");
+        let Some(tx) = &mut self.tx_skip else {
+            return Err(abort());
+        };
+        let budget = MAX_WORD_ERASURES * tx.block_bytes / FEC_BITS;
+        let hit = 1u8 << (symbol % tx.block_bytes);
+        if tx.block_skips >= budget || tx.word_hits & hit != 0 {
+            return Err(abort());
+        }
+        tx.word_hits |= hit;
+        tx.block_skips += 1;
+        tx.skipped += 1;
+        Ok(())
+    }
+
+    /// Transmit one bit; in the data region returns true when the slot was
+    /// skipped (nothing emitted) after an overrun.
+    fn send_bit(&mut self, one: bool, deadline: Instant) -> Result<bool, Error> {
+        if self.tx_skip_active() {
+            let Some(end) = self.data_slot_end(deadline)? else {
+                return Ok(true);
+            };
+            if one {
+                self.drive_active(end, deadline)?;
+            } else {
+                self.finish_slot(end, deadline)?;
+            }
+            return Ok(false);
+        }
+        if one {
+            self.slot_activity(deadline)?;
+        } else {
+            self.idle_slots(1, deadline)?;
+        }
+        Ok(false)
+    }
+
+    fn tx_skip_active(&self) -> bool {
+        self.tx_skip.as_ref().is_some_and(|tx| tx.data)
     }
 
     /// Sample the next frame slot on the absolute grid anchored at
@@ -701,6 +858,10 @@ impl Phy {
     fn slot_activity(&mut self, deadline: Instant) -> Result<(), Error> {
         self.check(deadline)?;
         let end = self.slot_end(deadline)?;
+        self.drive_active(end, deadline)
+    }
+
+    fn drive_active(&mut self, end: Instant, deadline: Instant) -> Result<(), Error> {
         while Instant::now() < end {
             self.check(deadline)?;
             self.activity();
@@ -717,6 +878,74 @@ impl Phy {
         Ok(())
     }
 
+    /// Begin the next data-region symbol's slot. On overrun, skip every
+    /// slot the absolute schedule has already passed: nothing is emitted
+    /// for them, the grid never re-anchors to `now`, and transmission
+    /// resumes at the first boundary that can still carry a symbol.
+    /// Returns the end of the slot to transmit in, or None when this
+    /// symbol's slot was skipped.
+    fn data_slot_end(&mut self, deadline: Instant) -> Result<Option<Instant>, Error> {
+        self.check(deadline)?;
+        if self.slot.is_zero() {
+            return Err(Error::InvalidInput("slot must be nonzero".into()));
+        }
+        let start = self.next_slot.unwrap_or_else(Instant::now);
+        let end = start
+            .checked_add(self.slot)
+            .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+        #[cfg(test)]
+        let now = self.injected_now(end).unwrap_or_else(Instant::now);
+        #[cfg(not(test))]
+        let now = Instant::now();
+        if now < end {
+            if let Some(slots) = &mut self.tx_slots {
+                *slots += 1;
+            }
+            self.next_slot = Some(end);
+            return Ok(Some(end));
+        }
+        // Overrun: the process was descheduled past this slot's end. Count
+        // the slots the schedule has fully passed; their symbols are
+        // dropped, never shifted.
+        let elapsed = now.saturating_duration_since(start).as_nanos();
+        let mut skipped = u32::try_from(elapsed / self.slot.as_nanos()).unwrap_or(u32::MAX);
+        let mut resume = start
+            .checked_add(self.slot.saturating_mul(skipped))
+            .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+        // The current partial slot still ends on the grid, but an active
+        // symbol filling less than half of it reads as idle at the
+        // receiver -- an error the skip accounting never saw. Skip it too
+        // (accounted) unless at least half of it remains.
+        if now.saturating_duration_since(resume) >= self.slot / 2 {
+            skipped = skipped.saturating_add(1);
+            resume = resume
+                .checked_add(self.slot)
+                .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
+        }
+        let tx = self.tx_skip.as_mut().expect("data region has skip state");
+        tx.drop_pending = tx.drop_pending.saturating_add((skipped - 1) as usize);
+        if let Some(slots) = &mut self.tx_slots {
+            *slots = slots.saturating_add(u64::from(skipped));
+        }
+        self.next_slot = Some(resume);
+        Ok(None)
+    }
+
+    /// Synthesize a deschedule in tests: when the slot counter reaches the
+    /// armed value, the slot begin observes a synthetic now exactly `back`
+    /// whole slots plus a quarter slot past this slot's scheduled start.
+    /// The grid anchor itself never moves, so the resume boundary is
+    /// exactly where a real deschedule would put it.
+    #[cfg(test)]
+    fn injected_now(&mut self, end: Instant) -> Option<Instant> {
+        let (at, back) = self.tx_skip_inject?;
+        if self.tx_slots != Some(at) {
+            return None;
+        }
+        self.tx_skip_inject = None;
+        end.checked_add(self.slot.saturating_mul(back.saturating_sub(1)) + self.slot / 4)
+    }
+
     fn slot_end(&mut self, deadline: Instant) -> Result<Instant, Error> {
         self.check(deadline)?;
         if self.slot.is_zero() {
@@ -727,6 +956,9 @@ impl Phy {
             .checked_add(self.slot)
             .ok_or_else(|| Error::InvalidInput("slot too large".into()))?;
         // Dropping a slot changes every subsequent bit's meaning.
+        #[cfg(test)]
+        let now = self.injected_now(end).unwrap_or_else(Instant::now);
+        #[cfg(not(test))]
         let now = Instant::now();
         if now >= end {
             if std::env::var_os("CCC_DEBUG").is_some() {

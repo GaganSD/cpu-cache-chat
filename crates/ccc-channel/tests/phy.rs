@@ -492,6 +492,18 @@ fn acquisition_below_old_bounds_locks_only_when_all_gates_pass() {
 }
 
 #[test]
+fn physical_sender_completes_small_frame_unchanged() {
+    // Happy path: with the TX skip machinery armed, an undisturbed send
+    // still completes exactly as before.
+    let mut phy = Phy::new(
+        PhyKind::Cpu,
+        Duration::from_millis(5),
+        Arc::new(AtomicBool::new(false)),
+    );
+    phy.send_blob(b"ok", Duration::from_secs(10)).unwrap();
+}
+
+#[test]
 fn physical_sender_rejects_frames_beyond_receiver_bound() {
     let mut phy = Phy::new(
         PhyKind::Cpu,
