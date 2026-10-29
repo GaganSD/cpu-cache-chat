@@ -166,18 +166,25 @@ if [[ "$finished" != yes ]]; then
   echo 'FAIL: physical agent game did not finish (deadline or peer exit)' >&2
   exit 1
 fi
+# Transcripts live on tmpfs /tmp, destroyed at process exit: copy them
+# while the peers are still running, before sending /q.
+transcripts=complete
+for side in a b; do
+  name="ccc-agent-$$-$side"
+  docker cp "$name:/tmp/agent-transcript.log" "$workdir/$side.transcript.log" 2>/dev/null || {
+    echo "WARNING: $side transcript missing; hosted evidence incomplete" >&2
+    transcripts=incomplete
+  }
+done
 printf '/q\n' >&3; printf '/q\n' >&4
 wait "$A_PID" "$B_PID"
 A_PID=''; B_PID=''
-# Canonical events from stdout mirror, plus retained model transcripts.
+# Canonical events from stdout mirror.
 sed -n 's/^CCC_EVENT //p' "$workdir/a.out" > "$workdir/a.jsonl"
 sed -n 's/^CCC_EVENT //p' "$workdir/b.out" > "$workdir/b.jsonl"
-for side in a b; do
-  name="ccc-agent-$CHANNEL-$$-$side"
-  docker cp "$name:/tmp/agent-transcript.log" "$workdir/$side.transcript.log" 2>/dev/null || {
-    echo "FAIL: $side transcript missing; hosted evidence incomplete" >&2; exit 1; }
-done
-"$ROOT/target/release/ccc-verify-game" --require-agents \
-  "$workdir/a.jsonl" "$workdir/b.jsonl" | tee "$workdir/verdict.json"
+VERIFIER="${CCC_VERIFY_GAME:-$ROOT/target/release/ccc-verify-game}"
+[[ -x "$VERIFIER" ]] || { echo "FAIL: verifier missing; run: cargo build --release --bin ccc-verify-game" >&2; exit 1; }
+"$VERIFIER" --require-agents "$workdir/a.jsonl" "$workdir/b.jsonl" | tee "$workdir/verdict.json"
 move_count=$(grep -c '"type":"move"' "$workdir/a.jsonl")
+[[ "$transcripts" == complete ]] || { echo 'FAIL: verified game but transcripts incomplete; evidence not release-grade' >&2; exit 1; }
 echo "PASS physical $CHANNEL agent game: verified equal boards and agent choices ($move_count moves); live network controls still need scripts/demo.sh"

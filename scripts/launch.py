@@ -34,7 +34,9 @@ WAIT_TIMEOUT = 5
 # Bounded post-run verifier replay in a disposable observer container.
 OBSERVER_TIMEOUT = 30
 # Diagnostic logs are byte-capped per stream; canonical events never depend on
-# them (the tmpfs events file is authoritative, the stdout mirror best-effort).
+# them. The tmpfs events file is captured live during the SIGINT grace window
+# (a stopped container's tmpfs is gone, so post-exit cp cannot work); the
+# bounded stdout mirror is the retention-safe authoritative fallback.
 LOG_STREAM_LIMIT = 8 * 1024 * 1024
 LOG_CAPTURE_TIMEOUT = 60
 RUN_QUOTA = 64 * 1024 * 1024
@@ -333,11 +335,17 @@ def validate_events(data):
 
 
 def extract_stdout_events(out):
-    """Losslessly mirror CCC_EVENT-prefixed canonical JSONL lines from raw stdout."""
+    """Losslessly mirror CCC_EVENT-prefixed canonical JSONL lines from raw stdout.
+
+    Peers run with a TTY (interactive attach), so the pty layer terminates
+    lines with CRLF; one trailing carriage return per line is stripped so the
+    mirror is byte-identical to the events file.
+    """
     if not out:
         return None
     prefix = EVENT_PREFIX.encode()
-    lines = [line[len(prefix):] for line in out.split(b'\n') if line.startswith(prefix)]
+    lines = [line[len(prefix):].removesuffix(b'\r')
+             for line in out.split(b'\n') if line.startswith(prefix)]
     return b'\n'.join(lines) + b'\n' if lines else None
 
 
@@ -431,6 +439,33 @@ def finalize(run, store, mode, image, cpu):
     # forcibly removed and their evidence is missing, never invented.
     for ident in containers:
         docker('kill', '--signal', 'SIGINT', ident, check=False)
+    # Capture the tmpfs events file live during the grace window: once the
+    # peer exits, its tmpfs (and the terminal stopped record on it) is gone,
+    # so poll until the file validates or the peer is no longer exec-able.
+    live_events = {}
+    live_problems = {}
+    if game:
+        deadline = time.monotonic() + WAIT_TIMEOUT
+        pending = set(containers)
+        while pending and time.monotonic() < deadline:
+            for ident in sorted(pending):
+                try:
+                    rc, content = docker_capture('exec', ident, 'cat', EVENTS_PATH, timeout=10)
+                except RuntimeError:
+                    pending.discard(ident)
+                    continue
+                if rc != 0:
+                    pending.discard(ident)
+                    continue
+                data = content.encode()
+                problem = validate_events(data)
+                if problem is None:
+                    live_events[ident] = data
+                    pending.discard(ident)
+                else:
+                    live_problems[ident] = problem
+            if pending:
+                time.sleep(0.25)
     for ident in containers:
         record = evidence.setdefault(names[ident], {})
         try:
@@ -439,8 +474,8 @@ def finalize(run, store, mode, image, cpu):
         except RuntimeError:
             record['exit'] = 'forced'
             docker('rm', '-f', ident, check=False)
-    # Logs and canonical events are collected only after exit, so the tmpfs
-    # events file includes the final stopped record.
+    # Logs are collected after exit; canonical events come from the live
+    # capture when it validated, else from the retention-safe stdout mirror.
     for ident in containers:
         safe = names[ident]
         record = evidence.setdefault(safe, {})
@@ -456,20 +491,14 @@ def finalize(run, store, mode, image, cpu):
         if not game:
             continue
         file_events = None
-        try:
-            raw = read_remote_file(ident, EVENTS_PATH)
-            if raw is None:
-                record['events'] = 'missing'
-            else:
-                problem = validate_events(raw)
-                if problem:
-                    record['events'] = f'incomplete: {problem}'
-                else:
-                    store.write_jsonl(f'events/{safe}.jsonl', raw)
-                    record['events'] = 'captured'
-                    file_events = raw
-        except (RuntimeError, OSError) as e:
-            record['events'] = f'capture-error: {e}'
+        if ident in live_events:
+            store.write_jsonl(f'events/{safe}.jsonl', live_events[ident])
+            record['events'] = 'captured-live'
+            file_events = live_events[ident]
+        elif ident in live_problems:
+            record['events'] = f'incomplete: {live_problems[ident]}'
+        else:
+            record['events'] = 'unavailable: peer exited before a complete live capture'
         mirror_events = None
         mirror = extract_stdout_events(out)
         if mirror is None:
@@ -514,8 +543,10 @@ def incomplete_reasons(store, evidence, mode):
         if record.get('logs') != 'captured':
             reasons.append(f'{name}: logs {record.get("logs") or "not captured"}')
         if game:
-            if record.get('events') != 'captured':
-                reasons.append(f'{name}: events {record.get("events") or "not captured"}')
+            if record.get('events') != 'captured-live' and record.get('events_stdout') != 'captured':
+                reasons.append(f'{name}: no complete canonical events '
+                               f'(file: {record.get("events") or "not captured"}; '
+                               f'stdout: {record.get("events_stdout") or "not captured"})')
             if record.get('events_disagreement'):
                 reasons.append(f'{name}: events stdout mirror disagrees with events file')
         if hosted and record.get('transcript') != 'captured':

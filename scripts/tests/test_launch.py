@@ -297,17 +297,23 @@ class LauncherTests(unittest.TestCase):
         logs = {'cid-a': (mirror(EVENTS_A, secret_log), b'debug err\n', False),
                 'cid-b': (mirror(EVENTS_B), b'', False)}
         verdict = (0, '{"ok": true, "session": 7, "outcome": "draw", "agents_verified": true}')
+        events_by_ident = {'cid-a': EVENTS_A, 'cid-b': EVENTS_B}
+        def fake_capture(*args, **kwargs):
+            self.calls.append(args)
+            if args[:1] == ('exec',):
+                return 0, events_by_ident[args[1]].decode()
+            return verdict
         with patch.dict(os.environ, {'OPENCODE_GO_API_KEY': 'live-secret-value'}), \
              patch.object(launch, 'docker', self.peer_docker()), \
              patch.object(launch, 'read_container_logs', side_effect=lambda ident, **kw: logs[ident]), \
-             patch.object(launch, 'docker_capture', return_value=verdict):
+             patch.object(launch, 'docker_capture', fake_capture):
             launch.stop(run)
         data = json.loads((launch.STATE / (run + '.json')).read_text())
         self.assertEqual(data['status'], 'stopped')
         self.assertEqual(data['game_verdict']['ok'], True)
         self.assertEqual(data['game_verdict']['via'], 'observer-container')
         rec_a = data['evidence']['ccc-cid-a']
-        self.assertEqual(rec_a['events'], 'captured')
+        self.assertEqual(rec_a['events'], 'captured-live')
         self.assertEqual(rec_a['events_stdout'], 'captured')
         self.assertEqual(rec_a['exit'], 0)
         self.assertEqual(rec_a['logs'], 'captured')
@@ -334,21 +340,24 @@ class LauncherTests(unittest.TestCase):
         # Missing artifacts are recorded, never invented.
         self.assertFalse((launch.STATE / run / 'transcripts' / 'ccc-cid-a.log').exists())
         self.assertTrue((launch.STATE / run / 'transcripts' / 'ccc-cid-b.log').exists())
-        # Ordering: transcript copy while peers live, SIGINT, bounded wait,
-        # post-exit events copy, container removal, then network removal.
+        # Ordering: transcript copy while peers live, SIGINT, live events
+        # capture during the grace window, bounded wait, container removal,
+        # then network removal. A stopped peer's tmpfs is gone, so the events
+        # file must be read before exit, never by post-exit cp.
         index = lambda pred: [i for i, c in enumerate(self.calls) if pred(c)]
         tx_cp = index(lambda c: c[0] == 'cp' and 'agent-transcript.log' in c[1])
-        ev_cp = index(lambda c: c[0] == 'cp' and 'game.events.jsonl' in c[1])
+        ev_exec = index(lambda c: c[:1] == ('exec',) and any('game.events.jsonl' in x for x in c))
         kills = index(lambda c: c[:2] == ('kill', '--signal'))
         waits = index(lambda c: c[0] == 'wait')
         rms = index(lambda c: c[:2] == ('rm', '-f'))
         netrms = index(lambda c: c[:2] == ('network', 'rm'))
-        self.assertTrue(all((tx_cp, ev_cp, kills, waits, rms, netrms)))
+        self.assertTrue(all((tx_cp, ev_exec, kills, waits, rms, netrms)))
         self.assertLess(max(tx_cp), min(kills))
-        self.assertLess(max(kills), min(waits))
-        self.assertLess(max(waits), min(ev_cp))
-        self.assertLess(max(ev_cp), min(rms))
+        self.assertLess(max(kills), min(ev_exec))
+        self.assertLess(max(ev_exec), min(waits))
+        self.assertLess(max(waits), min(rms))
         self.assertLess(max(rms), min(netrms))
+        self.assertFalse(index(lambda c: c[0] == 'cp' and 'game.events.jsonl' in c[1]))
         self.assertTrue(all(c[2] == 'SIGINT' for c in self.calls if c[:2] == ('kill', '--signal')))
 
     def test_missing_final_or_stopped_marks_incomplete(self):
@@ -357,10 +366,16 @@ class LauncherTests(unittest.TestCase):
         no_stopped = EVENTS_A.replace(
             b'{"type":"stopped","successful":true,"evidence_complete":true}', MOVE)
         bad_stop = EVENTS_A.replace(b'"successful":true', b'"successful":false')
+        events_by_ident = {'cid-a': no_stopped, 'cid-b': bad_stop}
+        def fake_capture(*args, **kwargs):
+            if args[:1] == ('exec',):
+                return 0, events_by_ident[args[1]].decode()
+            raise AssertionError('verifier must not run without canonical events')
         with patch.object(launch, 'docker', self.peer_docker(events=(no_stopped, bad_stop),
                                                              transcripts=(None, None))), \
              patch.object(launch, 'read_container_logs', return_value=(b'', b'', False)), \
-             patch.object(launch, 'docker_capture') as capture_mock:
+             patch.object(launch, 'WAIT_TIMEOUT', 0.2), \
+             patch.object(launch, 'docker_capture', fake_capture):
             launch.stop(run)
         data = json.loads(path.read_text())
         self.assertEqual(data['evidence']['ccc-cid-a']['events'],
@@ -373,26 +388,28 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(any('verification skipped' in r for r in data['incomplete_reasons']))
         # No verdict is invented and malformed evidence is never stored as canonical.
         self.assertNotIn('game_verdict', data)
-        capture_mock.assert_not_called()
         self.assertFalse((launch.STATE / run / 'events' / 'ccc-cid-a.jsonl').exists())
 
     def test_observed_exit_failure_marks_incomplete(self):
         run = '2' * 32
         path = self.write_manifest(run, 'game')
+        def fake_capture(*args, **kwargs):
+            if args[:1] == ('exec',):
+                return 0, EVENTS_A.decode()
+            raise AssertionError('verifier must not run for a single peer')
         with patch.object(launch, 'docker', self.peer_docker(containers=('cid-a',),
                                                              networks=(), wait_result='1',
                                                              events=(EVENTS_A,),
                                                              transcripts=(None,))), \
              patch.object(launch, 'read_container_logs',
                           return_value=(mirror(EVENTS_A), b'', False)), \
-             patch.object(launch, 'docker_capture') as capture_mock:
+             patch.object(launch, 'docker_capture', fake_capture):
             launch.stop(run)
         data = json.loads(path.read_text())
         record = data['evidence']['ccc-cid-a']
         self.assertEqual(record['exit'], 1)
-        self.assertEqual(record['events'], 'captured')
+        self.assertEqual(record['events'], 'captured-live')
         self.assertTrue(any('peer exit 1' in r for r in data['incomplete_reasons']))
-        capture_mock.assert_not_called()
 
     def test_unresponsive_peer_escalates_and_never_invents(self):
         run = '3' * 32
@@ -402,16 +419,18 @@ class LauncherTests(unittest.TestCase):
                                 events=(None,), transcripts=(None,))
         with patch.object(launch, 'docker', fake), \
              patch.object(launch, 'read_container_logs',
-                          side_effect=RuntimeError('log capture failed')):
+                          side_effect=RuntimeError('log capture failed')), \
+             patch.object(launch, 'docker_capture', return_value=(1, '')):
             launch.stop(run)
         data = json.loads(path.read_text())
         record = data['evidence']['ccc-cid-a']
         self.assertEqual(record['exit'], 'forced')
-        self.assertEqual(record['events'], 'missing')
+        self.assertEqual(record['events'],
+                         'unavailable: peer exited before a complete live capture')
         self.assertTrue(record['logs'].startswith('capture-error'))
         reasons = data['incomplete_reasons']
         self.assertTrue(any('forcibly removed' in r for r in reasons))
-        self.assertTrue(any('events missing' in r for r in reasons))
+        self.assertTrue(any('no complete canonical events' in r for r in reasons))
         self.assertNotIn('game_verdict', data)
         self.assertTrue(any(c[:2] == ('rm', '-f') and 'cid-a' in c for c in self.calls))
         self.assertFalse((launch.STATE / run / 'events' / 'ccc-cid-a.jsonl').exists())
@@ -437,6 +456,7 @@ class LauncherTests(unittest.TestCase):
             return 'ok'
         with patch.object(launch, 'docker', fake), \
              patch.object(launch, 'read_container_logs', return_value=(b'', b'', False)), \
+             patch.object(launch, 'docker_capture', return_value=(1, '')), \
              patch.object(launch, 'TRANSCRIPT_QUOTA', 8):
             launch.stop(run)
         data = json.loads((launch.STATE / (run + '.json')).read_text())
@@ -471,6 +491,12 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(launch.extract_stdout_events(trailing), EVENTS_A + b'not-json\n')
         self.assertIsNone(launch.extract_stdout_events(b'no prefixed lines\n'))
         self.assertIsNone(launch.extract_stdout_events(b''))
+        # Peers attach via a TTY, whose pty layer terminates lines with CRLF;
+        # one trailing carriage return per line is stripped so the mirror is
+        # byte-identical to the events file.
+        crlf = mirror(EVENTS_A).replace(b'\n', b'\r\n')
+        self.assertEqual(launch.extract_stdout_events(crlf), EVENTS_A)
+        self.assertEqual(launch.extract_stdout_events(b'noise\r\n' + crlf), EVENTS_A)
 
     def test_log_streaming_reads_split_streams(self):
         script = ('import sys; sys.stdout.write("out"); sys.stdout.flush(); '

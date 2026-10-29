@@ -119,12 +119,14 @@ wait_for "$workdir/a.out" 'link: connected'
 wait_for "$workdir/b.out" 'link: connected'
 
 # Send an operator move, retrying only when the client rejected the input
-# locally (link degraded at the moment of typing). A delivery-unknown or a
-# rejected peer move is never retried: that is a protocol outcome, not typing.
+# locally (link degraded at the moment of typing). Local rejections are
+# printed on stderr (`rejected: ...`); delivery states and peer notes stay on
+# stdout. A delivery-unknown or a rejected peer move is never retried: that
+# is a protocol outcome, not typing.
 play_move() {
-  local fd="$1" sender_out="$2" square="$3" seq="$4" baseline
+  local fd="$1" sender_out="$2" sender_err="$3" square="$4" seq="$5" baseline
   for _ in 1 2 3 4 5 6; do
-    baseline=$(grep -cE 'not your turn|occupied|game is already over' "$sender_out" || true)
+    baseline=$(grep -cE 'not your turn|occupied|game is already over' "$sender_err" || true)
     printf '%s\n' "$square" >&"$fd"
     for _ in $(seq 1 "$WAIT_TRIES"); do
       if grep -Fxq "seq $seq: delivered" "$sender_out"; then return 0; fi
@@ -132,7 +134,7 @@ play_move() {
         echo "FAIL: seq $seq delivery unknown for square $square" >&2
         return 1
       fi
-      if (( $(grep -cE 'not your turn|occupied|game is already over' "$sender_out" || true) > baseline )); then
+      if (( $(grep -cE 'not your turn|occupied|game is already over' "$sender_err" || true) > baseline )); then
         wait_for "$sender_out" 'link: connected'
         break
       fi
@@ -147,21 +149,21 @@ play_move() {
 # A (X) plays center. B tries the occupied square first: it must be rejected
 # locally and never appear as a peer move on A.
 # A's start control consumes seq 1; A's moves are seq 2, 3, 4 and B's are 1, 2.
-play_move 3 "$workdir/a.out" 5 2
+play_move 3 "$workdir/a.out" "$workdir/a.err" 5 2
 wait_for "$workdir/b.out" 'peer move 5 (ply 0)'
 wait_for "$workdir/b.out" ' 4 | X | 6'
 printf '5\n' >&4
-wait_for "$workdir/b.out" 'square 5 occupied'
+wait_for "$workdir/b.err" 'rejected: illegal move: square 5 occupied'
 wait_absent "$workdir/a.out" 'peer move 5' 3
 echo 'PASS: illegal occupied square rejected locally; no peer move emitted'
-play_move 4 "$workdir/b.out" 2 1
+play_move 4 "$workdir/b.out" "$workdir/b.err" 2 1
 wait_for "$workdir/a.out" 'peer move 2 (ply 1)'
 wait_for "$workdir/a.out" ' 1 | O | 3'
-play_move 3 "$workdir/a.out" 1 3
+play_move 3 "$workdir/a.out" "$workdir/a.err" 1 3
 wait_for "$workdir/b.out" 'peer move 1 (ply 2)'
-play_move 4 "$workdir/b.out" 8 2
+play_move 4 "$workdir/b.out" "$workdir/b.err" 8 2
 wait_for "$workdir/a.out" 'peer move 8 (ply 3)'
-play_move 3 "$workdir/a.out" 9 4
+play_move 3 "$workdir/a.out" "$workdir/a.err" 9 4
 # A winning move is reported as the outcome, not a plain peer-move note.
 wait_for "$workdir/a.out" 'X wins'
 wait_for "$workdir/b.out" 'X wins'
@@ -176,5 +178,7 @@ A_PID=''; B_PID=''
 # Authoritative verdict: strict per-peer canonical events, replayed legally.
 sed -n 's/^CCC_EVENT //p' "$workdir/a.out" > "$workdir/a.jsonl"
 sed -n 's/^CCC_EVENT //p' "$workdir/b.out" > "$workdir/b.jsonl"
-"$ROOT/target/release/ccc-verify-game" "$workdir/a.jsonl" "$workdir/b.jsonl" | tee "$workdir/verdict.json"
+VERIFIER="${CCC_VERIFY_GAME:-$ROOT/target/release/ccc-verify-game}"
+[[ -x "$VERIFIER" ]] || { echo "FAIL: verifier missing; run: cargo build --release --bin ccc-verify-game" >&2; exit 1; }
+"$VERIFIER" "$workdir/a.jsonl" "$workdir/b.jsonl" | tee "$workdir/verdict.json"
 echo "PASS docker $CHANNEL game: legal moves, illegal rejected locally, verified equal boards"
