@@ -124,7 +124,7 @@ fi
 echo 'PASS: probe decoded expected bytes (0 bit errors in this frame) and silent control passed; single qualification run, not a reliability guarantee'
 docker rm "$a" "$b" >/dev/null
 owned_a=0; owned_b=0
-load_avg=$({ cut -d' ' -f1-3 < /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null || echo unknown; } | tr '\n' ' ')
+load_avg=$({ if [[ -r /proc/loadavg ]]; then cut -d' ' -f1-3 < /proc/loadavg; else sysctl -n vm.loadavg 2>/dev/null || echo unknown; fi; } | tr '\n' ' ')
 {
   printf 'schema_version=1\n'
   printf 'created_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
