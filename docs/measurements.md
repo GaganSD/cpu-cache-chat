@@ -121,3 +121,17 @@ Token-handoff robustness fixes were driven by these runs: the initiator re-offer
 **Sealed agent run** (`measurements/2026-10-28-physical/cpu-agent-game-sealed/`, exit_status=0, repo HEAD `f784922` clean at launch): seven legal plies (X: 5, 9, 2, 8; O: 1, 3, 7), `X wins` on both boards, complete untruncated session transcripts for every move (each ending in `submit_move` + `Accepted N`; B's third ply needed one retry after the model exhausted `maxTokens` without submitting — the failed session is retained in b.out), launch-time provenance, post-start runtime network capture, and a negative peer probe: container A's TCP connect to B's address was refused (`ECONNREFUSED`). On OrbStack's userspace networking that refusal answers at the router, so the probe demonstrates there is no reachable peer service rather than proving the absence of any L3 path; the isolation claim still rests on the disjoint bridges, no shared mounts, and the physical-layer telemetry. `docker/build-agent.sh` now documents the exact image build command.
 
 Two cache-mode game attempts after the cache chat success failed at the handshake (`link: connected` never reached); a cache game remains unrun. Everything above remains single-run evidence on a shared, noisy host.
+
+## Appendix: harness qualification controls and slot presets (harness behavior only, no new physical results)
+
+This section documents harness mechanics. It records no measurements and changes no result above.
+
+### Campaign control bundles
+
+The silent no-sender control (three complete empty control-frame windows; 61 s at the 50 ms preset) and the receiver-blind probe run **once per immutable configuration** via `scripts/run-controls.sh --out DIR`, producing a control bundle: `manifest.txt` plus `silent.out/.err` and `probe-a.out/.err`/`probe-b.out/.err`. The manifest records `schema_version=1`, UTC creation time, image tag and resolved image id, channel, slot, cpuset, the operator-supplied load note (`CCC_LOAD_NOTE`) and a best-effort informational load average, a `config_sha256` over `image id | channel | slot | cpuset | load note`, and `result=pass`. The silent control completes and its container is removed before the probe starts; the two never overlap.
+
+`scripts/e2e-docker.sh` accepts `--controls-dir DIR` / `CCC_CONTROLS_DIR`. If the bundle's `config_sha256` matches the current configuration and `scripts/probe-report.py bundle DIR` re-validates the stored evidence, the attempt references the bundle (manifest copied into the attempt evidence, `controls=bundle` in `run.txt`) instead of re-running controls. Otherwise the controls run inline into the attempt's own evidence (`controls=inline`); standalone behavior is unchanged. `scripts/run-physical-matrix.sh` qualifies the bundle once per chat campaign and aborts before any attempt if the controls do not pass. A passing bundle is a **single qualification run, not a reliability guarantee**, and it does not qualify any other image, channel, slot, cpuset, or recorded load note.
+
+### SLOT_MS=25 status: UNQUALIFIED
+
+The harness validation range is 1..500 ms, so `SLOT_MS=25` is accepted cleanly by the matrix runner and chat harness (31 s silent window). **No physical qualification run at 25 ms under recorded load has passed.** Until a control bundle at 25 ms passes under a recorded load note and bidirectional chat attempts referencing that bundle pass, the 25 ms preset remains UNQUALIFIED: no timing, decoding, delivery, or reliability claim is made for it, and none of the passing 50 ms results above apply to it.
