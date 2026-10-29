@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +24,31 @@ const FEC_BLOCK_BYTES: usize = 8;
 // occupy at most FRAME_LIFETIME_MULTIPLIER times its expected airtime.
 const MAX_WORD_ERASURES: usize = 3;
 const FRAME_LIFETIME_MULTIPLIER: u32 = 4;
+
+// Minimum observed (non-erased) quarter-samples per training region before a
+// lock candidate is even considered. Quarter-slot sampling loses individual
+// measurements under load, so a sparse but internally consistent window must
+// still train. These floors were lowered (carrier 20, gap 6, preamble 24) so
+// that 25-40% erasure hunts can lock; alignment safety comes from the
+// mandatory gap anchors, the zero-gap-error rule and the error caps scaling
+// with how much of each region was observed, not from these counts alone.
+const MIN_CARRIER_OBSERVED: usize = 16; // of 32 carrier quarter-samples
+const MIN_GAP_OBSERVED: usize = 4; // of 8 idle-gap quarter-samples
+const MIN_PREAMBLE_OBSERVED: usize = 16; // of 32 preamble quarter-samples
+
+// CCC_DEBUG diagnostics: tally which acquisition gate rejected each full
+// window so loaded hunts can attribute failures without per-quanta logging.
+static REJECT_CARRIER: AtomicU64 = AtomicU64::new(0);
+static REJECT_GAP: AtomicU64 = AtomicU64::new(0);
+static REJECT_PREAMBLE: AtomicU64 = AtomicU64::new(0);
+static REJECT_ANCHORS: AtomicU64 = AtomicU64::new(0);
+static REJECT_SEPARATION: AtomicU64 = AtomicU64::new(0);
+
+fn tally_reject(counter: &AtomicU64) {
+    if std::env::var_os("CCC_DEBUG").is_some() {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum PhyKind {
@@ -463,10 +488,17 @@ impl Phy {
                 let trained = train_lock_erased(samples);
                 if std::env::var_os("CCC_DEBUG").is_some() && hunt.count.is_multiple_of(128) {
                     eprintln!(
-                        "phy hunt elapsed={:?} count={} erasures={} candidate: {:?}",
+                        "phy hunt elapsed={:?} count={} erasures={} \
+                         rejects(carrier/gap/preamble/anchors/separation)={}/{}/{}/{}/{} \
+                         candidate: {:?}",
                         hunt.began.elapsed(),
                         hunt.count,
                         hunt.erasures,
+                        REJECT_CARRIER.load(Ordering::Relaxed),
+                        REJECT_GAP.load(Ordering::Relaxed),
+                        REJECT_PREAMBLE.load(Ordering::Relaxed),
+                        REJECT_ANCHORS.load(Ordering::Relaxed),
+                        REJECT_SEPARATION.load(Ordering::Relaxed),
                         training_stats_erased(samples)
                     );
                 }
@@ -976,12 +1008,22 @@ fn training_stats_erased(
     let gap_count = samples[32..40].iter().flatten().count();
     let preamble_count = samples[40..].iter().flatten().count();
     // Retain both edges of the gap: otherwise missing symbols can conceal a
-    // two-slot-early lock on the periodic preamble.
-    if carrier_count < 20
-        || gap_count < 6
-        || preamble_count < 24
-        || [32, 33, 38, 39].iter().any(|&i| samples[i].is_none())
-    {
+    // two-slot-early lock on the periodic preamble. The anchors at the gap
+    // edges stay mandatory even though the observation minima are lower.
+    if carrier_count < MIN_CARRIER_OBSERVED {
+        tally_reject(&REJECT_CARRIER);
+        return None;
+    }
+    if gap_count < MIN_GAP_OBSERVED {
+        tally_reject(&REJECT_GAP);
+        return None;
+    }
+    if preamble_count < MIN_PREAMBLE_OBSERVED {
+        tally_reject(&REJECT_PREAMBLE);
+        return None;
+    }
+    if [32, 33, 38, 39].iter().any(|&i| samples[i].is_none()) {
+        tally_reject(&REJECT_ANCHORS);
         return None;
     }
     let mut active = Vec::with_capacity(48);
@@ -1001,6 +1043,7 @@ fn training_stats_erased(
     let b = idle[idle.len() / 2];
     let (low, high) = if a < b { (a, b) } else { (b, a) };
     if high - low < low / 20 || high == low {
+        tally_reject(&REJECT_SEPARATION);
         return None;
     }
     let decoder = Decoder {
@@ -1043,7 +1086,16 @@ pub fn train_lock_erased(samples: &[Option<Duration>]) -> Option<Decoder> {
     // otherwise pass with exactly two carrier errors, two gap errors and one
     // preamble error, then decode every frame bit at the wrong offset. Require
     // the entire idle gap so that the gap identifies the phase unambiguously.
-    if carrier <= 4 && gap == 0 && preamble <= 4 {
+    //
+    // Error budgets scale with how much of each region survived erasure:
+    // min(4, observed/8) keeps a fully observed window at the historical cap
+    // of four, while a sparsely observed window must show proportionally
+    // cleaner evidence. Fewer observations never weaken error evidence.
+    let carrier_observed = samples[..32].iter().flatten().count() as u32;
+    let preamble_observed = samples[40..].iter().flatten().count() as u32;
+    let carrier_cap = (carrier_observed / 8).min(4);
+    let preamble_cap = (preamble_observed / 8).min(4);
+    if carrier <= carrier_cap && gap == 0 && preamble <= preamble_cap {
         Some(decoder)
     } else {
         None

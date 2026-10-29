@@ -272,6 +272,225 @@ fn acquisition_tolerates_scheduler_gap_bursts() {
     }
 }
 
+// Sparse 72-slot hunt windows for the acquisition hardening tests: erasures
+// and corruptions are absolute window positions, never shifts. The lowered
+// observation floors are 16 carrier, 4 gap and 16 preamble quarter-samples.
+fn sparse_training_window(
+    inverted: bool,
+    erase: &[usize],
+    corrupt: &[usize],
+) -> Vec<Option<Duration>> {
+    let bits = std::iter::repeat_n(true, 32)
+        .chain(std::iter::repeat_n(false, 8))
+        .chain(bits_msb(0xaaaa_aaaa, 32));
+    let mut window: Vec<_> = bits
+        .map(|active| {
+            Some(Duration::from_micros(if active ^ inverted {
+                20
+            } else {
+                10
+            }))
+        })
+        .collect();
+    for &i in corrupt {
+        window[i] = window[i].map(|sample| {
+            if sample == Duration::from_micros(20) {
+                Duration::from_micros(10)
+            } else {
+                Duration::from_micros(20)
+            }
+        });
+    }
+    for &i in erase {
+        window[i] = None;
+    }
+    window
+}
+
+// Erase sets leaving exactly the new minima: 16 carrier, the four mandatory
+// gap anchors, and 16 preamble quarter-samples.
+const SPARSE_CARRIER_ERASE: [usize; 16] =
+    [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30];
+const SPARSE_GAP_ERASE: [usize; 4] = [34, 35, 36, 37];
+const SPARSE_PREAMBLE_ERASE: [usize; 16] = [
+    40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+];
+
+fn sparse_erase_set() -> Vec<usize> {
+    SPARSE_CARRIER_ERASE
+        .into_iter()
+        .chain(SPARSE_GAP_ERASE)
+        .chain(SPARSE_PREAMBLE_ERASE)
+        .collect()
+}
+
+#[test]
+fn acquisition_locks_at_lowered_erasure_bounds() {
+    for inverted in [false, true] {
+        let window = sparse_training_window(inverted, &sparse_erase_set(), &[]);
+        let decoder = train_lock_erased(&window).expect("sparse window at the new bounds locks");
+        assert!(decoder.decode(Duration::from_micros(if inverted { 10 } else { 20 })));
+        assert!(!decoder.decode(Duration::from_micros(if inverted { 20 } else { 10 })));
+    }
+}
+
+#[test]
+fn acquisition_still_requires_mandatory_gap_anchors() {
+    for inverted in [false, true] {
+        for anchor in [32, 33, 38, 39] {
+            // Every other gap slot stays observed, so the gap count floor
+            // passes; the missing anchor alone must reject.
+            let erase: Vec<usize> = SPARSE_CARRIER_ERASE
+                .into_iter()
+                .chain(SPARSE_PREAMBLE_ERASE)
+                .chain([anchor])
+                .collect();
+            let window = sparse_training_window(inverted, &erase, &[]);
+            assert!(
+                train_lock_erased(&window).is_none(),
+                "anchor {anchor} is mandatory even at the lowered bounds"
+            );
+        }
+    }
+}
+
+#[test]
+fn acquisition_rejects_two_slot_aliases_at_lowered_bounds() {
+    for inverted in [false, true] {
+        // Stream: four idle slots, the training sequence, four idle slots.
+        let stream: Vec<_> = std::iter::repeat_n(false, 4)
+            .chain(std::iter::repeat_n(true, 32))
+            .chain(std::iter::repeat_n(false, 8))
+            .chain(bits_msb(0xaaaa_aaaa, 32))
+            .chain(std::iter::repeat_n(false, 4))
+            .map(|active| {
+                Some(Duration::from_micros(if active ^ inverted {
+                    20
+                } else {
+                    10
+                }))
+            })
+            .collect();
+        // Control: the aligned window, sparsely erased to the new bounds.
+        let mut aligned = stream[4..76].to_vec();
+        for &i in &sparse_erase_set() {
+            aligned[i] = None;
+        }
+        assert!(train_lock_erased(&aligned).is_some());
+        // Two slots early: every count gate passes (16 carrier, the four
+        // anchors, 16 preamble) with zero carrier and preamble errors; only
+        // the zero-gap-error guard can reject, because anchors 32 and 33
+        // hold carrier spillover.
+        let mut early = stream[2..74].to_vec();
+        let early_erase: Vec<usize> = [0, 1, 40, 41]
+            .into_iter()
+            .chain((2..32).step_by(2).take(14))
+            .chain([34, 35, 36, 37])
+            .chain((42..72).step_by(2).take(14))
+            .collect();
+        for &i in &early_erase {
+            early[i] = None;
+        }
+        assert!(
+            train_lock_erased(&early).is_none(),
+            "two-slot-early alias must not lock at the lowered bounds"
+        );
+        // Two slots late: again every count gate passes with zero carrier
+        // and preamble errors; anchor 38 holds preamble spillover, so the
+        // gap guard alone rejects.
+        let mut late = stream[6..78].to_vec();
+        let late_erase: Vec<usize> = [30, 31, 70]
+            .into_iter()
+            .chain((0..30).step_by(2).take(14))
+            .chain([34, 35, 36, 37])
+            .chain((40..70).step_by(2).take(15))
+            .collect();
+        for &i in &late_erase {
+            late[i] = None;
+        }
+        assert!(
+            train_lock_erased(&late).is_none(),
+            "two-slot-late alias must not lock at the lowered bounds"
+        );
+    }
+}
+
+#[test]
+fn acquisition_never_locks_noise_or_silence_under_erasures() {
+    // Pure silence: no measurements at all, or a constant-cost line, fully
+    // observed or thinned out.
+    assert!(train_lock_erased(&vec![None; 72]).is_none());
+    assert!(train_lock_erased(&vec![Some(Duration::from_micros(10)); 72]).is_none());
+    let mut sparse_flat = vec![Some(Duration::from_micros(10)); 72];
+    for i in (0..72).step_by(3) {
+        sparse_flat[i] = None;
+    }
+    assert!(train_lock_erased(&sparse_flat).is_none());
+    // Stationary noise with a third of the quarter-samples erased: no window
+    // of the stream may lock, however the erasures line up.
+    let mut seed = 7u64;
+    let mut stream = Vec::new();
+    for _ in 0..512 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        stream.push(if (seed >> 33).is_multiple_of(3) {
+            None
+        } else {
+            Some(Duration::from_nanos(10_000 + ((seed >> 32) % 1_000)))
+        });
+    }
+    assert!(stream
+        .windows(72)
+        .all(|window| train_lock_erased(window).is_none()));
+}
+
+#[test]
+fn acquisition_below_old_bounds_locks_only_when_all_gates_pass() {
+    for inverted in [false, true] {
+        // 19 carrier observations: below the old floor of 20, above the new
+        // floor of 16. Clean evidence at every other gate must now lock.
+        let nineteen_carrier: Vec<usize> = (0..32)
+            .step_by(2)
+            .take(13)
+            .chain(SPARSE_GAP_ERASE)
+            .chain(SPARSE_PREAMBLE_ERASE)
+            .collect();
+        let window = sparse_training_window(inverted, &nineteen_carrier, &[]);
+        assert!(
+            train_lock_erased(&window).is_some(),
+            "19/32 carrier with clean gap and preamble must lock"
+        );
+        // 23 preamble observations: below the old floor of 24.
+        let erase: Vec<usize> = SPARSE_CARRIER_ERASE
+            .into_iter()
+            .chain(SPARSE_GAP_ERASE)
+            .chain((40..72).step_by(2).take(9))
+            .collect();
+        assert!(train_lock_erased(&sparse_training_window(inverted, &erase, &[])).is_some());
+        // Five gap observations: below the old floor of six, anchors kept.
+        let erase: Vec<usize> = SPARSE_CARRIER_ERASE
+            .into_iter()
+            .chain([34, 35, 36])
+            .chain(SPARSE_PREAMBLE_ERASE)
+            .collect();
+        assert!(train_lock_erased(&sparse_training_window(inverted, &erase, &[])).is_some());
+        // The same 19-carrier window with three carrier errors: the scaled
+        // budget min(4, 19/8) = 2 still rejects.
+        let window = sparse_training_window(inverted, &nineteen_carrier, &[1, 3, 5]);
+        assert!(
+            train_lock_erased(&window).is_none(),
+            "three carrier errors exceed the budget for 19 observations"
+        );
+        // Fifteen carrier observations fall below the new floor entirely.
+        let erase: Vec<usize> = (0..32)
+            .step_by(2)
+            .chain([1])
+            .chain(SPARSE_GAP_ERASE)
+            .chain(SPARSE_PREAMBLE_ERASE)
+            .collect();
+        assert!(train_lock_erased(&sparse_training_window(inverted, &erase, &[])).is_none());
+    }
+}
+
 #[test]
 fn physical_sender_rejects_frames_beyond_receiver_bound() {
     let mut phy = Phy::new(

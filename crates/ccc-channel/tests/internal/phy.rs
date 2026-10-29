@@ -132,6 +132,68 @@ fn decode_frame_bits(bits: &[bool], chunk_size: usize) -> Result<Option<Vec<u8>>
     decode_frame_slots(&slots, chunk_size)
 }
 
+// Window with explicit erasures at absolute positions and optionally flipped
+// (wrong-symbol) samples, for probing the internal training statistics.
+fn stats_window(inverted: bool, erase: &[usize], corrupt: &[usize]) -> Vec<Option<Duration>> {
+    let bits = std::iter::repeat_n(true, 32)
+        .chain(std::iter::repeat_n(false, 8))
+        .chain(bits_msb(0xaaaa_aaaa, 32));
+    let mut window: Vec<_> = bits
+        .map(|active| {
+            Some(Duration::from_micros(if active ^ inverted {
+                20
+            } else {
+                10
+            }))
+        })
+        .collect();
+    for &i in corrupt {
+        window[i] = window[i].map(|sample| {
+            if sample == Duration::from_micros(20) {
+                Duration::from_micros(10)
+            } else {
+                Duration::from_micros(20)
+            }
+        });
+    }
+    for &i in erase {
+        window[i] = None;
+    }
+    window
+}
+
+#[test]
+fn error_budget_scales_with_observations_at_the_lowered_bounds() {
+    // Sixteen carrier observations: the count gate passes at the new floor
+    // and the error budget is min(4, 16/8) = 2. Two carrier errors lock;
+    // three reject while the statistics gate still accepts, proving the
+    // scaled error cap, not the count floor, does the rejecting.
+    let sparse: Vec<usize> = (0..32)
+        .step_by(2)
+        .chain([34, 35, 36, 37])
+        .chain(40..56)
+        .collect();
+    for inverted in [false, true] {
+        let two_errors = stats_window(inverted, &sparse, &[1, 3]);
+        let stats = training_stats_erased(&two_errors).expect("statistics accept two errors");
+        assert_eq!(stats.3, 2);
+        assert!(train_lock_erased(&two_errors).is_some());
+        let three_errors = stats_window(inverted, &sparse, &[1, 3, 5]);
+        let stats = training_stats_erased(&three_errors).expect("statistics accept three errors");
+        assert_eq!(stats.3, 3);
+        assert!(
+            train_lock_erased(&three_errors).is_none(),
+            "min(4, 16/8) = 2 budget rejects three carrier errors"
+        );
+    }
+    // A fully observed window keeps the historical budget of four.
+    let four_errors = stats_window(false, &[], &[0, 2, 4, 6]);
+    assert_eq!(training_stats_erased(&four_errors).unwrap().3, 4);
+    assert!(train_lock_erased(&four_errors).is_some());
+    let five_errors = stats_window(false, &[], &[0, 2, 4, 6, 8]);
+    assert!(train_lock_erased(&five_errors).is_none());
+}
+
 #[test]
 fn fec_corrects_every_single_bit_and_rejects_every_double_bit() {
     let decoder = Decoder {
