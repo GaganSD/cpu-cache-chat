@@ -67,6 +67,11 @@ fn failed_physical_send_waits_for_receiver_to_drain_before_retry() {
     )));
     let wire = link.into_wire();
     assert!(wire.waits[1] > cfg.physical_frame_duration(222) + cfg.response_budget(19));
+    // On top of the receiver-drain time sits a bounded randomized backoff of
+    // 0.5-2s; the recorded wait must stay inside that window.
+    let drain = cfg.failed_send_recovery_budget(222, 19);
+    assert!(wire.waits[1] >= drain + Duration::from_millis(400));
+    assert!(wire.waits[1] <= drain + Duration::from_millis(2000));
 }
 
 fn config(role: Role, millis: u64) -> RuntimeConfig {
@@ -114,6 +119,8 @@ fn initiator_waits_for_complete_sync_ack_and_budgets_actual_data_size() {
         assert!(wire.sends[1].2 > cfg.physical_frame_duration(222));
         // The drive wait is clamped by an ACK budget long enough for the whole response.
         assert!(wire.waits[1] > cfg.physical_frame_duration(19));
+        // A clean send pays no post-failure backoff.
+        assert!(wire.waits[1] <= cfg.response_budget(19));
     }
 }
 

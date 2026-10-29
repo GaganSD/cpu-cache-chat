@@ -146,10 +146,7 @@ impl<W: Wire> Link<W> {
                 return Err(last);
             }
         } else {
-            let frame =
-                self.recv_typed(FrameType::Sync, self.cfg.sync_listen_budget(FRAME_OVERHEAD))?;
-            self.accept_session(frame.session);
-            self.send_handshake(FrameType::SyncAck)?;
+            self.responder_handshake()?;
         }
         self.peer_seen = true;
         self.have_token = self.cfg.role.is_initiator();
@@ -167,6 +164,36 @@ impl<W: Wire> Link<W> {
             self.session
         )));
         Ok(events)
+    }
+
+    /// Responder side of the startup handshake. A transient SyncAck send
+    /// failure no longer kills startup: the initiator retransmits Sync on its
+    /// own schedule, so the responder stays in a bounded recovery loop where
+    /// every duplicate Sync gets the identical SyncAck response. The whole
+    /// exchange stays inside one overall listen deadline; interruption and
+    /// terminal I/O errors still propagate immediately.
+    fn responder_handshake(&mut self) -> Result<(), Error> {
+        let budget = self.cfg.sync_listen_budget(FRAME_OVERHEAD);
+        let began = Instant::now();
+        let mut last = Error::Timeout;
+        loop {
+            let remain = budget.saturating_sub(began.elapsed());
+            if remain.is_zero() {
+                return Err(last);
+            }
+            match self.recv_typed(FrameType::Sync, remain) {
+                Ok(frame) => {
+                    self.accept_session(frame.session);
+                    match self.send_handshake(FrameType::SyncAck) {
+                        Ok(()) => return Ok(()),
+                        Err(error) if recoverable_send_error(&error) => last = error,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(Error::Interrupted) => return Err(Error::Interrupted),
+                Err(error) => last = error,
+            }
+        }
     }
 
     pub fn drive(&mut self, wait: Duration) -> Result<Vec<LinkEvent>, Error> {
@@ -233,7 +260,7 @@ impl<W: Wire> Link<W> {
                         "send seq {seq} attempt 1 failed: {e}; waiting for ack before retry"
                     )));
                 }
-            } else if self.token_since.elapsed() >= Duration::from_millis(80) {
+            } else if self.token_since.elapsed() >= self.cfg.idle_dwell() {
                 // A send error is ambiguous: the peer may have received the
                 // token. Relinquish it before attempting the handoff and do
                 // not reclaim it if confirmation is lost.
@@ -250,6 +277,7 @@ impl<W: Wire> Link<W> {
                 let confirm_wait = if result.is_err() {
                     self.cfg
                         .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD)
+                        .saturating_add(self.post_failure_backoff())
                 } else {
                     self.cfg.response_budget(FRAME_OVERHEAD)
                 };
@@ -294,6 +322,7 @@ impl<W: Wire> Link<W> {
             let wait = if result.is_err() {
                 self.cfg
                     .failed_send_recovery_budget(FRAME_OVERHEAD, FRAME_OVERHEAD)
+                    .saturating_add(self.post_failure_backoff())
             } else {
                 self.cfg.response_budget(FRAME_OVERHEAD)
             };
@@ -630,13 +659,27 @@ impl<W: Wire> Link<W> {
 
     fn acknowledgement_wait(&self, frame: &Frame, send_failed: bool) -> Duration {
         if send_failed {
-            self.cfg.failed_send_recovery_budget(
-                FRAME_OVERHEAD.saturating_add(frame.payload.len()),
-                FRAME_OVERHEAD,
-            )
+            self.cfg
+                .failed_send_recovery_budget(
+                    FRAME_OVERHEAD.saturating_add(frame.payload.len()),
+                    FRAME_OVERHEAD,
+                )
+                .saturating_add(self.post_failure_backoff())
         } else {
             self.cfg.response_budget(FRAME_OVERHEAD)
         }
+    }
+
+    /// Bounded extra delay after an ambiguous physical send failure, added on
+    /// top of the receiver-drain budget so the retry does not land inside the
+    /// same noise window. Simulation and the clean path pay nothing.
+    fn post_failure_backoff(&self) -> Duration {
+        if !self.cfg.channel.is_physical() {
+            return Duration::ZERO;
+        }
+        let mut bytes = [0u8; 2];
+        fill_random(&mut bytes);
+        Duration::from_millis(500 + u64::from(u16::from_le_bytes(bytes)) % 1501)
     }
 
     fn send_control(&mut self, ftype: FrameType, ack_seq: u16) -> Result<(), Error> {
@@ -690,6 +733,17 @@ impl<W: Wire> Link<W> {
     pub fn into_wire(self) -> W {
         self.wire
     }
+}
+
+/// A physical noise window can abort a control send midway through the frame;
+/// the peer never learns whether any of it landed and retransmits, so startup
+/// listens again instead of dying. Interruption, disconnects, and programming
+/// errors stay terminal.
+fn recoverable_send_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Corrupt(_) | Error::Timeout | Error::Channel(_)
+    )
 }
 
 /// New session id. Not a secret; only used to drop stale frames.

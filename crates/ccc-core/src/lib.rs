@@ -313,14 +313,29 @@ impl RuntimeConfig {
         Ok(())
     }
 
-    /// How long a receive poll should last. Physical hunts need many slots.
+    /// How long a receive poll should last. Physical polls are bounded
+    /// service intervals of about 100-200ms; a streaming wire retains
+    /// partial acquisition and frame state across them, so a short poll
+    /// never drops a partially received frame.
     pub fn recv_poll(&self) -> Duration {
         if self.channel.is_physical() {
             self.slot
-                .saturating_mul(128)
-                .max(Duration::from_millis(400))
+                .saturating_mul(4)
+                .clamp(Duration::from_millis(100), Duration::from_millis(200))
         } else {
             Duration::from_millis(20)
+        }
+    }
+
+    /// How long the token may idle before it is offered to the peer. A
+    /// conservative physical dwell avoids paying a full two-frame control
+    /// exchange per rotation when local work is about to be queued; the
+    /// epoch handoff protocol itself is unchanged.
+    pub fn idle_dwell(&self) -> Duration {
+        if self.channel.is_physical() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(80)
         }
     }
 
@@ -334,23 +349,29 @@ impl RuntimeConfig {
             .saturating_mul(PHYSICAL_FRAME_OVERHEAD_SLOTS.saturating_add(data_slots))
     }
 
-    /// Budget a single send from its actual encoded length. The margin covers
-    /// scheduling and turn-around, not additional frame retries.
+    /// Turn-around and scheduling margin for one frame exchange. The margin
+    /// scales with the observed airtime instead of a blanket constant.
+    fn turnaround_margin(&self, airtime: Duration) -> Duration {
+        (airtime / 4).saturating_add(self.slot.saturating_mul(8))
+    }
+
+    /// Budget a single send from its actual encoded length: airtime plus the
+    /// turn-around margin. The margin covers scheduling and turn-around, not
+    /// additional frame retries, and there is no size-independent floor, so a
+    /// small control frame never pays for maximum-payload headroom.
     pub fn send_budget(&self, encoded_bytes: usize) -> Duration {
         if !self.channel.is_physical() {
             return self.ack_timeout;
         }
-        let duration = self.physical_frame_duration(encoded_bytes);
-        let margin = (duration / 4).saturating_add(self.slot.saturating_mul(8));
-        self.ack_timeout.max(
-            duration
-                .saturating_add(margin)
-                .saturating_add(Duration::from_secs(1)),
-        )
+        let airtime = self.physical_frame_duration(encoded_bytes);
+        airtime
+            .saturating_add(self.turnaround_margin(airtime))
+            .saturating_add(Duration::from_secs(1))
     }
 
     /// Give the peer time to transmit a complete control response after the
-    /// preceding send has finished. Simulation keeps its configured timeout.
+    /// preceding send has finished: the response's own send budget plus one
+    /// more turn-around. Simulation keeps its configured timeout.
     pub fn response_budget(&self, control_bytes: usize) -> Duration {
         if !self.channel.is_physical() {
             return self.ack_timeout;
@@ -360,8 +381,11 @@ impl RuntimeConfig {
             .saturating_add(Duration::from_secs(1))
     }
 
-    /// An interrupted physical frame may have been acquired by the receiver,
-    /// which must finish or abandon it before another transmission begins.
+    /// Drain time after an ambiguous send failure. An interrupted physical
+    /// frame may have been acquired by the receiver, which needs up to one
+    /// bounded maximum frame lifetime — the failed frame's own complete send
+    /// budget — to finish or abandon it, plus the budget for a control
+    /// response that may still arrive, before another transmission begins.
     pub fn failed_send_recovery_budget(
         &self,
         encoded_bytes: usize,
