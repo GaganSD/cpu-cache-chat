@@ -462,11 +462,18 @@ impl<W: Wire> Link<W> {
                 match AppMessage::decode(&frame.payload) {
                     Ok(msg) => {
                         if let Err(e) = accept(frame.seq, &msg) {
-                            self.send_control(FrameType::Nack, frame.seq)?;
-                            return Ok(Some(vec![LinkEvent::Error(format!(
+                            let result = self.send_control(FrameType::Nack, frame.seq);
+                            if matches!(result, Err(Error::Interrupted)) {
+                                return Err(Error::Interrupted);
+                            }
+                            let mut events = vec![LinkEvent::Error(format!(
                                 "application rejected seq {}: {e}",
                                 frame.seq
-                            ))]));
+                            ))];
+                            if let Err(send_e) = result {
+                                events.push(LinkEvent::Error(format!("nack failed: {send_e}")));
+                            }
+                            return Ok(Some(events));
                         }
                         self.handoff = None;
                         self.tokenless_since = Some(Instant::now());
@@ -489,8 +496,15 @@ impl<W: Wire> Link<W> {
                         Ok(Some(events))
                     }
                     Err(e) => {
-                        self.send_control(FrameType::Nack, frame.seq)?;
-                        Ok(Some(vec![LinkEvent::Error(format!("bad payload: {e}"))]))
+                        let result = self.send_control(FrameType::Nack, frame.seq);
+                        if matches!(result, Err(Error::Interrupted)) {
+                            return Err(Error::Interrupted);
+                        }
+                        let mut events = vec![LinkEvent::Error(format!("bad payload: {e}"))];
+                        if let Err(send_e) = result {
+                            events.push(LinkEvent::Error(format!("nack failed: {send_e}")));
+                        }
+                        Ok(Some(events))
                     }
                 }
             }

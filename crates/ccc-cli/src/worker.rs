@@ -437,7 +437,24 @@ pub fn start(
                     }
                 }
             }
-            match session.tick(cfg.recv_poll()) {
+            let tick = session.tick(cfg.recv_poll());
+            // A tick can apply peer moves and still return an error afterwards
+            // (for example an interrupted ack send). Drain accepted moves
+            // before acting on the result so an interrupted shutdown never
+            // attests complete evidence while silently dropping applied moves.
+            for mv in session.take_accepted_moves() {
+                if let Err(e) = emit(
+                    serde_json::json!({"type":"move","ply":mv.ply,"square":mv.square,"mark":mv.mark.glyph().to_string(),"sequence":mv.sequence,"acceptance":if mv.local_ack {"local_ack"} else {"peer_accepted"}}),
+                ) {
+                    let _ = output.send(Update::Fatal(e));
+                    successful = false;
+                    break;
+                }
+            }
+            if !successful {
+                break;
+            }
+            match tick {
                 Ok(notes) => {
                     for note in notes {
                         let _ = output.send(Update::Note(note));
@@ -458,18 +475,6 @@ pub fn start(
                     successful = false;
                     break;
                 }
-            }
-            for mv in session.take_accepted_moves() {
-                if let Err(e) = emit(
-                    serde_json::json!({"type":"move","ply":mv.ply,"square":mv.square,"mark":mv.mark.glyph().to_string(),"sequence":mv.sequence,"acceptance":if mv.local_ack {"local_ack"} else {"peer_accepted"}}),
-                ) {
-                    let _ = output.send(Update::Fatal(e));
-                    successful = false;
-                    break;
-                }
-            }
-            if !successful {
-                break;
             }
             let snapshot = session.snapshot();
             if !final_emitted {
