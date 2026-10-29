@@ -78,6 +78,7 @@ cleanup() {
       printf 'repo_dirty=%s\n' "$repo_dirty"
       printf 'ccc_debug=%s\nccc_agent_debug=%s\n' "${CCC_DEBUG:-0}" "${CCC_AGENT_DEBUG:-0}"
       printf 'host_uname=%s\n' "$(uname -srm)"
+      printf 'load_avg=%s\n' "$(if [[ -r /proc/loadavg ]]; then cut -d' ' -f1-3 < /proc/loadavg; else sysctl -n vm.loadavg 2>/dev/null || echo unknown; fi | tr '\n' ' ')"
       printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$workdir/run.txt"
     echo "Evidence retained: $workdir"
