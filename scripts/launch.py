@@ -263,13 +263,16 @@ def read_container_logs(ident, limit=LOG_STREAM_LIMIT, timeout=LOG_CAPTURE_TIMEO
 
 
 def read_remote_file(ident, remote):
-    """docker cp one in-container file; None when absent (no invented record)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        target = Path(tmp) / 'artifact'
-        if docker('cp', f'{ident}:{remote}', str(target), check=False) is None or not target.is_file():
-            return None
-        # Bounded by the container's 64 MiB tmpfs.
-        return target.read_bytes()
+    """Read one in-container file from a RUNNING container; None when absent.
+
+    Uses docker exec cat: docker cp cannot see tmpfs content on VM-based
+    Docker (OrbStack), and a stopped container's tmpfs is gone either way.
+    Bounded by the container's 64 MiB tmpfs; callers apply their own quotas.
+    """
+    rc, content = docker_capture('exec', ident, 'cat', remote, timeout=30)
+    if rc != 0 or not content:
+        return None
+    return content.encode()
 
 
 def docker_capture(*args, timeout=OBSERVER_TIMEOUT):

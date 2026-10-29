@@ -167,12 +167,13 @@ if [[ "$finished" != yes ]]; then
   echo 'FAIL: physical agent game did not finish (deadline or peer exit)' >&2
   exit 1
 fi
-# Transcripts live on tmpfs /tmp, destroyed at process exit: copy them
-# while the peers are still running, before sending /q.
+# Transcripts live on tmpfs /tmp, destroyed at process exit: read them
+# while the peers are still running, before sending /q. docker cp cannot
+# see tmpfs content on VM-based Docker (OrbStack); exec+read works.
 transcripts=complete
 for side in a b; do
   name="ccc-agent-$$-$side"
-  docker cp "$name:/tmp/agent-transcript.log" "$workdir/$side.transcript.log" 2>/dev/null || {
+  docker exec "$name" cat /tmp/agent-transcript.log > "$workdir/$side.transcript.log" 2>/dev/null || {
     echo "WARNING: $side transcript missing; hosted evidence incomplete" >&2
     transcripts=incomplete
   }

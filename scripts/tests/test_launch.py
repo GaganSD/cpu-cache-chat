@@ -298,10 +298,14 @@ class LauncherTests(unittest.TestCase):
                 'cid-b': (mirror(EVENTS_B), b'', False)}
         verdict = (0, '{"ok": true, "session": 7, "outcome": "draw", "agents_verified": true}')
         events_by_ident = {'cid-a': EVENTS_A, 'cid-b': EVENTS_B}
+        transcripts_by_ident = {'cid-a': None, 'cid-b': b'raw model transcript\n'}
         def fake_capture(*args, **kwargs):
             self.calls.append(args)
-            if args[:1] == ('exec',):
+            if args[:1] == ('exec',) and any('game.events.jsonl' in x for x in args):
                 return 0, events_by_ident[args[1]].decode()
+            if args[:1] == ('exec',) and any('agent-transcript.log' in x for x in args):
+                data = transcripts_by_ident[args[1]]
+                return (1, '') if data is None else (0, data.decode())
             return verdict
         with patch.dict(os.environ, {'OPENCODE_GO_API_KEY': 'live-secret-value'}), \
              patch.object(launch, 'docker', self.peer_docker()), \
@@ -340,12 +344,13 @@ class LauncherTests(unittest.TestCase):
         # Missing artifacts are recorded, never invented.
         self.assertFalse((launch.STATE / run / 'transcripts' / 'ccc-cid-a.log').exists())
         self.assertTrue((launch.STATE / run / 'transcripts' / 'ccc-cid-b.log').exists())
-        # Ordering: transcript copy while peers live, SIGINT, live events
+        # Ordering: transcript read while peers live, SIGINT, live events
         # capture during the grace window, bounded wait, container removal,
-        # then network removal. A stopped peer's tmpfs is gone, so the events
-        # file must be read before exit, never by post-exit cp.
+        # then network removal. A stopped peer's tmpfs is gone and docker cp
+        # cannot see tmpfs content on VM-based Docker, so in-container files
+        # must be read via exec, never cp.
         index = lambda pred: [i for i, c in enumerate(self.calls) if pred(c)]
-        tx_cp = index(lambda c: c[0] == 'cp' and 'agent-transcript.log' in c[1])
+        tx_cp = index(lambda c: c[:1] == ('exec',) and any('agent-transcript.log' in x for x in c))
         ev_exec = index(lambda c: c[:1] == ('exec',) and any('game.events.jsonl' in x for x in c))
         kills = index(lambda c: c[:2] == ('kill', '--signal'))
         waits = index(lambda c: c[0] == 'wait')
@@ -357,7 +362,7 @@ class LauncherTests(unittest.TestCase):
         self.assertLess(max(ev_exec), min(waits))
         self.assertLess(max(waits), min(rms))
         self.assertLess(max(rms), min(netrms))
-        self.assertFalse(index(lambda c: c[0] == 'cp' and 'game.events.jsonl' in c[1]))
+        self.assertFalse(index(lambda c: c[0] == 'cp'))
         self.assertTrue(all(c[2] == 'SIGINT' for c in self.calls if c[:2] == ('kill', '--signal')))
 
     def test_missing_final_or_stopped_marks_incomplete(self):
@@ -448,15 +453,14 @@ class LauncherTests(unittest.TestCase):
                 return '0'
             if args[0] == 'inspect':
                 return 'ccc-' + args[-1]
-            if args[0] == 'cp':
-                if 'agent-transcript.log' in args[1]:
-                    Path(args[-1]).write_bytes(b'x' * launch.TRANSCRIPT_QUOTA)
-                    return ''
-                return None
             return 'ok'
+        def fake_capture(*args, **kwargs):
+            if args[:1] == ('exec',) and any('agent-transcript.log' in x for x in args):
+                return 0, ('x' * launch.TRANSCRIPT_QUOTA)
+            return 1, ''
         with patch.object(launch, 'docker', fake), \
              patch.object(launch, 'read_container_logs', return_value=(b'', b'', False)), \
-             patch.object(launch, 'docker_capture', return_value=(1, '')), \
+             patch.object(launch, 'docker_capture', fake_capture), \
              patch.object(launch, 'TRANSCRIPT_QUOTA', 8):
             launch.stop(run)
         data = json.loads((launch.STATE / (run + '.json')).read_text())
