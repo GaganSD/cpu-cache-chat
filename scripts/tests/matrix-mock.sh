@@ -87,7 +87,7 @@ export PATH="$tmp/bin:$PATH" MOCK_STATE="$tmp/state" MOCK_LOG="$tmp/log"
 
 # Two passing attempts: controls run exactly once, both attempts reference the
 # bundle, and the summary records first-attempt fields.
-MOCK_CHAT_SUCCESS=1 CCC_LOAD_NOTE=matrix-note EVIDENCE_DIR="$tmp/evidence" \
+MOCK_CHAT_SUCCESS=1 CCC_LOAD_NOTE=matrix-note EVIDENCE_DIR="$tmp/evidence" SETTLE_SECONDS=0 \
   "$ROOT/scripts/run-physical-matrix.sh" chat 2 >"$tmp/matrix-output" 2>&1
 base=$(find "$tmp/evidence" -mindepth 1 -maxdepth 1 -type d -name 'cpu-chat-*' -print)
 [[ -f "$base/controls/manifest.txt" ]]

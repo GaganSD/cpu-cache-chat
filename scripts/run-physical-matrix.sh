@@ -62,6 +62,10 @@ for ((i = 1; i <= COUNT; i++)); do
       ;;
   esac
   elapsed=$(( $(date +%s) - start ))
+  # Let the VM and scheduler settle after force-removing the previous
+  # attempt's CPU-burning containers; back-to-back starts correlated with
+  # handshake starvation in the 25ms game campaign.
+  if (( i < COUNT )); then sleep "${SETTLE_SECONDS:-15}"; fi
   rundir=$(find "$attempt" -mindepth 1 -maxdepth 1 -type d -name 'ccc-*' | head -n 1)
   retries=0
   if [[ -n "$rundir" ]]; then
