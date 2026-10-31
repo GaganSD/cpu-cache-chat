@@ -1,0 +1,14 @@
+schema_version=1
+created_utc=2026-10-29T03:36:54Z
+image=cpu-cache-chat:local
+image_id=sha256:d3c57e150d4307565d05173b99798c5945b8a2454dfddf4459200e265c3b6014
+channel=cpu
+slot_ms=25
+cpuset=0
+silent_seconds=31
+load_note=unspecified
+load_avg={ 3.94 4.54 4.15 } 
+host_uname=Darwin 27.0.0 arm64
+config_sha256=3e52c07a49ec5ca72884f3568c62466e7d358fcaecd8236ed5e8ba6aed11166c
+result=pass
+note=single qualification run; not a reliability guarantee

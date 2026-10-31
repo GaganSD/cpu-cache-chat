@@ -1,0 +1,8 @@
+{"role":"A","session":1125324835,"type":"session","version":1}
+{"acceptance":"local_ack","mark":"X","ply":0,"sequence":2,"square":5,"type":"move"}
+{"acceptance":"peer_accepted","mark":"O","ply":1,"sequence":1,"square":2,"type":"move"}
+{"acceptance":"local_ack","mark":"X","ply":2,"sequence":3,"square":1,"type":"move"}
+{"acceptance":"peer_accepted","mark":"O","ply":3,"sequence":2,"square":8,"type":"move"}
+{"acceptance":"local_ack","mark":"X","ply":4,"sequence":4,"square":9,"type":"move"}
+{"board":"XO34X67OX","outcome":"x_win","ply":5,"type":"final"}
+{"evidence_complete":true,"successful":true,"type":"stopped"}

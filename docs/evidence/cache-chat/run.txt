@@ -1,0 +1,7 @@
+exit_status=0
+channel=cache
+mode=chat
+slot_ms=50
+cpuset=0
+wait_seconds=600
+image=cpu-cache-chat:local

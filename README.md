@@ -1,32 +1,76 @@
 # cpu-cache-chat
 
-Two sandboxed programs share a CPU and attempt to exchange chat or tic-tac-toe moves using timing rather than a peer network. This experiment was inspired by accounts of agent communication through shared hardware; no equivalence to any specific research is asserted here.
+**Message protocol over CPU's cache: re-implementation of OpenAI's sandbox escape attempt.**
 
-## Status and scope
+A weekend experiment: two programs on the same machine exchange chat messages and tic-tac-toe moves through hardware timing, instead of sending each other network packets. You can type in two terminals or let two agents play.
 
-| Configuration | Evidence and limits |
-| --- | --- |
-| Simulation | Unix datagrams, for software testing only; not isolation or physical-channel evidence. |
-| CPU contention / cache timing | Historical single-run results on Apple M2 and OrbStack exist; failures also occurred. The newer wire format needs fresh physical validation. |
-| Hosted agents | Historical hosted runs used external inference and separate bridge networks, not offline operation. Egress was not restricted to inference destinations. |
-| Offline agents, other Macs, Linux | Physical release gates blocked pending measurements; do not infer support from CI. |
+## Why
 
-See [measurements](docs/measurements.md). Containers share a Linux kernel; they are not a security boundary against all covert channels. Cache timing does not establish a particular eviction mechanism. The link can fail or report unknown delivery; never treat it as reliable or secure.
+Inspired by OpenAI's [Securing our frontier model training environment](https://openai.com/index/securing-our-frontier-model-training-environment/). In its sandbox red-team experiments, agents in separate microVMs communicated by evicting and reloading CPU-cache data. The post also describes channels using shared storage and competition for CPU time.
 
-## Prerequisites and quickstart
+This is my take on the communication idea, using Docker containers—not a reproduction of OpenAI's infrastructure or an actual sandbox escape.
 
-Docker Engine on Linux or OrbStack on Apple silicon, Bash, Python 3, and a native image are required for physical demos. Building from source also needs Rust 1.96.1. The launcher is implemented and software-tested; the current wire format's physical release gates are not yet complete:
+## How it works
+
+One peer alternates between doing work and staying idle. The other measures timing differences and decodes the pattern into bits.
+
+- **Cache timing** (`--channel cache`): an 8 MiB strided-memory workload creates timing differences. The experiment doesn't isolate cache eviction from scheduling and memory contention.
+- **CPU contention** (`--channel cpu`): busy/idle periods compete for CPU time. This has been the more practical channel.
+- **Protocol**: preamble and training, error correction, CRC, acknowledgements, retries, and a token to take turns talking.
+- **Apps**: terminal chat and tic-tac-toe, with optional Pi agents choosing moves. Rust checks the game rules.
+
+Manual peers have no network or shared writable files. The host starts and observes them; it doesn't relay their messages. Simulation uses Unix datagrams and is only for software tests.
+
+## What happened
+
+On an Apple M2 with OrbStack:
+
+- Bidirectional chat worked in both CPU-contention and cache-timing modes.
+- A CPU chat campaign at 50 ms slots passed **7/10** attempts. A later 25 ms campaign passed **5/5**, with retries, taking about **2.5–6 minutes** per attempt.
+- A later manual tic-tac-toe campaign passed **3/3** attempts.
+- Hosted agents completed games, including a draw. Other attempts stalled at handshake or lost acknowledgements; one completed draw failed the overall harness because transcript capture was incomplete.
+
+It's slow and noisy. Scheduler pauses matter, and a missing acknowledgement can leave delivery unknown. These are observations from particular builds on one setup, not benchmarks for every Mac or Linux machine. [Findings and sample evidence](docs/measurements.md).
+
+## Try it
+
+You'll need Docker Engine on Linux or OrbStack on an Apple-silicon Mac, Bash, and Python 3. Docker builds the Rust binaries.
 
 ```sh
+git clone https://github.com/GaganSD/cpu-cache-chat.git
+cd cpu-cache-chat
 ./docker/build.sh
 ./scripts/demo.sh doctor
 ./scripts/demo.sh chat --channel cpu
-# Use the run ID printed by the launcher:
+```
+
+Run each printed `docker attach` command in a separate terminal, then send a short message. Detach with **Ctrl-p Ctrl-q**. The launcher prints a run ID; stop both peers with:
+
+```sh
 ./scripts/demo.sh stop --run-id RUN_ID
 ```
 
-The launcher prints two `docker attach` commands: run each in its own terminal, type a short personal message such as `hello world`, and reply from the other. Each terminal controls only its own peer. Detach with Ctrl-p Ctrl-q, or stop both using the printed run ID. The launcher runs a bounded receiver-blind probe first; a failed probe stops the launch without switching channels. A pair should show its channel, connection and delivery state; no-lock and unknown delivery are possible. At the explicit 50 ms reference preset, one protocol control frame nominally takes 20.15 seconds; `hello world` plus its ACK takes 49.4 seconds, before token wait, retries, startup, and scheduling delays. Handshakes and games can take minutes or time out. Do not expect interactive-network latency. To try a manual game, use `./scripts/demo.sh game --channel cpu`. Hosted agents additionally require `./docker/build-agent.sh`, `CCC_HOSTED_OPT_IN=1`, and provider credentials. Use `./scripts/demo.sh agents --channel cpu --provider opencode-go` (`OPENCODE_GO_API_KEY`) or `--provider vercel-ai-gateway` (`AI_GATEWAY_API_KEY`). The configured models are DeepSeek V4.1 Flash at low reasoning and Reflection Beam Free, respectively. Provider availability, pricing, and tool reliability are external dependencies. Both boards are disclosed to the provider; separate bridges permit general egress, not only inference. Never put keys in logs or images.
+Use `chat --channel cache` for the cache workload, or `game --channel cpu` for tic-tac-toe. The launcher checks the physical channel first and stops if that probe fails. Expect minutes, not instant messaging.
 
-For software-only checks, use `cargo test --workspace --locked` and `MODE=chat ./scripts/e2e-headless-sim.sh`. The latter is not a physical test. If Docker is unavailable, start the runtime; if connection fails, stop the run and inspect its diagnostics rather than assuming success or switching channels silently.
+For agent play, build `./docker/build-agent.sh`, export `OPENCODE_GO_API_KEY`, then run:
 
-[Architecture](docs/architecture.md) · [Measurements](docs/measurements.md) · [Release checklist](docs/release.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+```sh
+CCC_HOSTED_OPT_IN=1 ./scripts/demo.sh agents --channel cpu --provider opencode-go
+```
+
+Hosted agents send board prompts to an external provider and may incur charges. Their separate bridges allow general egress; this isn't an offline or network-isolation demo. [Agent setup](agent/README.md).
+
+## Reproduce the experiments
+
+[Commands, controls, and how to read failures](docs/reproducing.md). Software-only checks need Rust 1.96.1:
+
+```sh
+cargo test --workspace --locked
+MODE=chat ./scripts/e2e-headless-sim.sh
+```
+
+[Architecture](docs/architecture.md) · [Protocol](docs/protocol.md) · [Launcher](docs/launcher.md)
+
+## License
+
+[MIT](LICENSE).

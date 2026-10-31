@@ -18,4 +18,4 @@ Post-run [JSONL evidence verification](events.md) replays both complete legal hi
 
 The physical layer uses a 32-bit `0xAAAAAAAA` preamble, training/carrier and gaps, then a length, payload and CRC encoded with 13-bit SECDED codewords and interleaving. The slot budget is 156 + 13 per payload byte; see `ccc-core` and `ccc-channel/src/phy.rs` for the exact implementation. Historical physical formats changed while still using version 1; the current version-2 peers cannot interoperate with those binaries. Peers must use the same build. New physical results are required after wire changes.
 
-The selected cache or CPU mode is explicit; a failed physical link must not silently become simulation. Missing acknowledgements can make delivery unknown. Consult [measurements](measurements.md) for the distinction between historical evidence and current release gates.
+The selected cache or CPU mode is explicit; a failed physical link must not silently become simulation. Missing acknowledgements can make delivery unknown. See [findings](measurements.md) for observed successes, failures, and the limits of those experiments.

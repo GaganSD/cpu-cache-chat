@@ -1,0 +1,11 @@
+{
+  "mode": "Cache",
+  "role": "B",
+  "trials": 1,
+  "bits": 32,
+  "bit_errors": 0,
+  "timeouts": 0,
+  "silent_false_ones": 0,
+  "usable": false,
+  "notes": "unproven: one receive attempt (requested 64); two-process operation and reliability are not established; silent-sender control not measured; received bytes (hex): 5a7fa4c9; BER unavailable: expected bytes were not supplied; bit_errors field is not a measurement"
+}

@@ -1,0 +1,300 @@
+{
+  "description": "Historical samples, curated without rerunning the experiments. Original files retained privately.",
+  "original_source_head_before_history_cleanup": "f6ca2565d6c6aa33adb9401be8d438610195429b",
+  "files": [
+    {
+      "file": "cache-chat/run.txt",
+      "source_path": "measurements/2026-10-28-physical/cache-chat-bidirectional/run.txt",
+      "original_sha256": "997d42dd8f38a9268921f9e24eb1f74eb20ae24d5eca15b0e7b1d23a1bddf7a6",
+      "published_sha256": "997d42dd8f38a9268921f9e24eb1f74eb20ae24d5eca15b0e7b1d23a1bddf7a6",
+      "transformations": []
+    },
+    {
+      "file": "cache-chat/harness.txt",
+      "source_path": "measurements/2026-10-28-physical/cache-chat-bidirectional/harness.log",
+      "original_sha256": "42302d43f2a5883c5833fa226a81b6530e870909ddcc1395ca037d9c2a481854",
+      "published_sha256": "42302d43f2a5883c5833fa226a81b6530e870909ddcc1395ca037d9c2a481854",
+      "transformations": []
+    },
+    {
+      "file": "cache-chat/a.txt",
+      "source_path": "measurements/2026-10-28-physical/cache-chat-bidirectional/a.out",
+      "original_sha256": "fd0fb12aea149968428d3616c170dd1e3dfb639b2bc36307ae3ce442c6d02675",
+      "published_sha256": "fd0fb12aea149968428d3616c170dd1e3dfb639b2bc36307ae3ce442c6d02675",
+      "transformations": []
+    },
+    {
+      "file": "cache-chat/b.txt",
+      "source_path": "measurements/2026-10-28-physical/cache-chat-bidirectional/b.out",
+      "original_sha256": "aaee6cee6f42cb810a59f141df3cf95f2a6b92a38f506eb0465c2952c107018f",
+      "published_sha256": "aaee6cee6f42cb810a59f141df3cf95f2a6b92a38f506eb0465c2952c107018f",
+      "transformations": []
+    },
+    {
+      "file": "cache-chat/probe.json",
+      "source_path": "measurements/2026-10-28-physical/cache-chat-bidirectional/probe-b.out",
+      "original_sha256": "50543eb68700d89c2573ea4f877b47eae6f4b92b590a705dcfca51ff05adff96",
+      "published_sha256": "50543eb68700d89c2573ea4f877b47eae6f4b92b590a705dcfca51ff05adff96",
+      "transformations": []
+    },
+    {
+      "file": "cache-chat/silent.json",
+      "source_path": "measurements/2026-10-28-physical/cache-chat-bidirectional/silent.out",
+      "original_sha256": "42150b11d0dba92eed24c9b79fbe8dea105a86f49eb5f93889c7f11e78654f81",
+      "published_sha256": "42150b11d0dba92eed24c9b79fbe8dea105a86f49eb5f93889c7f11e78654f81",
+      "transformations": []
+    },
+    {
+      "file": "probe-no-lock/receiver.json",
+      "source_path": "measurements/2026-10-27-physical/cpu-probe-no-lock/probe-b.out",
+      "original_sha256": "bec3a51092647a2b95572e6a1daea54aba2f6d0efe12bf7f602f939513d4f635",
+      "published_sha256": "bec3a51092647a2b95572e6a1daea54aba2f6d0efe12bf7f602f939513d4f635",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-25ms/run.txt",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/ccc-dockere2e.Xg6haI/run.txt",
+      "original_sha256": "d22443c662b4327e83cf3e33e3861de151344939552d5ad79fa2c57f8d76bde7",
+      "published_sha256": "d22443c662b4327e83cf3e33e3861de151344939552d5ad79fa2c57f8d76bde7",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-25ms/a.txt",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/ccc-dockere2e.Xg6haI/a.out",
+      "original_sha256": "ddf7e5eeb00ac3d4f7e3cf5593fc4a3f76de26d10f6451ca4838c2fa296224a0",
+      "published_sha256": "ddf7e5eeb00ac3d4f7e3cf5593fc4a3f76de26d10f6451ca4838c2fa296224a0",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-25ms/b.txt",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/ccc-dockere2e.Xg6haI/b.out",
+      "original_sha256": "46e86a8f4ad4b371fd968983ed3b663a69b57f32aa0dc38f59dca69c36108c90",
+      "published_sha256": "46e86a8f4ad4b371fd968983ed3b663a69b57f32aa0dc38f59dca69c36108c90",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-25ms/controls-manifest.txt",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/ccc-dockere2e.Xg6haI/controls-manifest.txt",
+      "original_sha256": "0f4ff6785f637443e2b79cc422299847c398d96eeb2f8c314542743928585677",
+      "published_sha256": "0f4ff6785f637443e2b79cc422299847c398d96eeb2f8c314542743928585677",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-25ms/harness.txt",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/harness.log",
+      "original_sha256": "76f623fbd6d996a1551b86415b5df6ec6e5157475c6153cde0c52034073d35bd",
+      "published_sha256": "d138e5e212c60ea94becef66a3e378c1c804250ceff674cd8a65cb734e7f3f12",
+      "transformations": [
+        "Replace absolute checkout path with <checkout>."
+      ]
+    },
+    {
+      "file": "cpu-chat-25ms/summary.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/summary.jsonl",
+      "original_sha256": "6779a88387d03bf17d829681884e01c1869b89e38fdb6119a0982a82276f6507",
+      "published_sha256": "6779a88387d03bf17d829681884e01c1869b89e38fdb6119a0982a82276f6507",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-50ms/summary.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T012400Z/summary.jsonl",
+      "original_sha256": "c4e2704de3657f1bfa3c1676969353c668f0c0130549c5ad9126a1178b14d83a",
+      "published_sha256": "c4e2704de3657f1bfa3c1676969353c668f0c0130549c5ad9126a1178b14d83a",
+      "transformations": []
+    },
+    {
+      "file": "cpu-chat-50ms/failed-probe.json",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T012400Z/attempt-4/ccc-dockere2e.O3Ndnw/probe-b.out",
+      "original_sha256": "bf76dd142d9175a577f8e5d16d6d33d9b40c1c820457df240219e8b4f54fa82a",
+      "published_sha256": "bf76dd142d9175a577f8e5d16d6d33d9b40c1c820457df240219e8b4f54fa82a",
+      "transformations": []
+    },
+    {
+      "file": "manual-game/run.txt",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/ccc-dockergame.md4HeC/run.txt",
+      "original_sha256": "583a47270435dfa621833e53a383727038da53525be6ff074812852efffd83bb",
+      "published_sha256": "583a47270435dfa621833e53a383727038da53525be6ff074812852efffd83bb",
+      "transformations": []
+    },
+    {
+      "file": "manual-game/a.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/ccc-dockergame.md4HeC/a.jsonl",
+      "original_sha256": "74a0ed6096cfd1ee13e58908ab10916addd29bcee5aee575f49058736f264342",
+      "published_sha256": "74a0ed6096cfd1ee13e58908ab10916addd29bcee5aee575f49058736f264342",
+      "transformations": []
+    },
+    {
+      "file": "manual-game/b.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/ccc-dockergame.md4HeC/b.jsonl",
+      "original_sha256": "f16ecb7e32d4505d70d28fdaf3b38ad15ca1a2432f57a44c1a3ea1a3117a54bf",
+      "published_sha256": "f16ecb7e32d4505d70d28fdaf3b38ad15ca1a2432f57a44c1a3ea1a3117a54bf",
+      "transformations": []
+    },
+    {
+      "file": "manual-game/verdict.json",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/ccc-dockergame.md4HeC/verdict.json",
+      "original_sha256": "bdbf72df2829a2ee03f11ac38a7efdf4a43cc941533dd26377ec356a7d7bdc33",
+      "published_sha256": "bdbf72df2829a2ee03f11ac38a7efdf4a43cc941533dd26377ec356a7d7bdc33",
+      "transformations": []
+    },
+    {
+      "file": "manual-game/summary.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/summary.jsonl",
+      "original_sha256": "5a5a8f46c953a32efc86eaa7c1d27554ae9a338cf98aeeb0d2bc4620bc1ac475",
+      "published_sha256": "5a5a8f46c953a32efc86eaa7c1d27554ae9a338cf98aeeb0d2bc4620bc1ac475",
+      "transformations": []
+    },
+    {
+      "file": "manual-game/harness.txt",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/harness.log",
+      "original_sha256": "0dec7934197c44523e2810ff58780902706fb9e05ec332b94d6a649fde10ca4e",
+      "published_sha256": "fbe70240ec77dfda0832e16f06615b27bb4e84950c476445be25dc6eadbed73a",
+      "transformations": [
+        "Replace absolute checkout path with <checkout>."
+      ]
+    },
+    {
+      "file": "agent-draw-incomplete/run.txt",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/attempt-1/ccc-dockeragent.TWoiBj/run.txt",
+      "original_sha256": "c5bb4e43d50ab9f50731f601b1258d26ac9a676c36f13653a06609963bf871e9",
+      "published_sha256": "c5bb4e43d50ab9f50731f601b1258d26ac9a676c36f13653a06609963bf871e9",
+      "transformations": []
+    },
+    {
+      "file": "agent-draw-incomplete/a.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/attempt-1/ccc-dockeragent.TWoiBj/a.jsonl",
+      "original_sha256": "24f34dd831ef9348a6c2c80cc44f3f0552d5d4f327590c95912a78c0c5de1f9b",
+      "published_sha256": "24f34dd831ef9348a6c2c80cc44f3f0552d5d4f327590c95912a78c0c5de1f9b",
+      "transformations": []
+    },
+    {
+      "file": "agent-draw-incomplete/b.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/attempt-1/ccc-dockeragent.TWoiBj/b.jsonl",
+      "original_sha256": "ab5ad982ac1f50214a824f1c91c9054caa8a0d0d46000c354c759af9d757fd8f",
+      "published_sha256": "ab5ad982ac1f50214a824f1c91c9054caa8a0d0d46000c354c759af9d757fd8f",
+      "transformations": []
+    },
+    {
+      "file": "agent-draw-incomplete/verdict.json",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/attempt-1/ccc-dockeragent.TWoiBj/verdict.json",
+      "original_sha256": "e5eed59ff433cb00dea4948c0f2f6ea31316802aee54703b0891878fa0b32176",
+      "published_sha256": "e5eed59ff433cb00dea4948c0f2f6ea31316802aee54703b0891878fa0b32176",
+      "transformations": []
+    },
+    {
+      "file": "agent-draw-incomplete/summary.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/summary.jsonl",
+      "original_sha256": "710e19ae7eb5f061a8b000b3d3bf36c04bcab3809931e72e6b264c45e1f39ad4",
+      "published_sha256": "710e19ae7eb5f061a8b000b3d3bf36c04bcab3809931e72e6b264c45e1f39ad4",
+      "transformations": []
+    },
+    {
+      "file": "agent-draw-incomplete/harness.txt",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/attempt-1/harness.log",
+      "original_sha256": "680671232613f49110ec846be21b418df3638de79357f83215458a1b66e22ed6",
+      "published_sha256": "cd86618880acf4a3f2973073a3953fc6ff8ae6f9c5020ff342ab080d49120a56",
+      "transformations": [
+        "Excerpt: harness outcome before diagnostic peer-log tails; no model sessions included.",
+        "Replace absolute checkout path with <checkout>."
+      ]
+    },
+    {
+      "file": "campaigns/cpu-agent-2026-10-29T054404Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T054404Z/summary.jsonl",
+      "original_sha256": "93eecb0bcec5d8e39a64a9b0876b8c7c02a0b2aed0ddc8789fc0168fa45961fe",
+      "published_sha256": "93eecb0bcec5d8e39a64a9b0876b8c7c02a0b2aed0ddc8789fc0168fa45961fe",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-agent-2026-10-29T055719Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T055719Z/summary.jsonl",
+      "original_sha256": "e92846f51f0922c591899ea7345177220b42ae744a13fd5358d63041953e4c84",
+      "published_sha256": "e92846f51f0922c591899ea7345177220b42ae744a13fd5358d63041953e4c84",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-agent-2026-10-29T073011Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T073011Z/summary.jsonl",
+      "original_sha256": "6672df80091bc91bb83bc298680160947a1723403d5447961dca2c0b3115f8c1",
+      "published_sha256": "6672df80091bc91bb83bc298680160947a1723403d5447961dca2c0b3115f8c1",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-agent-2026-10-29T080607Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/summary.jsonl",
+      "original_sha256": "710e19ae7eb5f061a8b000b3d3bf36c04bcab3809931e72e6b264c45e1f39ad4",
+      "published_sha256": "710e19ae7eb5f061a8b000b3d3bf36c04bcab3809931e72e6b264c45e1f39ad4",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-chat-2026-10-28T233754Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-28T233754Z/summary.jsonl",
+      "original_sha256": "ab15d76bb164959e849850325f4903ea0fa1ffb37d88acec28cf3876f136614c",
+      "published_sha256": "ab15d76bb164959e849850325f4903ea0fa1ffb37d88acec28cf3876f136614c",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-chat-2026-10-29T012400Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T012400Z/summary.jsonl",
+      "original_sha256": "c4e2704de3657f1bfa3c1676969353c668f0c0130549c5ad9126a1178b14d83a",
+      "published_sha256": "c4e2704de3657f1bfa3c1676969353c668f0c0130549c5ad9126a1178b14d83a",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-chat-2026-10-29T033614Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/summary.jsonl",
+      "original_sha256": "6779a88387d03bf17d829681884e01c1869b89e38fdb6119a0982a82276f6507",
+      "published_sha256": "6779a88387d03bf17d829681884e01c1869b89e38fdb6119a0982a82276f6507",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T035745Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T035745Z/summary.jsonl",
+      "original_sha256": "5a726327f986171e6b4ed9df35fae0c9782623da08b8a9709ff6f7264995f2d7",
+      "published_sha256": "5a726327f986171e6b4ed9df35fae0c9782623da08b8a9709ff6f7264995f2d7",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T040835Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T040835Z/summary.jsonl",
+      "original_sha256": "8f77306e448a02b5e45b2dac0694718f5789da77493658875f7294e1fd4d3f48",
+      "published_sha256": "8f77306e448a02b5e45b2dac0694718f5789da77493658875f7294e1fd4d3f48",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T040840Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T040840Z/summary.jsonl",
+      "original_sha256": "eeb79f7fa849dfc01c54806ae86f2998073b1e0ab2fa20a9138e44ff481b7b67",
+      "published_sha256": "eeb79f7fa849dfc01c54806ae86f2998073b1e0ab2fa20a9138e44ff481b7b67",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T042058Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T042058Z/summary.jsonl",
+      "original_sha256": "bd266f956d8980ee0c91fdcea00dfe9779f6dfdd7b71880e26d1d9119ba1a783",
+      "published_sha256": "bd266f956d8980ee0c91fdcea00dfe9779f6dfdd7b71880e26d1d9119ba1a783",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T042807Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T042807Z/summary.jsonl",
+      "original_sha256": "8746f8cb60ed441ca2a3dd5a6b1a0d80dff0ea2480918d945610ba7749af0f59",
+      "published_sha256": "8746f8cb60ed441ca2a3dd5a6b1a0d80dff0ea2480918d945610ba7749af0f59",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T044831Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T044831Z/summary.jsonl",
+      "original_sha256": "116fee573c2663db23d37a5f43086c9e57205ef470e8640db41556db47e971db",
+      "published_sha256": "116fee573c2663db23d37a5f43086c9e57205ef470e8640db41556db47e971db",
+      "transformations": []
+    },
+    {
+      "file": "campaigns/cpu-game-2026-10-29T051915Z.jsonl",
+      "source_path": "measurements/physical-matrix/cpu-game-2026-10-29T051915Z/summary.jsonl",
+      "original_sha256": "5a5a8f46c953a32efc86eaa7c1d27554ae9a338cf98aeeb0d2bc4620bc1ac475",
+      "published_sha256": "5a5a8f46c953a32efc86eaa7c1d27554ae9a338cf98aeeb0d2bc4620bc1ac475",
+      "transformations": []
+    }
+  ]
+}

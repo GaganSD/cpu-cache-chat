@@ -1,0 +1,7 @@
+Evidence directory: <checkout>/measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/ccc-dockergame.md4HeC
+WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set
+Configuration checks passed; live network policy is UNVERIFIED; hardware channel is not established.
+PASS: illegal occupied square rejected locally; no peer move emitted
+{"agents_verified":false,"board":"XO34X67OX","isolation_verified":false,"ok":true,"outcome":"x_win","physical_channel_verified":false,"ply":5,"session":1125324835}
+PASS docker cpu game: legal moves, illegal rejected locally, verified equal boards
+Evidence retained: <checkout>/measurements/physical-matrix/cpu-game-2026-10-29T051915Z/attempt-1/ccc-dockergame.md4HeC

@@ -1,0 +1,11 @@
+{
+  "mode": "Cpu",
+  "role": "B",
+  "trials": 1,
+  "bits": 32,
+  "bit_errors": 0,
+  "timeouts": 1,
+  "silent_false_ones": 0,
+  "usable": false,
+  "notes": "unproven: one receive attempt (requested 64); two-process operation and reliability are not established; silent-sender control not measured; receive failed: timeout; BER unavailable; bit_errors field is not a measurement"
+}

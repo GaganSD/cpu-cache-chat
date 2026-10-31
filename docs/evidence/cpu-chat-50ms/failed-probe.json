@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "mode": "Cpu",
+  "role": "B",
+  "requested_trials": 1,
+  "attempted_trials": 1,
+  "completed_trials": 0,
+  "requested_bits": 32,
+  "elapsed": {
+    "secs": 9,
+    "nanos": 191441842
+  },
+  "trials": [
+    {
+      "outcome": "corrupt",
+      "decoded_bytes": null,
+      "decoded_hex": null,
+      "crc_valid": null,
+      "payload_bit_errors": null,
+      "elapsed": {
+        "secs": 9,
+        "nanos": 191418633
+      },
+      "error": "corrupt frame: missed physical slot"
+    }
+  ],
+  "raw_bit_errors": null,
+  "silent_false_ones": null,
+  "usable": false,
+  "notes": "One frame observation; raw BER and link reliability are not established."
+}

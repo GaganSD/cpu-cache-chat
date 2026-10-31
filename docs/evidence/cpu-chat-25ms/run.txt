@@ -1,0 +1,12 @@
+exit_status=0
+channel=cpu
+mode=chat
+slot_ms=25
+cpuset=0
+wait_seconds=900
+image=cpu-cache-chat:local
+image_id=sha256:d3c57e150d4307565d05173b99798c5945b8a2454dfddf4459200e265c3b6014
+controls=bundle
+controls_bundle=measurements/physical-matrix/controls-25ms
+phase_reached=verify
+attempt_deadline=1793245914

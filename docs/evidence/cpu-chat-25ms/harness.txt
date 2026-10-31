@@ -1,0 +1,12 @@
+Evidence directory: <checkout>/measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/ccc-dockere2e.Xg6haI
+WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set
+phase=start ts=1793245014
+Qualification controls: referencing bundle measurements/physical-matrix/controls-25ms (config 3e52c07a49ec...); single qualification run, not a reliability guarantee
+phase=connect ts=1793245014
+Configuration checks passed; live network policy is UNVERIFIED; hardware channel is not established.
+phase=chat ts=1793245110
+PASS: hello-from-a queued, transmitted, acknowledged, and received (seq 1)
+PASS: hello-from-b queued, transmitted, acknowledged, and received (seq 1)
+phase=verify ts=1793245232
+PASS docker cpu chat both directions
+Evidence retained: <checkout>/measurements/physical-matrix/cpu-chat-2026-10-29T033614Z/attempt-1/ccc-dockere2e.Xg6haI

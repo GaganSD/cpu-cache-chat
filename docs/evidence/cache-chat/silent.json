@@ -1,0 +1,11 @@
+{
+  "mode": "Cache",
+  "role": "B",
+  "trials": 1,
+  "bits": 0,
+  "bit_errors": 0,
+  "timeouts": 1,
+  "silent_false_ones": 0,
+  "usable": false,
+  "notes": "unproven: silent-sender control; sender silence must be ensured independently; false decoded frame=false; result=Err(Timeout); silent_false_ones and bit_errors are not measured"
+}

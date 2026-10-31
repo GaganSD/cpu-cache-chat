@@ -1,0 +1,17 @@
+exit_status=1
+channel=cpu
+mode=game --agent
+slot_ms=50
+cpuset=0
+wait_seconds=3600
+image=cpu-cache-chat:agent
+provider=opencode-go
+model=deepseek-v4.1-flash
+image_digest=sha256:dd3370573f57c009e497bbb8455b0bfadaa64338a4c1845661407f8eace59638
+repo_head=55b384ea79abf35dd4ac492127782843fab21659
+repo_dirty=yes
+ccc_debug=0
+ccc_agent_debug=0
+host_uname=Darwin 27.0.0 arm64
+load_avg={ 3.61 4.23 4.25 } 
+date=2026-10-29T08:28:47Z

@@ -1,0 +1,17 @@
+{"role":"A","session":3094208562,"type":"session","version":1}
+{"ply":0,"square":5,"type":"agent_choice"}
+{"acceptance":"local_ack","mark":"X","ply":0,"sequence":2,"square":5,"type":"move"}
+{"acceptance":"peer_accepted","mark":"O","ply":1,"sequence":1,"square":1,"type":"move"}
+{"ply":2,"square":3,"type":"agent_choice"}
+{"acceptance":"local_ack","mark":"X","ply":2,"sequence":3,"square":3,"type":"move"}
+{"acceptance":"peer_accepted","mark":"O","ply":3,"sequence":2,"square":7,"type":"move"}
+{"ply":4,"square":4,"type":"agent_choice"}
+{"acceptance":"local_ack","mark":"X","ply":4,"sequence":4,"square":4,"type":"move"}
+{"acceptance":"peer_accepted","mark":"O","ply":5,"sequence":3,"square":6,"type":"move"}
+{"ply":6,"square":2,"type":"agent_choice"}
+{"acceptance":"local_ack","mark":"X","ply":6,"sequence":5,"square":2,"type":"move"}
+{"acceptance":"peer_accepted","mark":"O","ply":7,"sequence":4,"square":8,"type":"move"}
+{"ply":8,"square":9,"type":"agent_choice"}
+{"acceptance":"local_ack","mark":"X","ply":8,"sequence":6,"square":9,"type":"move"}
+{"board":"OXXXXOOOX","outcome":"draw","ply":9,"type":"final"}
+{"evidence_complete":true,"successful":true,"type":"stopped"}

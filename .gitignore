@@ -6,13 +6,26 @@
 /models
 /tmp
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 node_modules
 dist
 *.gguf
-measurements/*.json
-measurements/*.log
-agent/node_modules
 __pycache__/
 *.py[cod]
 
-!measurements/.gitkeep
+# Local planning and session notes (keep on disk, not in Git).
+/prompt.md
+/handoff.md
+/JOURNAL.md
+/plan.md
+/product.md
+/report.md
+/docs/codex-computer-use-test.md
+/docs/release.md
+/docs/reviews/
+
+# Raw runs, transcripts, and review output. Curated samples live in docs/evidence/.
+/measurements/

@@ -1,0 +1,9 @@
+Evidence directory: <checkout>/measurements/physical-matrix/cpu-agent-2026-10-29T080607Z/attempt-1/ccc-dockeragent.TWoiBj
+WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set
+container networks: A=[ccc-agent-20986-net-a ] B=[ccc-agent-20986-net-b ] (must be disjoint, no host, no none-shared)
+UNVERIFIED: no known-listener positive/negative live network controls were run.
+PASS: both agents connected over the physical channel
+WARNING: a transcript missing; hosted evidence incomplete
+WARNING: b transcript missing; hosted evidence incomplete
+{"agents_verified":true,"board":"OXXXXOOOX","isolation_verified":false,"ok":true,"outcome":"draw","physical_channel_verified":false,"ply":9,"session":3094208562}
+FAIL: verified game but transcripts incomplete; evidence not release-grade

@@ -1,0 +1,45 @@
+Evidence directory: /tmp/ccc-evidence/ccc-dockere2e.vCDYdS
+WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set
+{
+  "mode": "Cache",
+  "role": "B",
+  "trials": 1,
+  "bits": 0,
+  "bit_errors": 0,
+  "timeouts": 1,
+  "silent_false_ones": 0,
+  "usable": false,
+  "notes": "unproven: silent-sender control; sender silence must be ensured independently; false decoded frame=false; result=Err(Timeout); silent_false_ones and bit_errors are not measured"
+}
+ccc-e2e-92375-a: network=none privileged=false pid= ipc=private
+ccc-e2e-92375-a mounts:
+
+ccc-e2e-92375-b: network=none privileged=false pid= ipc=private
+ccc-e2e-92375-b mounts:
+
+Container configuration checks passed; this does not establish a working hardware channel.
+sender payload (keep this off the receiver argv): [5a, 7f, a4, c9]
+{"role":"A","mode":"cache timing","sent":4}
+{
+  "mode": "Cache",
+  "role": "B",
+  "trials": 1,
+  "bits": 32,
+  "bit_errors": 0,
+  "timeouts": 0,
+  "silent_false_ones": 0,
+  "usable": false,
+  "notes": "unproven: one receive attempt (requested 64); two-process operation and reliability are not established; silent-sender control not measured; received bytes (hex): 5a7fa4c9; BER unavailable: expected bytes were not supplied; bit_errors field is not a measurement"
+}
+PASS: probe decoded expected bytes (0 bit errors in this frame) and silent control passed
+ccc-e2e-92375-a: network=none privileged=false pid= ipc=private
+ccc-e2e-92375-a mounts:
+
+ccc-e2e-92375-b: network=none privileged=false pid= ipc=private
+ccc-e2e-92375-b mounts:
+
+Container configuration checks passed; this does not establish a working hardware channel.
+PASS: hello-from-a queued, transmitted, acknowledged, and received (seq 1)
+PASS: hello-from-b queued, transmitted, acknowledged, and received (seq 1)
+PASS docker cache chat both directions
+Evidence retained: /tmp/ccc-evidence/ccc-dockere2e.vCDYdS

@@ -1,0 +1,14 @@
+exit_status=0
+channel=cpu
+mode=game
+slot_ms=25
+cpuset=0
+wait_seconds=3600
+image=cpu-cache-chat:local
+image_digest=sha256:d3c57e150d4307565d05173b99798c5945b8a2454dfddf4459200e265c3b6014
+repo_head=91e365c06236a77af14eb7a3e93acb199379f4b6
+repo_dirty=yes
+ccc_debug=0
+host_uname=Darwin 27.0.0 arm64
+load_avg={ 2.49 2.72 3.13 } 
+date=2026-10-29T05:23:39Z

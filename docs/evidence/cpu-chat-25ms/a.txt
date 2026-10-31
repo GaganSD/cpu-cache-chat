@@ -1,0 +1,28 @@
+cpu-cache-chat / A / X mode: cpu contention
+connecting; enter messages or /q to quit
+connecting
+link: idle
+
+link connecting
+link connected
+session 0x2ad51ef3 established
+link: connected
+
+queued: hello-from-a
+seq 1: transmitting
+seq 1: awaiting ack
+seq 1: delivered
+link connected
+corrupt frame: channel crc
+link degraded
+link: degraded
+
+corrupt frame: channel crc
+peer: hello-from-b
+link connected
+link: connected
+
+link closed
+link: closed
+
+stopped

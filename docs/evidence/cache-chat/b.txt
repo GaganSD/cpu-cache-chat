@@ -1,0 +1,19 @@
+cpu-cache-chat / B / O mode: cache timing
+connecting; enter messages or /q to quit
+link: idle
+
+connecting
+link connecting
+link connected
+session 0xeb990211 established
+link: connected
+
+corrupt frame: missed physical slot
+peer: hello-from-a
+queued: hello-from-b
+seq 1: transmitting
+seq 1: awaiting ack
+seq 1: delivered
+link connected
+link closed
+stopped
