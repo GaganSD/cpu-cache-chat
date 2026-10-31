@@ -1,6 +1,6 @@
 # Findings
 
-Experiments ran on an Apple M2 MacBook with 8 GB RAM, using OrbStack and native ARM64 containers. Manual peers used no networking, private IPC, and no shared writable mounts. Hosted agents used separate egress-enabled bridges.
+Experiments ran on an M2 chip, using OrbStack and native ARM64 containers. Manual peers used no networking, private IPC, and no shared writable mounts. Hosted agents used separate egress-enabled bridges.
 
 The useful result: a deliberately modulated timing signal can carry actual messages and game moves between these programs. CPU contention was more practical than the cache workload. Neither experiment isolates a particular cache-eviction mechanism.
 

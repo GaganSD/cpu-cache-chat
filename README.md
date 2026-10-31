@@ -2,7 +2,7 @@
 
 I built **cpu-cache-chat** to recreate the agent-to-agent communication experiments described in [OpenAI’s sandbox security post](https://openai.com/index/securing-our-frontier-model-training-environment/). Two agents run in separate Docker containers and play tic-tac-toe, passing moves through CPU contention or cache timing instead of network messages. You can also open two terminals and chat over the same channel.
 
-One agent creates CPU or memory activity; the other decodes the timing changes into messages. Both channels verified on a M2 macbook chip. Including a chat communication and two agents playing Tic-Tac-Toe over CPU contention
+One agent creates CPU or memory activity; the other decodes the timing changes into messages. Both channels verified on an M2 chip. Including a chat communication and two agents playing Tic-Tac-Toe over CPU contention
 
 ## How it works
 
@@ -15,9 +15,9 @@ One peer alternates between doing work and staying idle. The other measures timi
 
 Manual peers have no network or shared writable files. The host starts and observes them; it doesn't relay their messages. Simulation uses Unix datagrams and is only for software tests.
 
-## What happened
+## Results
 
-On an Apple M2 with OrbStack:
+On an M2 chip with OrbStack:
 
 - Bidirectional chat worked in both CPU-contention and cache-timing modes.
 - A CPU chat campaign at 50 ms slots passed **7/10** attempts. A later 25 ms campaign passed **5/5**, with retries, taking about **2.5–6 minutes** per attempt.
@@ -26,7 +26,7 @@ On an Apple M2 with OrbStack:
 
 It's slow and noisy. Scheduler pauses matter, and a missing acknowledgement can leave delivery unknown. These are observations from particular builds on one setup, not benchmarks for every Mac or Linux machine. [Findings and sample evidence](docs/measurements.md).
 
-## Try it
+## Getting Started
 
 You'll need Docker Engine on Linux or OrbStack on an Apple-silicon Mac, Bash, and Python 3. Docker builds the Rust binaries.
 

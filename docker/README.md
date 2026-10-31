@@ -17,4 +17,4 @@ Hosted agents need the agent image, provider credentials, and `CCC_HOSTED_OPT_IN
 
 No script here changes host security settings or starts Docker. Containers share a Linux kernel; they aren't VMs.
 
-[Try it](../README.md#try-it) · [Reproduce experiments](../docs/reproducing.md) · [Findings](../docs/measurements.md)
+[Getting Started](../README.md#getting-started) · [Reproduce experiments](../docs/reproducing.md) · [Findings](../docs/measurements.md)

@@ -1,6 +1,6 @@
 # Sample evidence
 
-A small selection of historical output from the M2/OrbStack experiments. These are captured results, not illustrative output or fresh runs of the current checkout.
+A small selection of historical output from experiments on an M2 chip using OrbStack. These are captured results, not illustrative output or fresh runs of the current checkout.
 
 | Directory | What it preserves |
 | --- | --- |
