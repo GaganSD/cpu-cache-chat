@@ -1,21 +1,136 @@
 # Agent player
 
-The player reads one JSON object from stdin (close stdin after writing):
+The player asks a model to select one tic-tac-toe move.
+Rust checks the returned move before the application can use it.
+The player has no scripted fallback.
+
+## Input and output
+
+Write one JSON object to stdin.
+Then close stdin.
 
 ```json
 {"board":"123456789","turn":"X","legal":[1,2,3,4,5,6,7,8,9]}
 ```
 
-On success it writes a single JSON object such as `{"square":5,"source":"pi"}` to stdout. Errors go to stderr and result in a nonzero exit. Rust must independently validate the returned move. The process runs one prompt, allows at most three illegal submissions, and has a 90-second hard deadline. It has no default tools or discovered extensions; the only active tools are `get_board` and `submit_move`.
+On success, the player writes one JSON object to stdout:
 
-Provision Node.js 22.19 or later and install the locked dependencies with `npm ci --prefix agent`. The adapter supports three provider configurations; offline model provisioning and two-instance resource viability remain unvalidated:
+```json
+{"square":5,"source":"pi"}
+```
 
-- **llama (default, offline):** start a local llama.cpp server separately, with a tool-capable model and `--jinja`, bound to `127.0.0.1`. Set `LLAMA_BASE_URL` to its HTTP root (default `http://127.0.0.1:8080`, optionally ending in `/v1`) and `LLAMA_MODEL` to the server's model ID (default `local-model`). Only literal loopback HTTP URLs are accepted. No provider key is needed. Model weights and dependencies must already be present; this player does not download them. Use a server configuration without remote model autoload or downloads.
-- **opencode-go (hosted):** set `CCC_AGENT_PROVIDER=opencode-go`, pass the key via `OPENCODE_GO_API_KEY`, and optionally choose `CCC_AGENT_MODEL` from the allowlist in `src/game.mjs` (only `deepseek-v4.1-flash`, low reasoning). The fetch wrapper restricts requests to the configured origin, but the container bridges allow general egress. The key must come from the environment, never the image.
-- **vercel-ai-gateway (hosted):** set `CCC_AGENT_PROVIDER=vercel-ai-gateway` and `AI_GATEWAY_API_KEY`. Only `reflection/beam-free` is allowed. Its output cap is 8,192 tokens under the same 90-second deadline; the provider can still fail or change availability. Both hosted modes disclose board prompts and require explicit host-launch opt-in.
+Errors go to stderr.
+An error returns a nonzero exit status.
 
-In all cases the Pi SDK credential store needs a writable `HOME` (the agent image sets `HOME=/tmp`).
+Each process handles one board request with a 90-second deadline.
+It permits at most three illegal submissions.
+Its only active tools are `get_board` and `submit_move`.
+It does not load default tools or discovered extensions.
 
-Provider response data and per-request debug transcripts each have a 1 MiB quota; exceeding either fails the request and marks evidence incomplete. Set `CCC_AGENT_TRANSCRIPT_PATH` to retain redacted full transcripts in a private owned regular file (16 MiB total cap). This write happens in the supervised agent subprocess, not the physical wire owner. The launcher/harness should collect that file before removing the container. Without a transcript path, debug stderr can be visibly truncated by the UI and is not complete model evidence. The fetch restriction is an application guard, not a network firewall. The hosted provider receives board prompts.
+## Install dependencies
 
-Run `npm ci --prefix agent` and `npm test --prefix agent`; the Pi mock-server tests fail if dependencies are missing and explicitly select the local provider. `play.mjs` has no scripted fallback. No real model is needed.
+Use Node.js 22.19 or later.
+
+```sh
+npm ci --prefix agent
+```
+
+The Pi SDK needs a writable `HOME` for its credential store.
+The agent image uses `HOME=/tmp`.
+
+## Providers
+
+Set `CCC_AGENT_PROVIDER` to select a provider.
+The default is `llama`.
+
+### Local llama.cpp
+
+1. Start a separate llama.cpp server with a tool-capable model.
+2. Enable `--jinja`.
+3. Bind the server to `127.0.0.1`.
+4. Set the endpoint and model variables if their defaults do not apply.
+
+| Variable | Default |
+| --- | --- |
+| `LLAMA_BASE_URL` | `http://127.0.0.1:8080` |
+| `LLAMA_MODEL` | `local-model` |
+
+The base URL can end in `/v1`.
+The player accepts only HTTP URLs with literal loopback addresses.
+It needs no provider key.
+
+Install model weights and dependencies before the run.
+The player does not download them.
+Disable remote model loading and downloads in the server configuration.
+
+The experiments did not test offline setup or resource use with two local models.
+
+### OpenCode Go
+
+Set these environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `CCC_AGENT_PROVIDER` | `opencode-go` |
+| `OPENCODE_GO_API_KEY` | Your provider key |
+| `CCC_AGENT_MODEL` | `deepseek-v4.1-flash`, if set |
+
+Only `deepseek-v4.1-flash` is allowed.
+It uses low reasoning.
+The model list is in `src/game.mjs`.
+
+### Vercel AI Gateway
+
+Set these environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `CCC_AGENT_PROVIDER` | `vercel-ai-gateway` |
+| `AI_GATEWAY_API_KEY` | Your provider key |
+| `CCC_AGENT_MODEL` | `reflection/beam-free`, if set |
+
+Only `reflection/beam-free` is allowed.
+Its output limit is 8,192 tokens.
+The same 90-second deadline applies.
+The provider can fail or change model availability.
+
+### Hosted access
+
+Both hosted modes send board prompts to an external provider.
+Host launches require explicit permission through `CCC_HOSTED_OPT_IN=1`.
+
+Supply keys through the environment.
+Do not add them to images.
+
+The fetch wrapper permits requests only to the configured provider origin.
+This application check is not a network firewall.
+The container bridges still permit general egress.
+
+## Transcripts
+
+Provider response data has a 1 MiB limit.
+Each request's debug transcript also has a 1 MiB limit.
+Exceeding either limit fails the request and marks its evidence incomplete.
+
+Set `CCC_AGENT_TRANSCRIPT_PATH` to retain full redacted transcripts.
+The target must be a private regular file owned by the current user.
+The total file limit is 16 MiB.
+
+The supervised agent process writes the transcript.
+The transport worker does not write it.
+Collect the file before removing the container.
+
+Without a transcript path, the player writes debug output to stderr.
+The interface can truncate that output.
+Do not treat truncated output as a complete model transcript.
+
+## Tests
+
+```sh
+npm ci --prefix agent
+npm test --prefix agent
+```
+
+The Pi tests use a mock server and explicitly select the local provider.
+They fail if dependencies are missing.
+They do not need a real model.

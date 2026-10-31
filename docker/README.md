@@ -2,19 +2,71 @@
 
 Use Docker Engine on Linux or OrbStack on an Apple-silicon Mac.
 
+## Build images
+
+Build the manual chat and game image:
+
 ```sh
-./docker/build.sh        # Rust chat/game binaries
-./docker/build-agent.sh  # Separate Node/Pi agent image
+./docker/build.sh
 ```
 
-Builds are native to the Docker host and use pinned base-image digests and lockfiles. They download dependencies, not model weights. Source-revision labels are useful bookkeeping, not proof that an image matches a checkout.
+Build the separate Node/Pi agent image:
 
-`scripts/run-pair.sh` starts manual peers with CPU contention, 50 ms slots, and `CPUSET=0`. Change `CPUSET` if that Docker guest CPU isn't available, or set `CHANNEL=cache` for the separate cache workload. The [launcher](../docs/launcher.md) is the easier interactive entry point.
+```sh
+./docker/build-agent.sh
+```
 
-Manual containers have no network, private namespaces, no shared writable mounts, a read-only root, a non-root user, dropped capabilities, and resource limits. `scripts/inspect-isolation.sh` checks configuration; it doesn't prove live isolation.
+Builds use the Docker host's native architecture.
+The Dockerfiles pin base-image digests and use dependency lockfiles.
+They download dependencies, not model weights.
 
-Hosted agents need the agent image, provider credentials, and `CCC_HOSTED_OPT_IN=1`. Their separate bridges allow general egress, and the provider receives board prompts. See [agent setup](../agent/README.md).
+Source-revision labels record build inputs.
+They do not prove that an image matches a checkout.
 
-No script here changes host security settings or starts Docker. Containers share a Linux kernel; they aren't VMs.
+## Start peers
+
+The [launcher](../docs/launcher.md) provides the interactive commands.
+
+The lower-level `scripts/run-pair.sh` defaults to:
+
+| Setting | Value |
+| --- | --- |
+| Channel | CPU contention |
+| Slot duration | 50 ms |
+| CPU assignment | `CPUSET=0` |
+
+Change `CPUSET` if Docker does not allow guest CPU 0.
+Set `CHANNEL=cache` to select the cache workload.
+
+## Manual containers
+
+Manual containers use:
+
+- No network.
+- Private namespaces.
+- No shared writable mounts.
+- A read-only root filesystem.
+- A non-root user.
+- Dropped capabilities.
+- Resource limits.
+
+`scripts/inspect-isolation.sh` checks these settings.
+It does not prove live isolation.
+
+## Hosted agents
+
+Hosted agents require:
+
+- The agent image.
+- Provider credentials.
+- `CCC_HOSTED_OPT_IN=1`.
+
+Each peer uses a separate bridge with general egress.
+The provider receives board prompts.
+See [agent setup](../agent/README.md).
+
+The scripts do not change host security settings or start Docker.
+Containers share a Linux kernel.
+They are not virtual machines.
 
 [Getting Started](../README.md#getting-started) · [Reproduce experiments](../docs/reproducing.md) · [Findings](../docs/measurements.md)

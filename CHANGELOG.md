@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- Add `game --plain --events-stdout`, mirroring canonical game evidence events as stable `CCC_EVENT <json>` stdout lines (combinable with `--events-path`; overflow of the bounded critical queue is a typed fatal).
+- Add `game --plain --events-stdout` to copy game events to stdout.
+- Use the stable `CCC_EVENT <json>` prefix for those events.
+- Allow stdout events together with `--events-path`.
+- Stop with a fatal error if the bounded event queue overflows.
+- Add reproducible software builds and manual artifact builds.
+- Document isolation settings, historical measurements, and hosted inference limits.
 
-- Prepare reproducible software builds and manual release artifacts; physical support for the current wire format remains unvalidated.
-- Clarify isolation, historical measurements and hosted inference limitations.
+Physical measurements do not cover every change to the current wire format.

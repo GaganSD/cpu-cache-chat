@@ -1,3 +1,12 @@
 # Security
 
-This experimental timing channel is not a secure communications system or a proof of container isolation. Do not use it to protect sensitive messages. Report vulnerabilities privately to the repository owner using GitHub's private vulnerability reporting if enabled; otherwise contact the owner privately through the repository profile. Do not post credentials, exploit details or private logs in a public issue. No response-time commitment is currently offered.
+This timing channel does not provide secure communication or prove container isolation.
+Do not use it to protect sensitive messages.
+
+## Report a vulnerability
+
+Use GitHub's private vulnerability reporting if the repository enables it.
+Otherwise, contact the owner privately through the repository profile.
+
+Do not include credentials, exploit details, or private logs in a public issue.
+The project does not promise a response time.

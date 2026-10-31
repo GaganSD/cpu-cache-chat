@@ -1,32 +1,53 @@
 # Sample evidence
 
-A small selection of historical output from experiments on an M2 chip using OrbStack. These are captured results, not illustrative output or fresh runs of the current checkout.
+These files contain captured output from experiments on an M2 chip using OrbStack.
+They are not example output or new runs of the current checkout.
 
-| Directory | What it preserves |
+## Samples
+
+| Directory | Contents |
 | --- | --- |
-| [cache-chat](cache-chat/) | A 50 ms cache-mode chat: silent control, decoded probe, both peer logs, configuration, and passing harness. Includes a retransmission. |
-| [probe-no-lock](probe-no-lock/) | An earlier CPU receiver timeout. Its legacy zero error field isn't a measured BER. |
-| [cpu-chat-50ms](cpu-chat-50ms/) | All ten campaign outcomes (7 passes) and one failed receiver probe. |
-| [cpu-chat-25ms](cpu-chat-25ms/) | All five campaign outcomes (5 passes with retries), plus one peer pair and its control-bundle reference. The full control bundle isn't included. |
-| [manual-game](manual-game/) | All three campaign outcomes, plus one five-ply game's event histories, configuration, harness, and verifier verdict. |
-| [agent-draw-incomplete](agent-draw-incomplete/) | All three campaign outcomes (no overall passes), plus the completed nine-ply draw's events and verdict. Transcript capture failed, so the harness still failed. |
-| [campaigns](campaigns/) | Every retained campaign summary, including failed, harness-bug, stale-image, and partial campaigns. Only completed attempts with summary rows are counted. |
+| [cache-chat](cache-chat/) | One passing 50 ms cache chat. Includes the silent control, probe, peer logs, configuration, harness result, and a retry. |
+| [probe-no-lock](probe-no-lock/) | An earlier CPU receiver timeout. Its zero error field is not a measured bit error rate. |
+| [cpu-chat-50ms](cpu-chat-50ms/) | All ten outcomes, including seven passes. Includes one failed receiver probe. |
+| [cpu-chat-25ms](cpu-chat-25ms/) | All five passing outcomes, including retries. Includes one peer pair and its control-bundle reference, but not the full bundle. |
+| [manual-game](manual-game/) | All three outcomes. Includes one five-move game's events, configuration, harness result, and verifier result. |
+| [agent-draw-incomplete](agent-draw-incomplete/) | Three overall failures. Includes the completed nine-move draw and its failed transcript capture. |
+| [campaigns](campaigns/) | Every retained campaign summary, including partial campaigns, harness failures, and stale-image tests. Counts include only completed attempts with summary rows. |
 
-## Provenance and edits
+## Source records
 
-[manifest.json](manifest.json) records the original relative source path, original SHA-256, published SHA-256, and transformations for each file. The source revision identifies the original snapshot before the repository's history cleanup; it isn't a link to an accessible historical commit.
+[manifest.json](manifest.json) records these values for each sample:
 
-- Absolute checkout paths are replaced with `<checkout>`.
-- Output files are sometimes renamed to `.txt` or `.json` for readability.
-- The agent harness excerpt ends before its diagnostic peer-log tails; its success, warnings, verifier result, and overall failure are preserved.
-- Other sampled file contents are unchanged. Session IDs, image IDs, recorded revisions, error fields, and failures are retained.
-- Full raw campaigns, Docker inspection dumps, model transcripts, and automated review reports are local-only. These samples aren't a complete archive or an independent audit.
+- Original relative source path.
+- Original SHA-256.
+- Published SHA-256.
+- Changes to the contents.
 
-Historical harness messages about isolation or physical operation reflect what those harnesses printed, not additional proof. In particular, a verifier's `ok: true` means the event histories agree; it doesn't verify transport or isolation. Read the [findings](../measurements.md) alongside the output.
+The source revision identifies the snapshot before history cleanup.
+It does not link to an accessible historical commit.
 
-## Replay the sampled games
+## Edits
 
-From the repository root:
+- Absolute checkout paths use the placeholder `<checkout>`.
+- Some output filenames use `.txt` or `.json` for readability.
+- The agent harness excerpt ends before the diagnostic peer-log tails.
+- That excerpt retains success messages, warnings, the verifier result, and the overall failure.
+- Other sampled contents remain unchanged.
+- Session IDs, image IDs, revisions, error fields, and failures remain in the samples.
+
+Full campaigns, Docker dumps, model transcripts, and automated reviews remain local.
+These samples are not a complete archive or an independent audit.
+
+A historical harness message records what the harness printed.
+It does not add proof of isolation or physical transport.
+The verifier's `ok: true` means that the event histories agree.
+
+Read the [findings](../measurements.md) with these files.
+
+## Replay games
+
+Run these commands from the repository root:
 
 ```sh
 cargo build --locked --release -p ccc-game
@@ -34,4 +55,6 @@ cargo build --locked --release -p ccc-game
 ./target/release/ccc-verify-game --require-agents docs/evidence/agent-draw-incomplete/a.jsonl docs/evidence/agent-draw-incomplete/b.jsonl
 ```
 
-The second replay checks agent choices recorded in the events. It cannot recover the missing inference transcripts or turn the failed harness run into a pass.
+The second replay checks the agent choices recorded in the events.
+It cannot recover the missing model transcripts.
+A successful replay does not change the failed harness result.

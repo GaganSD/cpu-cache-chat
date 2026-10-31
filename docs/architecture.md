@@ -1,21 +1,105 @@
-# Architecture (current implementation overview)
+# Architecture
 
-The CLI joins application sessions, protocol framing and a selected transport. `ccc-game` checks moves; `ccc-app` manages chat/game state; `ccc-protocol` handles frames and link state; `ccc-channel` implements timing transports and Unix-datagram simulation. Simulation is not isolation or a hardware result.
+Each peer runs the same stack: terminal interface, application state, message protocol, and transport.
+The transport carries messages through CPU contention, cache timing, or Unix datagrams for simulation.
 
-## Boundary
+```text
+Peer A                                  Peer B
+Terminal or agent                       Terminal or agent
+       |                                       |
+Application state                       Application state
+       |                                       |
+Message protocol                        Message protocol
+       |                                       |
+Timing transport <--- shared hardware ---> Timing transport
+```
 
-Manual physical tests use separate Docker containers, normally network-none, private IPC and no shared writable mounts. The host launches and observes them, not a payload relay. Hosted agent containers instead require external network access; separate bridges do not restrict egress to the inference provider. Neither Docker configuration proves absence of other covert channels. The cache workload's timing contrast is not proof of eviction.
+## Components
 
-## Wire and reliability
+| Component | Responsibility |
+| --- | --- |
+| `ccc-cli` | Reads terminal input and displays chat or game state. |
+| `ccc-app` | Manages sessions, delivery state, and agent processes. |
+| `ccc-game` | Checks turns, moves, and game outcomes. |
+| `ccc-protocol` | Encodes frames, establishes sessions, and handles acknowledgements and retries. |
+| `ccc-channel` | Sends and receives through the selected transport. |
+| `ccc-core` | Defines shared types, limits, and timing calculations. |
 
-Protocol frames in `crates/ccc-protocol/src/codec.rs` are `C3 C4 | version=2 | type | flags | session:u32le | seq:u16le | ack:u16le | length:u16le | payload | crc32:u32le`; the CRC covers the preceding bytes and payload is limited to 256 bytes. The encoded overhead is 19 bytes. Version 2 rejects reserved flags and invalid control fields, negotiates chat versus game, and identifies token offers monotonically. See [the protocol contract](protocol.md) for exact transitions, limits, and compatibility.
+Each peer has one worker that owns its session and transport.
+Agent processes run separately, so model requests do not block protocol polling.
 
-Each peer has one wire/session owner. Agent subprocess jobs receive immutable board/session/request snapshots and execute independently, so inference does not block protocol polling. A returned move must still match the live generation and legal turn. Subprocess output and lifetime have quotas; the supervisor terminates its owned process group on failure, timeout, or cancellation. A descendant deliberately escaping that group is not covered by a sandbox guarantee.
+## Transports
 
-The receiver validates and applies a new game message synchronously before sending its acceptance ACK; duplicates are acknowledged without applying twice. The sender commits its tentative board only on that ACK. Lost ACKs can therefore leave the receiver ahead: the sender retains an uncertain move and fails closed rather than sending a later move or fabricating board agreement. Restart means a new session, not automatic replay. Start is role/state checked, and freeze/abort prevents later move mutation.
+- **CPU contention:** the sender alternates between CPU work and idle periods.
+- **Cache timing:** the sender creates a memory workload that changes measured timing.
+- **Simulation:** peers exchange Unix datagrams to test the software.
 
-Post-run [JSONL evidence verification](events.md) replays both complete legal histories, checks sender ACK against receiver acceptance, and optionally matches local agent choices. It does not prove physical transport, inference authorship, or isolation; those require independent runtime evidence.
+The program does not silently change transports after a failure.
+Simulation does not test the hardware channel.
+Cache-mode timing differences do not isolate cache eviction from scheduling or memory traffic.
 
-The physical layer uses a 32-bit `0xAAAAAAAA` preamble, training/carrier and gaps, then a length, payload and CRC encoded with 13-bit SECDED codewords and interleaving. The slot budget is 156 + 13 per payload byte; see `ccc-core` and `ccc-channel/src/phy.rs` for the exact implementation. Historical physical formats changed while still using version 1; the current version-2 peers cannot interoperate with those binaries. Peers must use the same build. New physical results are required after wire changes.
+## Container boundaries
 
-The selected cache or CPU mode is explicit; a failed physical link must not silently become simulation. Missing acknowledgements can make delivery unknown. See [findings](measurements.md) for observed successes, failures, and the limits of those experiments.
+Manual peers run in separate containers without networking, shared writable mounts, or shared IPC.
+The host starts and observes the peers.
+It does not relay messages between them.
+
+Hosted agents need external network access for model requests.
+Each peer uses a separate bridge, but those bridges allow general egress.
+These settings do not prove that all other communication channels are absent.
+
+## Frames and timing
+
+The message protocol uses version 2 frames with a maximum payload of 256 bytes.
+Each frame adds 19 bytes of overhead.
+The [protocol specification](protocol.md) defines the fields and acceptance rules.
+
+The physical layer adds:
+
+1. A 32-bit `0xAAAAAAAA` preamble.
+2. Training signals, carrier periods, and gaps.
+3. A length, payload, and CRC.
+4. Error correction with 13-bit SECDED codewords and interleaving.
+
+SECDED means single-error correction and double-error detection.
+The slot budget is `156 + 13 × n`, where `n` is the number of bytes supplied to the physical layer.
+See `crates/ccc-channel/src/phy.rs` for the encoding.
+
+Peers must use the same build.
+Older physical formats changed without a version increase.
+Current version 2 peers cannot communicate with those version 1 builds.
+A wire-format change requires another physical test.
+
+## Message acceptance
+
+The receiver checks and applies a new game message before it sends an acknowledgement.
+It acknowledges a duplicate without applying the message again.
+
+The sender changes its board only after the acknowledgement arrives.
+If every acknowledgement is lost, the receiver can advance while the sender remains uncertain.
+The sender then reports unknown delivery and stops further messages.
+It does not assume that both boards agree.
+
+The application checks the role and state before it accepts a game start.
+A frozen or aborted game cannot apply later moves.
+A restart creates a new session without replaying queued messages.
+
+## Agent processes
+
+Each agent receives a fixed copy of the board, session, and request identity.
+The application checks the returned move against the current request and legal turn.
+
+The supervisor limits process lifetime and output.
+It terminates the process group after failure, timeout, or cancellation.
+A descendant that deliberately escapes that group is outside this guarantee.
+
+## Recorded evidence
+
+The [game verifier](events.md) replays both event files after a run.
+It checks legal histories, matching boards, and sender acknowledgements against receiver acceptance.
+It can also compare recorded agent choices with accepted moves.
+
+Event replay does not prove physical transport, model authorship, or container isolation.
+Those claims require separate evidence from the run.
+
+[Observed results](measurements.md) · [Experiment commands](reproducing.md)

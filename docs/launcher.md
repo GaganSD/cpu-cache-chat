@@ -1,34 +1,243 @@
 # Demo launcher
 
-Build the appropriate local image first (`docker/build.sh`; use the agent image build for hosted play). Docker Engine on Linux or Docker Desktop/OrbStack on Apple Silicon, Python 3, and a Docker guest CPU shared by the containers are required.
+The launcher creates two peer containers and prints their attach commands.
+It also stops the run and collects logs.
+Use it for terminal chat, manual games, or hosted-agent games.
+
+## Requirements
+
+- Docker Engine on Linux, or Docker Desktop or OrbStack on an Apple-silicon Mac.
+- Python 3.
+- A Docker guest CPU that both containers can use.
+- A local image built for the selected mode.
+
+Build the manual image with `./docker/build.sh`.
+Build the hosted-agent image with `./docker/build-agent.sh`.
+
+## Commands
+
+Run these commands from the repository root:
 
 ```sh
-scripts/demo.sh doctor
-scripts/demo.sh chat --channel cpu
-scripts/demo.sh game --channel cache --cpu 0
-CCC_HOSTED_OPT_IN=1 scripts/demo.sh agents --channel cpu --provider opencode-go
-CCC_HOSTED_OPT_IN=1 scripts/demo.sh agents --channel cpu --provider vercel-ai-gateway
-scripts/demo.sh stop --run-id RUN_ID
+./scripts/demo.sh doctor
+./scripts/demo.sh chat --channel cpu
+./scripts/demo.sh game --channel cache --cpu 0
 ```
 
-Attach to each printed container in a separate terminal; Ctrl-p Ctrl-q detaches. The run persists until stopped. `--image` selects a locally available image; the launcher resolves its immutable ID before creation. The named `reference-50ms` preset is shared by every mode. A nominal 19-byte control frame takes about 20 seconds; retries can take much longer. No silent switch between cache and CPU occurs.
+For each run:
 
-By default a bounded 300-second, receiver-blind, 32-bit physical probe precedes launch. Its matching bytes are not a reliability guarantee. `--skip-preflight` explicitly skips it, for tests or informed troubleshooting; this does not establish a working channel. A failed probe stops the launch. `doctor` checks Docker reachability and reports guest CPU count, not image, credential, or hardware-channel readiness. CPU indices are checked against the Docker daemon guest's CPU count, not the Mac host's count, and a disposable bounded container verifies that Docker accepts the chosen cpuset.
+1. Open two terminals.
+2. Run one printed `docker attach` command in each terminal.
+3. Enter messages or moves.
+4. Press **Ctrl-p Ctrl-q** to detach without stopping the run.
 
-Manual peers have no network. Hosted peers get separate egress-enabled bridges, **not destination-restricted firewalls**: peer network isolation is unverified. Board prompts leave the machine and provider charges may apply. Hosted operation requires explicit `CCC_HOSTED_OPT_IN=1` and `OPENCODE_GO_API_KEY` or `AI_GATEWAY_API_KEY` (also accepts `VERCEL_AI_GATEWAY_API_KEY`). The fixed models are `deepseek-v4.1-flash` with low reasoning and `reflection/beam-free`, respectively. Offline agents are not provisioned and fail before Docker resource creation. Credentials are passed by environment variable name, never placed in manifests or printed by the launcher; Docker stores container environment and privileged Docker users can inspect it. Protect Docker access and provider keys.
+Stop both peers with the printed run ID:
 
-Each run has a random ownership label and a private manifest in `~/.cpu-cache-chat/runs` (override with `CCC_RUN_DIR`). Stop and failure cleanup select only that run label; retain the manifest if cleanup fails and retry stop. Deleting a manifest prevents the launcher from stopping that run. Containers use a non-root user, read-only root, private IPC, private cgroup namespace, no extra capabilities, no-new-privileges, and memory, PID and CPU bounds. These controls and inspection do not establish hardware-channel success or live network isolation.
+```sh
+./scripts/demo.sh stop --run-id RUN_ID
+```
 
-## Run retention and evidence
+The containers continue until the run stops.
 
-Manifests are **retained** after stop and failure, recording `status` (`running`, `stopped`, `failed`), `start`/`end`, probe result (`passed`/`skipped`/`pending`), hosted peer-path policy, the configuration, per-peer evidence status (logs, events, transcript, observed exit), the game verifier verdict (`game_verdict`) for game/hosted runs, the artifact warning, and the resolved image ID plus best-effort provenance (source/revision labels and bounded `--version` output; the launcher never dumps container `Env`). `stop` is idempotent: rerunning it on a cleaned-up run reports the retained state without touching anything, and manifests with a mismatched run ID or ownership label are rejected.
+## Images, CPUs, and timing
 
-Game and hosted peers run with `--plain --events-stdout --events-path /tmp/game.events.jsonl`: canonical event JSONL is written to the container tmpfs and mirrored to stdout with the exact `CCC_EVENT ` prefix. Chat is plain-only and has no game verifier.
+`--image` selects a local image.
+The launcher resolves its immutable image ID before it creates containers.
 
-Stop and failure follow a fixed order. First the hosted agent raw transcript (`--env CCC_AGENT_TRANSCRIPT_PATH=/tmp/agent-transcript.log`, with `CCC_AGENT_DEBUG=1`) is copied while peers still run; a transcript that reaches the adapter's 16 MiB bound is marked `truncated`. Owned peers then get `SIGINT` and a bounded 5-second `docker wait` each; a peer that does not exit is forcibly removed and recorded as `forced` (never treated as a clean exit), and its later evidence is missing rather than invented. Only after exit does the launcher stream the split Docker logs (TTY containers merge both into stdout) and `docker cp` the events file, so the tmpfs stopped record exists. Log capture is streamed through byte-capped buffers (8 MiB per stream) with a timeout; the capture CLI is terminated and reaped only when a cap or the deadline is hit, and truncation marks the run incomplete.
+`--cpu` selects a Docker guest CPU.
+The launcher checks the index against the guest's CPU count.
+A temporary container then checks whether Docker accepts that CPU assignment.
+The index does not identify a physical host core.
 
-Canonical machine JSONL (`events/*.jsonl`) is stored byte-exact and **never carries a text header**; the review-before-sharing warning lives in the manifest (`artifact_warning`) and on text artifacts (logs, transcripts). The `CCC_EVENT `-prefixed stdout mirror is extracted losslessly from the raw captured stdout into `events/*.stdout.jsonl`. The tmpfs events file is authoritative; the mirror is a cross-check (disagreement marks the run incomplete) and a fallback source, because the diagnostic log is bounded (Docker json-file `max-size=4m`, `max-file=2`, plus the capture cap) and event completeness must not depend on diagnostic log rotation. Captured events must pass a structural gate — versioned session record, exactly one final record, terminal `stopped` with `successful` and `evidence_complete` true — before they count as captured at all; anything less is `incomplete`, never silently accepted.
+Every mode uses the `reference-50ms` preset.
+A 19-byte control frame takes about 20 seconds before retries.
+Games and retries can take minutes.
+The launcher does not silently change channels.
 
-For game and hosted runs both peers' canonical events are replayed post-run with the image-packaged `/usr/local/bin/ccc-verify-game` (`--require-agents` for hosted runs) in a disposable observer container: `--rm`, `--network none`, read-only, the common hardening, memory/PID bounds and ownership label, bounded to 30 seconds. The observer mounts only copies of the canonical event files (mode 644) from a private host tempdir (mode 700) as read-only binds; it never touches peer containers and relays no live messages. The verdict is recorded in the manifest as `game_verdict`. If the observer cannot run, a host `ccc-verify-game` binary is an optional fallback; without a successful verifier run there is **no pass** — the run is marked incomplete. Missing or malformed events, unsuccessful or unobserved peer exits, forced removals, and failed or absent verdicts all mark the run `incomplete` with explicit reasons; no record is invented for absent evidence.
+## Preflight checks
 
-Artifacts live under `<run-id>/` next to the manifest and each text file is labeled **REVIEW BEFORE SHARING**: redaction (live credential environment values plus bearer/key patterns) is best-effort and **not guaranteed secret-free**. Retention is bounded: a 64 MiB per-run quota (overflow is truncated — canonical JSONL all-or-nothing — and recorded as incomplete) and a total budget of 8 runs / 512 MiB; a launch that would exceed the budget is refused and the launcher never deletes unknown files, so prune retained runs manually.
+`doctor` checks Docker access and reports the guest CPU count.
+It does not check images, credentials, or physical communication.
+
+By default, the launcher runs a 32-bit physical probe before it starts the peers.
+The receiver does not receive the expected payload as an argument.
+The probe has a 300-second deadline.
+A failed probe stops the launch.
+
+`--skip-preflight` skips that probe.
+Use it only for tests or deliberate troubleshooting.
+A passing probe records one observation, not a reliability estimate.
+
+## Hosted agents
+
+Export the provider key before the launch.
+Then select the provider:
+
+```sh
+CCC_HOSTED_OPT_IN=1 ./scripts/demo.sh agents --channel cpu --provider opencode-go
+CCC_HOSTED_OPT_IN=1 ./scripts/demo.sh agents --channel cpu --provider vercel-ai-gateway
+```
+
+| Provider | Key variable | Model |
+| --- | --- | --- |
+| `opencode-go` | `OPENCODE_GO_API_KEY` | `deepseek-v4.1-flash`, low reasoning |
+| `vercel-ai-gateway` | `AI_GATEWAY_API_KEY` | `reflection/beam-free` |
+
+The gateway also accepts `VERCEL_AI_GATEWAY_API_KEY` as an alternative key variable.
+Board prompts leave the machine.
+Provider charges may apply.
+The launcher does not install local models or support offline-agent launches.
+
+Manual peers have no network.
+Hosted peers use separate bridges with general egress.
+These bridges do not restrict traffic to model providers.
+
+For hosted launches, the launcher tests TCP paths with temporary listeners.
+It requires successful connections within each bridge and denied or timed-out connections between bridges.
+It also requires disabled IPv6.
+These checks cover the tested listener IPs and TCP port, not every possible network path.
+
+The launcher passes credentials by environment variable name.
+It does not print credentials or store them in manifests.
+Docker stores the container environment, which privileged Docker users can inspect.
+
+## Container settings
+
+Each container uses:
+
+- A non-root user and read-only root filesystem.
+- Private IPC and cgroup namespaces.
+- No extra capabilities.
+- The `no-new-privileges` setting.
+- Memory, PID, and CPU limits.
+
+These settings do not prove that hardware communication works or that every other communication path is blocked.
+
+## Run files
+
+Each run has a random ownership label.
+The launcher uses that label to select resources during stop and failure cleanup.
+
+The default storage directory is `~/.cpu-cache-chat/runs`.
+Set `CCC_RUN_DIR` to use another directory.
+Each run keeps a private manifest and an artifact directory.
+
+The manifest records:
+
+| Category | Recorded values |
+| --- | --- |
+| Lifecycle | Status, start time, and end time |
+| Configuration | Mode, channel, slot, CPU, image ID, and provider |
+| Checks | Probe result and hosted TCP-path results |
+| Evidence | Logs, events, transcripts, and observed peer exits |
+| Game result | `game_verdict` |
+| Warnings | Incomplete evidence and review-before-sharing warning |
+| Image details | Source labels, revision labels, and bounded `--version` output |
+
+A probe result is `passed`, `skipped`, or `pending`.
+Image labels do not prove which source produced an image.
+The launcher does not copy the container's `Env` fields into the manifest.
+
+The launcher retains manifests after stop and failure.
+A repeated stop reports the saved state without removing unrelated resources.
+The launcher rejects a mismatched run ID or ownership label.
+
+Keep the manifest if cleanup fails.
+Repeat the stop command to retry cleanup.
+Without the manifest, the launcher cannot stop that run.
+
+## Stop and evidence capture
+
+Game peers use `--plain --events-stdout --events-path /tmp/game.events.jsonl`.
+They write JSONL events to tmpfs and copy those events to stdout.
+Chat peers use `--plain` without game verification.
+
+The stop sequence is:
+
+1. Read hosted transcripts while the containers still run.
+2. Send `SIGINT` to the owned peers.
+3. Attempt to read complete event files during the five-second exit window.
+4. Wait up to five seconds for each peer's exit.
+5. Force-remove a peer that does not exit.
+6. Collect Docker logs after exit.
+7. Select complete event data from the file capture or stdout copy.
+8. Run the game verifier.
+9. Remove the run's remaining containers and networks.
+
+The launcher reads container files with `docker exec cat`.
+It cannot read tmpfs after the container exits.
+If complete file capture fails, it uses the stdout copy.
+
+For hosted runs, `CCC_AGENT_DEBUG=1` enables transcripts at `/tmp/agent-transcript.log`.
+A transcript at the 16 MiB limit counts as truncated.
+
+TTY containers combine stdout and stderr.
+The launcher still captures each available log stream with an 8 MiB limit and a 60-second deadline.
+It terminates the capture process when either limit expires.
+Truncated logs mark the run incomplete.
+
+## Event checks
+
+Saved event files contain only JSONL bytes.
+They do not contain warning headers.
+Warnings appear in the manifest and text artifacts.
+
+The launcher extracts stdout events using the exact `CCC_EVENT ` prefix.
+It saves them as `events/*.stdout.jsonl`.
+A complete file capture takes precedence over the stdout copy.
+If both exist but differ, the run counts as incomplete.
+
+An event stream must contain:
+
+1. A versioned session record.
+2. Exactly one final-board record.
+3. A terminal `stopped` record with `successful=true` and `evidence_complete=true`.
+
+The full [event verifier](events.md) then checks game rules.
+Docker log rotation can remove stdout events.
+The launcher therefore also attempts direct file capture.
+Docker keeps at most two diagnostic log files of 4 MiB each.
+
+## Game verification
+
+The launcher runs `/usr/local/bin/ccc-verify-game` from the selected image after the peers stop.
+Hosted runs add `--require-agents`.
+
+The verifier runs in a temporary observer container with:
+
+- No network and a read-only root filesystem.
+- The common resource and privilege limits.
+- The run's ownership label.
+- Read-only copies of both event files.
+- A 30-second deadline.
+
+The copied files use mode `644` inside a private host directory with mode `700`.
+The observer does not access peer containers or relay live messages.
+
+If the observer cannot run, the launcher can use a host `ccc-verify-game` binary.
+Without a successful verifier result, the game evidence counts as incomplete.
+The manifest stores the result as `game_verdict`.
+
+Missing events, malformed events, failed exits, unknown exits, forced removals, and missing or failed verdicts all count as incomplete.
+The launcher records the reasons instead of creating replacement evidence.
+
+## Storage limits
+
+| Item | Limit |
+| --- | --- |
+| Agent transcript | 16 MiB |
+| Log capture | 8 MiB per stream |
+| Artifacts per run | 64 MiB |
+| Retained runs | 8 |
+| Total artifact budget | 512 MiB |
+
+Text artifacts can truncate at the run limit.
+JSONL artifacts must fit completely.
+The launcher refuses a launch that exceeds its retention budget.
+It does not delete unknown files.
+Remove retained runs manually when necessary.
+
+Text artifacts carry a **REVIEW BEFORE SHARING** warning.
+Redaction covers current credential values and common bearer-token or API-key patterns.
+It can miss secrets.
+Review artifacts before publishing them.
