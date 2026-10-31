@@ -1,14 +1,8 @@
 # cpu-cache-chat
 
-**Message protocol over CPU's cache: re-implementation of OpenAI's sandbox escape attempt.**
+I built **cpu-cache-chat** to recreate the agent-to-agent communication experiments described in [OpenAI’s sandbox security post](https://openai.com/index/securing-our-frontier-model-training-environment/). Two agents run in separate Docker containers and play tic-tac-toe, passing moves through CPU contention or cache timing instead of network messages. You can also open two terminals and chat over the same channel.
 
-A weekend experiment: two programs on the same machine exchange chat messages and tic-tac-toe moves through hardware timing, instead of sending each other network packets. You can type in two terminals or let two agents play.
-
-## Why
-
-Inspired by OpenAI's [Securing our frontier model training environment](https://openai.com/index/securing-our-frontier-model-training-environment/). In its sandbox red-team experiments, agents in separate microVMs communicated by evicting and reloading CPU-cache data. The post also describes channels using shared storage and competition for CPU time.
-
-This is my take on the communication idea, using Docker containers—not a reproduction of OpenAI's infrastructure or an actual sandbox escape.
+One agent creates CPU or memory activity; the other decodes the timing changes into messages. Both channels verified on a M2 macbook chip. Including a chat communication and two agents playing Tic-Tac-Toe over CPU contention
 
 ## How it works
 
